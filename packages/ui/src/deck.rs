@@ -76,6 +76,13 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
         .and_then(|t| t.duration)
         .unwrap_or_default();
 
+    // Get waveform peaks from track
+    let waveform_peaks = props
+        .track
+        .as_ref()
+        .and_then(|t| t.waveform.as_ref())
+        .map(|w| w.peaks.clone());
+
     rsx! {
         div { class: "deck deck-{props.deck_number}",
             div { class: "deck-header",
@@ -96,12 +103,13 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
                 }
             }
 
-            // Trackbar with waveform placeholder
+            // Trackbar with waveform
             Trackbar {
                 position: props.position,
                 duration,
                 is_playing,
                 has_track,
+                waveform_peaks,
                 on_seek: props.on_seek.clone(),
                 deck_number: props.deck_number,
             }

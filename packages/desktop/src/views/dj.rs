@@ -1,6 +1,6 @@
 //! Main DJ view with deck controls.
 
-use crate::state::use_app_state;
+use crate::state::{spawn_waveform_analysis, use_app_state};
 use dioxus::prelude::*;
 use rec_core::Track;
 use std::time::Duration;
@@ -28,6 +28,34 @@ pub fn DjView() -> Element {
     // Get tracks for currently selected playlist
     let current_tracks = use_memo(move || app_state.selected_playlist_tracks());
 
+    // Watch waveform cache and update deck tracks when waveforms complete
+    let waveform_cache = app_state.waveform_cache;
+    use_effect(move || {
+        let cache = waveform_cache.read();
+        
+        // Update deck 1 track if waveform became available
+        if let Some(track) = deck1_track() {
+            if !track.has_waveform() {
+                if let Some(peaks) = cache.get(&track.id) {
+                    let mut updated_track = track.clone();
+                    updated_track.set_waveform(peaks.clone());
+                    deck1_track.set(Some(updated_track));
+                }
+            }
+        }
+        
+        // Update deck 2 track if waveform became available
+        if let Some(track) = deck2_track() {
+            if !track.has_waveform() {
+                if let Some(peaks) = cache.get(&track.id) {
+                    let mut updated_track = track.clone();
+                    updated_track.set_waveform(peaks.clone());
+                    deck2_track.set(Some(updated_track));
+                }
+            }
+        }
+    });
+
     // Periodically update deck positions while playing
     use_future(move || async move {
         loop {
@@ -54,7 +82,6 @@ pub fn DjView() -> Element {
                     }
                 }
             }
-            // If lock is held by a control action, just skip this update
         }
     });
 
@@ -161,18 +188,34 @@ pub fn DjView() -> Element {
             .find(|t| t.id == track_id)
             .cloned();
 
-        if let Some(track) = track {
+        if let Some(mut track) = track {
+            let track_path = track.path.clone();
+            let needs_waveform = !track.has_waveform();
+
+            // Check if waveform is in cache (from previous analysis)
+            if needs_waveform {
+                if let Some(peaks) = app_state.get_waveform(track_id) {
+                    track.set_waveform(peaks);
+                }
+            }
+
+            // Load track immediately (don't wait for waveform)
             if let Ok(mut eng) = (app_state.engine)().lock() {
                 let deck_idx = deck - 1; // Convert to 0-indexed
                 if eng.load_track(deck_idx, track.clone()).is_ok() {
                     if deck == 1 {
-                        deck1_track.set(Some(track));
+                        deck1_track.set(Some(track.clone()));
                         deck1_state.set(DeckDisplayState::Stopped);
                     } else {
-                        deck2_track.set(Some(track));
+                        deck2_track.set(Some(track.clone()));
                         deck2_state.set(DeckDisplayState::Stopped);
                     }
                 }
+            }
+
+            // Spawn background waveform analysis if needed
+            if needs_waveform && app_state.get_waveform(track_id).is_none() {
+                spawn_waveform_analysis(app_state, track_id, track_path);
             }
         }
     };

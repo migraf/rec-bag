@@ -171,12 +171,18 @@ impl SqliteStorage {
                     sample_rate INTEGER,
                     bitrate INTEGER,
                     year INTEGER,
-                    track_number INTEGER
+                    track_number INTEGER,
+                    waveform_json TEXT
                 )
                 "#,
                 (),
             )
             .await?;
+
+        // Migration: Add waveform column if it doesn't exist
+        let _ = self.conn
+            .execute("ALTER TABLE tracks ADD COLUMN waveform_json TEXT", ())
+            .await;
 
         // Create playlists table
         self.conn
@@ -329,14 +335,21 @@ impl SqliteStorage {
 
     /// Insert or update a track.
     async fn upsert_track(&self, track: &Track) -> Result<(), StorageError> {
+        // Serialize waveform to JSON if present
+        let waveform_json = track
+            .waveform
+            .as_ref()
+            .map(|w| serde_json::to_string(w).ok())
+            .flatten();
+
         self.conn
             .execute(
                 r#"
                 INSERT INTO tracks (
                     id, path, title, artist, album, duration_ms, bpm, key, genre,
                     rating, comment, added_at, last_played, play_count, sample_rate,
-                    bitrate, year, track_number
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                    bitrate, year, track_number, waveform_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                 ON CONFLICT(id) DO UPDATE SET
                     path = excluded.path,
                     title = excluded.title,
@@ -353,7 +366,8 @@ impl SqliteStorage {
                     sample_rate = excluded.sample_rate,
                     bitrate = excluded.bitrate,
                     year = excluded.year,
-                    track_number = excluded.track_number
+                    track_number = excluded.track_number,
+                    waveform_json = excluded.waveform_json
                 "#,
                 params![
                     track.id.to_string(),
@@ -374,6 +388,7 @@ impl SqliteStorage {
                     track.bitrate.map(|b| b as i64),
                     track.year.map(|y| y as i64),
                     track.track_number.map(|t| t as i64),
+                    waveform_json,
                 ],
             )
             .await?;
@@ -420,6 +435,11 @@ impl SqliteStorage {
         let bitrate: Option<i64> = row.get(15)?;
         let year: Option<i64> = row.get(16)?;
         let track_number: Option<i64> = row.get(17)?;
+        let waveform_json: Option<String> = row.get(18).ok().flatten();
+
+        // Parse waveform from JSON
+        let waveform = waveform_json
+            .and_then(|json| serde_json::from_str(&json).ok());
 
         Ok(Track {
             id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4()),
@@ -446,6 +466,7 @@ impl SqliteStorage {
             bitrate: bitrate.map(|b| b as u32),
             year: year.map(|y| y as u32),
             track_number: track_number.map(|t| t as u32),
+            waveform,
         })
     }
 

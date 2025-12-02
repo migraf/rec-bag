@@ -1,6 +1,6 @@
 //! Trackbar component for seeking within a track.
 //!
-//! Designed with a placeholder area for future waveform display.
+//! Displays waveform visualization when available.
 
 use dioxus::prelude::*;
 use std::time::Duration;
@@ -16,6 +16,9 @@ pub struct TrackbarProps {
     pub is_playing: bool,
     /// Whether a track is loaded
     pub has_track: bool,
+    /// Waveform peaks data (optional)
+    #[props(default)]
+    pub waveform_peaks: Option<Vec<f32>>,
     /// Callback when user seeks to a new position
     pub on_seek: EventHandler<Duration>,
     /// Deck number for styling (1 or 2)
@@ -36,7 +39,30 @@ fn remaining_time(position: Duration, duration: Duration) -> Duration {
     duration.saturating_sub(position)
 }
 
-/// A seekable trackbar with waveform placeholder area.
+/// Downsample waveform peaks to fit display width.
+fn downsample_peaks(peaks: &[f32], target_count: usize) -> Vec<f32> {
+    if peaks.is_empty() || target_count == 0 {
+        return vec![];
+    }
+    if peaks.len() <= target_count {
+        return peaks.to_vec();
+    }
+    
+    let chunk_size = peaks.len() / target_count;
+    peaks
+        .chunks(chunk_size)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .copied()
+                .unwrap_or(0.0)
+        })
+        .take(target_count)
+        .collect()
+}
+
+/// A seekable trackbar with waveform visualization.
 #[component]
 pub fn Trackbar(props: TrackbarProps) -> Element {
     let progress = if props.duration.as_secs_f64() > 0.0 {
@@ -52,7 +78,7 @@ pub fn Trackbar(props: TrackbarProps) -> Element {
         format!("trackbar deck-{}-trackbar disabled", props.deck_number)
     };
 
-    // Handle click to seek (using range input for now, waveform click handling for future)
+    // Handle click to seek
     let on_seek = props.on_seek.clone();
 
     let handle_click = move |_e: MouseEvent| {
@@ -60,16 +86,49 @@ pub fn Trackbar(props: TrackbarProps) -> Element {
         // For now, the invisible range slider handles seeking
     };
 
+    // Downsample waveform to ~200 bars for display
+    let display_peaks = props
+        .waveform_peaks
+        .as_ref()
+        .map(|p| downsample_peaks(p, 200))
+        .unwrap_or_default();
+
+    let has_waveform = !display_peaks.is_empty();
+
     rsx! {
         div {
             class: "{deck_class}",
 
-            // Waveform placeholder area (clickable for seeking)
+            // Waveform area (clickable for seeking)
             div {
                 class: "trackbar-waveform",
                 onclick: handle_click,
 
-                // Progress fill
+                // Render waveform bars if data is available
+                if has_waveform {
+                    div { class: "waveform-bars",
+                        for (i, peak) in display_peaks.iter().enumerate() {
+                            {
+                                let bar_progress = (i as f64 / display_peaks.len() as f64) * 100.0;
+                                let is_played = bar_progress < progress;
+                                let height_pct = (peak * 100.0).max(2.0);
+                                let bar_class = if is_played { "waveform-bar played" } else { "waveform-bar" };
+                                rsx! {
+                                    div {
+                                        key: "{i}",
+                                        class: "{bar_class}",
+                                        style: "height: {height_pct}%",
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Fallback pattern when no waveform data
+                    div { class: "trackbar-waveform-pattern" }
+                }
+
+                // Progress overlay (semi-transparent)
                 div {
                     class: "trackbar-progress",
                     style: "width: {progress}%",
@@ -81,10 +140,7 @@ pub fn Trackbar(props: TrackbarProps) -> Element {
                     style: "left: {progress}%",
                 }
 
-                // Waveform placeholder pattern
-                div { class: "trackbar-waveform-pattern" }
-
-                // Seek slider (invisible, inside waveform for proper positioning)
+                // Seek slider (invisible, for precise control)
                 input {
                     r#type: "range",
                     class: "trackbar-slider",
@@ -108,4 +164,3 @@ pub fn Trackbar(props: TrackbarProps) -> Element {
         }
     }
 }
-

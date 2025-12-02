@@ -8,6 +8,25 @@ use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Waveform peaks data for visualization (stored as JSON blob).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct WaveformPeaks {
+    /// Normalized peak values (0.0 to 1.0)
+    pub peaks: Vec<f32>,
+}
+
+impl WaveformPeaks {
+    /// Create empty waveform peaks.
+    pub fn empty() -> Self {
+        Self { peaks: Vec::new() }
+    }
+
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.peaks.is_empty()
+    }
+}
+
 /// Represents a single audio track with its metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Track {
@@ -47,6 +66,9 @@ pub struct Track {
     pub year: Option<u32>,
     /// Track number in album
     pub track_number: Option<u32>,
+    /// Waveform peaks for visualization
+    #[serde(default)]
+    pub waveform: Option<WaveformPeaks>,
 }
 
 impl Track {
@@ -84,7 +106,18 @@ impl Track {
             bitrate: None,
             year: None,
             track_number: None,
+            waveform: None,
         }
+    }
+
+    /// Set waveform data from extracted peaks.
+    pub fn set_waveform(&mut self, peaks: Vec<f32>) {
+        self.waveform = Some(WaveformPeaks { peaks });
+    }
+
+    /// Check if waveform data is available.
+    pub fn has_waveform(&self) -> bool {
+        self.waveform.as_ref().map(|w| !w.is_empty()).unwrap_or(false)
     }
 
     /// Load metadata from the audio file.
