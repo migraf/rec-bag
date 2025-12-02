@@ -85,7 +85,7 @@ pub fn PlaylistBrowser(props: PlaylistBrowserProps) -> Element {
                                 onclick: move |_| props.on_select.call(id),
                                 div { class: "playlist-info",
                                     span { class: "playlist-name", "{playlist.name}" }
-                                    span { class: "playlist-count", "{playlist.tracks.len()} tracks" }
+                                    span { class: "playlist-count", "({playlist.tracks.len()})" }
                                 }
                                 button {
                                     class: "btn-delete",

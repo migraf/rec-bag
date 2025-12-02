@@ -8,6 +8,7 @@ dioxus = { workspace = true }
 api = { workspace = true }
 rec_core = { version = "0.1.0", path = "../core", default-features = false }
 uuid = { workspace = true, features = ["v4", "serde"] }
+chrono.workspace = true
 
 [features]
 server = ["api/server"]

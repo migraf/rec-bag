@@ -1,5 +1,6 @@
 //! Storage abstraction for local and cloud backends.
 
+use crate::source::{MusicSource, SourceType};
 use crate::{Library, Playlist, Track};
 use chrono::{DateTime, Utc};
 use libsql::{params, Builder, Connection, Database};
@@ -221,6 +222,50 @@ impl SqliteStorage {
         self.conn
             .execute(
                 "CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist ON playlist_tracks(playlist_id)",
+                (),
+            )
+            .await?;
+
+        // Create sources table (designed for future cloud storage support)
+        self.conn
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS sources (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source_type TEXT NOT NULL DEFAULT 'local',
+                    uri TEXT NOT NULL,
+                    config_json TEXT,
+                    track_count INTEGER DEFAULT 0,
+                    enabled INTEGER DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    last_scanned TEXT
+                )
+                "#,
+                (),
+            )
+            .await?;
+
+        // Create source_tracks junction table to track which tracks came from which source
+        self.conn
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS source_tracks (
+                    source_id TEXT NOT NULL,
+                    track_id TEXT NOT NULL,
+                    PRIMARY KEY (source_id, track_id),
+                    FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE,
+                    FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+                )
+                "#,
+                (),
+            )
+            .await?;
+
+        // Index for source lookups
+        self.conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_source_tracks_source ON source_tracks(source_id)",
                 (),
             )
             .await?;
@@ -505,6 +550,189 @@ impl SqliteStorage {
     /// Get the storage location description.
     pub fn location(&self) -> String {
         self.db_path.display().to_string()
+    }
+
+    // ==================== Source Management ====================
+
+    /// Load all music sources.
+    pub async fn load_sources(&self) -> Result<Vec<MusicSource>, StorageError> {
+        let mut sources = Vec::new();
+        let mut rows = self
+            .conn
+            .query("SELECT * FROM sources ORDER BY created_at", ())
+            .await?;
+
+        while let Some(row) = rows.next().await? {
+            sources.push(self.row_to_source(&row)?);
+        }
+
+        Ok(sources)
+    }
+
+    /// Get a single source by ID.
+    pub async fn get_source(&self, id: Uuid) -> Result<Option<MusicSource>, StorageError> {
+        let mut rows = self
+            .conn
+            .query("SELECT * FROM sources WHERE id = ?1", params![id.to_string()])
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            Ok(Some(self.row_to_source(&row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Insert or update a music source.
+    pub async fn upsert_source(&self, source: &MusicSource) -> Result<(), StorageError> {
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO sources (id, name, source_type, uri, config_json, track_count, enabled, created_at, last_scanned)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    source_type = excluded.source_type,
+                    uri = excluded.uri,
+                    config_json = excluded.config_json,
+                    track_count = excluded.track_count,
+                    enabled = excluded.enabled,
+                    last_scanned = excluded.last_scanned
+                "#,
+                params![
+                    source.id.to_string(),
+                    source.name.clone(),
+                    source.source_type.as_str().to_string(),
+                    source.uri.clone(),
+                    source.config.clone(),
+                    source.track_count as i64,
+                    if source.enabled { 1i64 } else { 0i64 },
+                    source.created_at.to_rfc3339(),
+                    source.last_scanned.map(|d| d.to_rfc3339()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a music source by ID.
+    pub async fn delete_source(&self, id: Uuid) -> Result<(), StorageError> {
+        // First remove source-track associations
+        self.conn
+            .execute(
+                "DELETE FROM source_tracks WHERE source_id = ?1",
+                params![id.to_string()],
+            )
+            .await?;
+
+        // Then remove the source
+        self.conn
+            .execute("DELETE FROM sources WHERE id = ?1", params![id.to_string()])
+            .await?;
+
+        Ok(())
+    }
+
+    /// Associate tracks with a source (after scanning).
+    pub async fn link_tracks_to_source(
+        &self,
+        source_id: Uuid,
+        track_ids: &[Uuid],
+    ) -> Result<(), StorageError> {
+        // Clear existing associations for this source
+        self.conn
+            .execute(
+                "DELETE FROM source_tracks WHERE source_id = ?1",
+                params![source_id.to_string()],
+            )
+            .await?;
+
+        // Insert new associations
+        for track_id in track_ids {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO source_tracks (source_id, track_id) VALUES (?1, ?2)",
+                    params![source_id.to_string(), track_id.to_string()],
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get all track IDs from a source.
+    pub async fn get_source_track_ids(&self, source_id: Uuid) -> Result<Vec<Uuid>, StorageError> {
+        let mut track_ids = Vec::new();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT track_id FROM source_tracks WHERE source_id = ?1",
+                params![source_id.to_string()],
+            )
+            .await?;
+
+        while let Some(row) = rows.next().await? {
+            let id_str: String = row.get(0)?;
+            if let Ok(id) = Uuid::parse_str(&id_str) {
+                track_ids.push(id);
+            }
+        }
+
+        Ok(track_ids)
+    }
+
+    /// Get tracks from a specific source.
+    pub async fn get_source_tracks(&self, source_id: Uuid) -> Result<Vec<Track>, StorageError> {
+        let mut tracks = Vec::new();
+        let mut rows = self
+            .conn
+            .query(
+                r#"
+                SELECT t.* FROM tracks t
+                INNER JOIN source_tracks st ON t.id = st.track_id
+                WHERE st.source_id = ?1
+                ORDER BY t.title
+                "#,
+                params![source_id.to_string()],
+            )
+            .await?;
+
+        while let Some(row) = rows.next().await? {
+            tracks.push(self.row_to_track(&row)?);
+        }
+
+        Ok(tracks)
+    }
+
+    /// Convert a database row to a MusicSource.
+    fn row_to_source(&self, row: &libsql::Row) -> Result<MusicSource, StorageError> {
+        let id_str: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let source_type_str: String = row.get(2)?;
+        let uri: String = row.get(3)?;
+        let config_json: Option<String> = row.get(4)?;
+        let track_count: i64 = row.get(5)?;
+        let enabled: i64 = row.get(6)?;
+        let created_at_str: String = row.get(7)?;
+        let last_scanned_str: Option<String> = row.get(8)?;
+
+        Ok(MusicSource {
+            id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4()),
+            name,
+            source_type: SourceType::from_str(&source_type_str),
+            uri,
+            config: config_json,
+            track_count: track_count as u32,
+            enabled: enabled != 0,
+            created_at: DateTime::parse_from_rfc3339(&created_at_str)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            last_scanned: last_scanned_str.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .ok()
+            }),
+        })
     }
 }
 

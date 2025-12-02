@@ -1,0 +1,6 @@
+---
+description: When managing dependencies the cargo cli should be used
+alwaysApply: false
+---
+
+Always use the cargo cli (add, remove etc.) for dependency management in rust

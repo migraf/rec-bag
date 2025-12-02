@@ -1,8 +1,11 @@
 //! Shared application state using Dioxus Context API.
 
 use dioxus::prelude::*;
-use rec_core::{extract_waveform, AudioEngine, Library, Playlist, SqliteStorage, Track};
-use std::collections::HashMap;
+use rec_core::{
+    extract_waveform, AudioEngine, Library, MusicSource, Playlist, SearchEngine, SqliteStorage,
+    Track,
+};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use uuid::Uuid;
@@ -28,20 +31,28 @@ pub struct AppState {
     pub storage: Signal<Option<Arc<SqliteStorage>>>,
     /// All playlists
     pub playlists: Signal<Vec<Playlist>>,
-    /// Scanned library tracks (not in any playlist yet)
+    /// Scanned library tracks (from all sources)
     pub library_tracks: Signal<Vec<Track>>,
+    /// Music sources (folders to watch for music files)
+    pub sources: Signal<Vec<MusicSource>>,
     /// Currently selected playlist ID
     pub selected_playlist_id: Signal<Option<Uuid>>,
+    /// Current search query for filtering
+    pub search_query: Signal<String>,
     /// Flag to trigger save
     save_pending: Signal<bool>,
     /// Waveform results cache (for reactive updates)
     pub waveform_cache: Signal<HashMap<Uuid, Vec<f32>>>,
     /// Tracks currently being analyzed
-    pub analyzing_tracks: Signal<std::collections::HashSet<Uuid>>,
+    pub analyzing_tracks: Signal<HashSet<Uuid>>,
     /// Channel sender for waveform results
     pub waveform_tx: Signal<WaveformSender>,
     /// Channel receiver for waveform results (wrapped in Arc<Mutex> for sharing)
     waveform_rx: Signal<Arc<StdMutex<WaveformReceiver>>>,
+    /// Track loaded on deck 1 (shared across views)
+    pub deck1_track: Signal<Option<Track>>,
+    /// Track loaded on deck 2 (shared across views)
+    pub deck2_track: Signal<Option<Track>>,
 }
 
 impl AppState {
@@ -55,12 +66,16 @@ impl AppState {
             storage: Signal::new(None),
             playlists: Signal::new(Vec::new()),
             library_tracks: Signal::new(Vec::new()),
+            sources: Signal::new(Vec::new()),
             selected_playlist_id: Signal::new(None),
+            search_query: Signal::new(String::new()),
             save_pending: Signal::new(false),
             waveform_cache: Signal::new(HashMap::new()),
-            analyzing_tracks: Signal::new(std::collections::HashSet::new()),
+            analyzing_tracks: Signal::new(HashSet::new()),
             waveform_tx: Signal::new(tx),
             waveform_rx: Signal::new(Arc::new(StdMutex::new(rx))),
+            deck1_track: Signal::new(None),
+            deck2_track: Signal::new(None),
         }
     }
 
@@ -69,7 +84,7 @@ impl AppState {
         match SqliteStorage::default_location().await {
             Ok(storage) => {
                 let storage = Arc::new(storage);
-                
+
                 // Load existing data
                 match storage.load_library_async().await {
                     Ok(library) => {
@@ -95,8 +110,21 @@ impl AppState {
                         eprintln!("Failed to load library from storage: {}", e);
                     }
                 }
-                
-                self.storage.set(Some(storage));
+
+                // Load music sources
+                match storage.load_sources().await {
+                    Ok(sources) => {
+                        self.sources.set(sources);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load sources: {}", e);
+                    }
+                }
+
+                self.storage.set(Some(storage.clone()));
+
+                // Trigger auto-rescan of all enabled sources on startup
+                self.rescan_all_sources().await;
             }
             Err(e) => {
                 eprintln!("Failed to initialize storage: {}", e);
@@ -161,10 +189,13 @@ impl AppState {
 
         // Update cache for reactive updates
         self.waveform_cache.write().insert(track_id, peaks.clone());
-        
+
         // Remove from analyzing set
         self.analyzing_tracks.write().remove(&track_id);
-        
+
+        // Update deck tracks if they have this track
+        self.update_deck_waveform(track_id, peaks.clone());
+
         // Update library tracks
         let mut library_tracks = self.library_tracks.write();
         if let Some(track) = library_tracks.iter_mut().find(|t| t.id == track_id) {
@@ -234,29 +265,355 @@ impl AppState {
         }
     }
 
-    /// Scan a folder for audio files.
+    // ==================== Source Management ====================
+
+    /// Add a new music source folder.
+    pub async fn add_source(mut self, path: String) -> Option<Uuid> {
+        // Check if path exists and is a directory
+        let path_obj = std::path::Path::new(&path);
+        if !path_obj.exists() || !path_obj.is_dir() {
+            return None;
+        }
+
+        // Check if source already exists
+        if self.sources.read().iter().any(|s| s.uri == path) {
+            return None;
+        }
+
+        let mut source = MusicSource::new_local(&path);
+        let source_id = source.id;
+
+        // Scan the folder for tracks
+        let tracks = self.scan_source_folder(&path);
+        source.set_track_count(tracks.len() as u32);
+
+        // Save source to storage
+        if let Some(storage) = self.storage.read().as_ref() {
+            if let Err(e) = storage.upsert_source(&source).await {
+                eprintln!("Failed to save source: {}", e);
+                return None;
+            }
+
+            // Link tracks to source
+            let track_ids: Vec<Uuid> = tracks.iter().map(|t| t.id).collect();
+            if let Err(e) = storage.link_tracks_to_source(source_id, &track_ids).await {
+                eprintln!("Failed to link tracks to source: {}", e);
+            }
+        }
+
+        // Add tracks to library
+        let mut library_tracks = self.library_tracks.write();
+        for track in tracks {
+            if !library_tracks.iter().any(|t| t.path == track.path) {
+                library_tracks.push(track);
+            }
+        }
+        drop(library_tracks);
+
+        // Add source to state
+        self.sources.write().push(source);
+        self.mark_save_pending();
+
+        Some(source_id)
+    }
+
+    /// Remove a music source.
+    pub async fn remove_source(mut self, source_id: Uuid) {
+        // Remove from storage
+        if let Some(storage) = self.storage.read().as_ref() {
+            if let Err(e) = storage.delete_source(source_id).await {
+                eprintln!("Failed to delete source: {}", e);
+            }
+        }
+
+        // Remove from state
+        self.sources.write().retain(|s| s.id != source_id);
+        self.mark_save_pending();
+    }
+
+    /// Rescan a specific source for changes.
+    pub async fn rescan_source(mut self, source_id: Uuid) {
+        let source = self.sources.read().iter().find(|s| s.id == source_id).cloned();
+
+        if let Some(mut source) = source {
+            if !source.enabled || !source.is_local() {
+                return;
+            }
+
+            let path = source.uri.clone();
+            let tracks = self.scan_source_folder(&path);
+            source.set_track_count(tracks.len() as u32);
+
+            // Update storage
+            if let Some(storage) = self.storage.read().as_ref() {
+                // Update source
+                let _ = storage.upsert_source(&source).await;
+
+                // Update track links
+                let track_ids: Vec<Uuid> = tracks.iter().map(|t| t.id).collect();
+                let _ = storage.link_tracks_to_source(source_id, &track_ids).await;
+            }
+
+            // Update library tracks (merge new tracks)
+            let mut library_tracks = self.library_tracks.write();
+            for track in tracks {
+                if !library_tracks.iter().any(|t| t.path == track.path) {
+                    library_tracks.push(track);
+                }
+            }
+            drop(library_tracks);
+
+            // Update source in state
+            let mut sources = self.sources.write();
+            if let Some(s) = sources.iter_mut().find(|s| s.id == source_id) {
+                *s = source;
+            }
+            drop(sources);
+
+            self.mark_save_pending();
+        }
+    }
+
+    /// Rescan all enabled sources.
+    pub async fn rescan_all_sources(self) {
+        let source_ids: Vec<Uuid> = self
+            .sources
+            .read()
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.id)
+            .collect();
+
+        for source_id in source_ids {
+            self.rescan_source(source_id).await;
+        }
+    }
+
+    /// Create a playlist from a source folder.
+    pub fn create_playlist_from_source(mut self, source_id: Uuid) -> Option<Uuid> {
+        let source = self.sources.read().iter().find(|s| s.id == source_id).cloned()?;
+
+        // Get tracks from this source
+        let source_path = source.local_path()?;
+        let source_tracks: Vec<Track> = self
+            .library_tracks
+            .read()
+            .iter()
+            .filter(|t| t.path.starts_with(source_path))
+            .cloned()
+            .collect();
+
+        if source_tracks.is_empty() {
+            return None;
+        }
+
+        // Create playlist with source name
+        let mut playlist = Playlist::new(&source.name);
+        for track in source_tracks {
+            playlist.add_track(track);
+        }
+
+        let playlist_id = playlist.id;
+        self.playlists.write().push(playlist);
+        self.mark_save_pending();
+
+        Some(playlist_id)
+    }
+
+    /// Scan a folder for audio files (internal helper).
+    fn scan_source_folder(&self, path: &str) -> Vec<Track> {
+        let mut found_tracks = Vec::new();
+
+        fn scan_recursive(path: &std::path::Path, tracks: &mut Vec<Track>) {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let file_path = entry.path();
+                    if file_path.is_dir() {
+                        scan_recursive(&file_path, tracks);
+                    } else if file_path.is_file() {
+                        if let Some(ext) = file_path.extension() {
+                            let ext = ext.to_string_lossy().to_lowercase();
+                            if matches!(ext.as_str(), "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac")
+                            {
+                                tracks.push(Track::new(file_path));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        scan_recursive(std::path::Path::new(path), &mut found_tracks);
+        found_tracks
+    }
+
+    /// Scan a folder for audio files (legacy method, kept for compatibility).
     pub fn scan_folder(mut self, path: &str) {
         if path.is_empty() {
             return;
         }
 
-        if let Ok(entries) = std::fs::read_dir(path) {
-            let mut found_tracks = Vec::new();
-            for entry in entries.flatten() {
-                let file_path = entry.path();
-                if file_path.is_file() {
-                    if let Some(ext) = file_path.extension() {
-                        let ext = ext.to_string_lossy().to_lowercase();
-                        if matches!(ext.as_str(), "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac") {
-                            found_tracks.push(Track::new(file_path));
-                        }
-                    }
-                }
+        let found_tracks = self.scan_source_folder(path);
+        self.library_tracks.set(found_tracks);
+        self.mark_save_pending();
+    }
+
+    // ==================== Search ====================
+
+    /// Set the search query.
+    pub fn set_search_query(mut self, query: String) {
+        self.search_query.set(query);
+    }
+
+    /// Get filtered library tracks based on search query.
+    pub fn filtered_library_tracks(&self) -> Vec<Track> {
+        let query = self.search_query.read().clone();
+        let tracks = self.library_tracks.read().clone();
+
+        if query.is_empty() {
+            return tracks;
+        }
+
+        let mut engine = SearchEngine::new();
+        engine
+            .search(&query, &tracks)
+            .into_iter()
+            .map(|r| r.track)
+            .collect()
+    }
+
+    /// Get filtered playlist tracks based on search query.
+    pub fn filtered_playlist_tracks(&self) -> Vec<Track> {
+        let query = self.search_query.read().clone();
+        let tracks = self.selected_playlist_tracks();
+
+        if query.is_empty() {
+            return tracks;
+        }
+
+        let mut engine = SearchEngine::new();
+        engine
+            .search(&query, &tracks)
+            .into_iter()
+            .map(|r| r.track)
+            .collect()
+    }
+
+    // ==================== Playlist References ====================
+
+    /// Get all playlists that contain a specific track.
+    pub fn get_playlists_for_track(&self, track_id: Uuid) -> Vec<PlaylistRef> {
+        self.playlists
+            .read()
+            .iter()
+            .filter(|p| p.tracks.iter().any(|t| t.id == track_id))
+            .map(|p| PlaylistRef {
+                id: p.id,
+                name: p.name.clone(),
+            })
+            .collect()
+    }
+
+    // ==================== Batch Operations ====================
+
+    /// Add multiple tracks to a playlist.
+    pub fn add_tracks_to_playlist(mut self, tracks: Vec<Track>, playlist_id: Uuid) {
+        let mut playlists = self.playlists.write();
+        if let Some(playlist) = playlists.iter_mut().find(|p| p.id == playlist_id) {
+            for track in tracks {
+                playlist.add_track(track);
             }
-            self.library_tracks.set(found_tracks);
-            self.mark_save_pending();
+        }
+        drop(playlists);
+        self.mark_save_pending();
+    }
+
+    // ==================== Deck Operations ====================
+
+    /// Load a track to a deck (1 or 2). Updates both the audio engine and shared state.
+    /// Returns true if successful.
+    pub fn load_track_to_deck(mut self, mut track: Track, deck: usize) -> bool {
+        let track_id = track.id;
+        let track_path = track.path.clone();
+        let needs_waveform = !track.has_waveform();
+
+        // Check if waveform is in cache
+        if needs_waveform {
+            if let Some(peaks) = self.get_waveform(track_id) {
+                track.set_waveform(peaks);
+            }
+        }
+
+        // Load track to audio engine
+        let loaded = if let Ok(mut eng) = (self.engine)().lock() {
+            let deck_idx = deck - 1; // Convert to 0-indexed (deck 1 = index 0)
+            eng.load_track(deck_idx, track.clone()).is_ok()
+        } else {
+            false
+        };
+
+        if loaded {
+            // Update shared deck state
+            if deck == 1 {
+                self.deck1_track.set(Some(track.clone()));
+            } else if deck == 2 {
+                self.deck2_track.set(Some(track.clone()));
+            }
+
+            // Spawn background waveform analysis if needed
+            if needs_waveform && self.get_waveform(track_id).is_none() {
+                spawn_waveform_analysis(self, track_id, track_path);
+            }
+        }
+
+        loaded
+    }
+
+    /// Update deck track with new waveform data.
+    pub fn update_deck_waveform(mut self, track_id: Uuid, peaks: Vec<f32>) {
+        // Update deck 1 if it has this track
+        let deck1_update = {
+            let track_opt = self.deck1_track.read().clone();
+            if let Some(mut track) = track_opt {
+                if track.id == track_id && !track.has_waveform() {
+                    track.set_waveform(peaks.clone());
+                    Some(track)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(track) = deck1_update {
+            self.deck1_track.set(Some(track));
+        }
+
+        // Update deck 2 if it has this track
+        let deck2_update = {
+            let track_opt = self.deck2_track.read().clone();
+            if let Some(mut track) = track_opt {
+                if track.id == track_id && !track.has_waveform() {
+                    track.set_waveform(peaks);
+                    Some(track)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(track) = deck2_update {
+            self.deck2_track.set(Some(track));
         }
     }
+}
+
+/// Reference to a playlist (for display purposes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistRef {
+    pub id: Uuid,
+    pub name: String,
 }
 
 /// Provide the app state to the component tree.

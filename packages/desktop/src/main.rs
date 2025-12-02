@@ -38,19 +38,34 @@ fn App() -> Element {
     }
 }
 
-/// Desktop navigation bar.
+/// Desktop navigation bar with tab-style navigation.
 #[component]
 fn DesktopNavbar() -> Element {
+    let route = use_route::<Route>();
+    let is_dj = matches!(route, Route::DjView {});
+    let is_library = matches!(route, Route::Library {});
+
     rsx! {
-        Navbar {
-            Link {
-                to: Route::DjView {},
-                "DJ"
+        nav { class: "main-nav",
+            div { class: "nav-brand",
+                span { class: "brand-icon", "🎧" }
+                span { class: "brand-name", "rec_bag" }
             }
-            Link {
-                to: Route::Library {},
-                "Library"
+            div { class: "nav-tabs",
+                Link {
+                    to: Route::DjView {},
+                    class: if is_dj { "nav-tab active" } else { "nav-tab" },
+                    span { class: "nav-tab-icon", "🎛️" }
+                    span { class: "nav-tab-label", "DJ" }
+                }
+                Link {
+                    to: Route::Library {},
+                    class: if is_library { "nav-tab active" } else { "nav-tab" },
+                    span { class: "nav-tab-icon", "📚" }
+                    span { class: "nav-tab-label", "Library" }
+                }
             }
+            div { class: "nav-spacer" }
         }
         Outlet::<Route> {}
     }

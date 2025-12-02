@@ -56,6 +56,81 @@ body {
     background: rgba(0, 212, 255, 0.1);
 }
 
+/* Main Navigation Bar */
+.main-nav {
+    display: flex;
+    align-items: center;
+    background: linear-gradient(180deg, var(--bg-secondary) 0%, var(--bg-primary) 100%);
+    border-bottom: 1px solid var(--border-color);
+    padding: 0;
+    height: 48px;
+    gap: 0;
+}
+
+.nav-brand {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0 1rem;
+    height: 100%;
+    border-right: 1px solid var(--border-color);
+}
+
+.brand-icon {
+    font-size: 1.25rem;
+}
+
+.brand-name {
+    font-size: 0.875rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    letter-spacing: -0.02em;
+}
+
+.nav-tabs {
+    display: flex;
+    height: 100%;
+    gap: 0;
+}
+
+.nav-tab {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0 1.25rem;
+    height: 100%;
+    color: var(--text-secondary);
+    text-decoration: none;
+    font-weight: 500;
+    font-size: 0.875rem;
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s ease;
+    position: relative;
+}
+
+.nav-tab:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.nav-tab.active {
+    color: var(--accent-primary);
+    border-bottom-color: var(--accent-primary);
+    background: rgba(0, 212, 255, 0.05);
+}
+
+.nav-tab-icon {
+    font-size: 1.125rem;
+}
+
+.nav-tab-label {
+    font-weight: 600;
+}
+
+.nav-spacer {
+    flex: 1;
+}
+
 /* DJ View Layout */
 .dj-view {
     display: flex;
@@ -537,6 +612,7 @@ body {
 .playlist-count {
     font-size: 0.6875rem;
     color: var(--text-muted);
+    margin-left: 0.5rem;
 }
 
 .btn-delete {
@@ -912,4 +988,475 @@ body {
 .not-found a {
     color: var(--accent-primary);
     text-decoration: none;
+}
+
+/* ==================== Sources Panel ==================== */
+.sources-panel {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    margin-bottom: 0.5rem;
+    overflow: hidden;
+}
+
+.sources-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.4rem 0.5rem;
+    background: var(--bg-tertiary);
+    cursor: pointer;
+    user-select: none;
+}
+
+.sources-header:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.sources-header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+}
+
+.sources-header-left h3 {
+    margin: 0;
+    font-size: 0.625rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-secondary);
+}
+
+.sources-count {
+    font-size: 0.625rem;
+    color: var(--text-muted);
+}
+
+.collapse-icon {
+    font-size: 0.5rem;
+    color: var(--text-muted);
+    transition: transform 0.2s;
+}
+
+.collapse-icon.collapsed {
+    transform: rotate(-90deg);
+}
+
+.sources-header-actions {
+    display: flex;
+    gap: 0.25rem;
+}
+
+.sources-header-actions .btn-icon {
+    width: 18px;
+    height: 18px;
+    font-size: 0.75rem;
+}
+
+.add-source-form {
+    padding: 0.5rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.add-source-form input {
+    width: 100%;
+    padding: 0.375rem 0.5rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 0.75rem;
+    margin-bottom: 0.375rem;
+}
+
+.add-source-form input:focus {
+    outline: none;
+    border-color: var(--accent-primary);
+}
+
+.add-source-buttons {
+    display: flex;
+    gap: 0.25rem;
+}
+
+.sources-list {
+    max-height: 150px;
+    overflow-y: auto;
+}
+
+.source-item {
+    border-bottom: 1px solid var(--border-color);
+}
+
+.source-item:last-child {
+    border-bottom: none;
+}
+
+.source-row {
+    display: flex;
+    align-items: center;
+    padding: 0.4rem 0.5rem;
+    gap: 0.375rem;
+    cursor: pointer;
+    transition: background 0.1s;
+}
+
+.source-row:hover {
+    background: var(--bg-tertiary);
+}
+
+.source-item.expanded .source-row {
+    background: rgba(0, 212, 255, 0.05);
+}
+
+.source-icon {
+    font-size: 0.875rem;
+    opacity: 0.7;
+}
+
+.source-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.source-name {
+    font-size: 0.75rem;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.source-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.625rem;
+    color: var(--text-muted);
+}
+
+.source-separator {
+    color: var(--border-color);
+}
+
+.source-details {
+    padding: 0.5rem;
+    background: var(--bg-primary);
+    border-top: 1px solid var(--border-color);
+}
+
+.source-path {
+    display: flex;
+    gap: 0.375rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.6875rem;
+}
+
+.source-path-label {
+    color: var(--text-muted);
+}
+
+.source-path-value {
+    color: var(--text-secondary);
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.source-actions {
+    display: flex;
+    gap: 0.375rem;
+    flex-wrap: wrap;
+}
+
+.source-actions .btn-small {
+    font-size: 0.625rem;
+    padding: 0.2rem 0.4rem;
+}
+
+.btn-danger {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.btn-danger:hover {
+    background: rgba(255, 68, 68, 0.15) !important;
+}
+
+.sources-empty {
+    padding: 1rem;
+    font-size: 0.75rem;
+}
+
+/* ==================== Search Bar ==================== */
+.search-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.5rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    transition: border-color 0.15s;
+}
+
+.search-bar.focused {
+    border-color: var(--accent-primary);
+}
+
+.search-bar.compact {
+    padding: 0.25rem 0.375rem;
+}
+
+.search-icon {
+    font-size: 0.75rem;
+    opacity: 0.5;
+}
+
+.search-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    font-size: 0.8125rem;
+    outline: none;
+}
+
+.search-input::placeholder {
+    color: var(--text-muted);
+}
+
+.search-results-badge {
+    font-size: 0.625rem;
+    padding: 0.125rem 0.375rem;
+    background: var(--accent-primary);
+    color: var(--bg-primary);
+    border-radius: 10px;
+    font-weight: 600;
+}
+
+.search-clear-btn {
+    width: 16px;
+    height: 16px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    transition: all 0.15s;
+}
+
+.search-clear-btn:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+/* ==================== Context Menu ==================== */
+.context-menu-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 999;
+}
+
+.context-menu {
+    position: fixed;
+    z-index: 1000;
+    min-width: 180px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+    padding: 0.25rem 0;
+    animation: contextMenuFadeIn 0.1s ease-out;
+}
+
+@keyframes contextMenuFadeIn {
+    from {
+        opacity: 0;
+        transform: scale(0.95);
+    }
+    to {
+        opacity: 1;
+        transform: scale(1);
+    }
+}
+
+.context-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.75rem;
+    cursor: pointer;
+    transition: background 0.1s;
+    position: relative;
+}
+
+.context-menu-item:hover {
+    background: var(--bg-tertiary);
+}
+
+.context-menu-item.danger:hover {
+    background: rgba(255, 68, 68, 0.15);
+}
+
+.context-menu-item.danger .menu-label,
+.context-menu-item.danger .menu-icon {
+    color: var(--danger);
+}
+
+.context-menu-item.has-submenu {
+    padding-right: 1.5rem;
+}
+
+.menu-icon {
+    width: 16px;
+    font-size: 0.75rem;
+    text-align: center;
+    color: var(--text-muted);
+}
+
+.menu-label {
+    flex: 1;
+    font-size: 0.8125rem;
+}
+
+.menu-arrow {
+    position: absolute;
+    right: 0.5rem;
+    font-size: 0.625rem;
+    color: var(--text-muted);
+}
+
+.context-menu-separator {
+    height: 1px;
+    background: var(--border-color);
+    margin: 0.25rem 0;
+}
+
+.context-submenu {
+    position: absolute;
+    left: 100%;
+    top: 0;
+    min-width: 160px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+    padding: 0.25rem 0;
+    margin-left: 2px;
+}
+
+/* ==================== Playlist Badges ==================== */
+.col-playlists {
+    width: 100px;
+}
+
+.playlist-badges {
+    display: flex;
+    gap: 0.25rem;
+    flex-wrap: wrap;
+}
+
+.playlist-badge {
+    display: inline-block;
+    padding: 0.1rem 0.35rem;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    font-size: 0.5625rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    max-width: 60px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.playlist-badge.overflow {
+    background: var(--accent-primary);
+    border-color: var(--accent-primary);
+    color: var(--bg-primary);
+    font-weight: 600;
+}
+
+/* ==================== Multi-Selection ==================== */
+.col-checkbox {
+    width: 28px;
+    text-align: center;
+}
+
+.col-checkbox input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+    accent-color: var(--accent-primary);
+}
+
+.track-row.selected {
+    background: rgba(0, 212, 255, 0.1);
+}
+
+.track-row.selected:hover {
+    background: rgba(0, 212, 255, 0.15);
+}
+
+/* Selection highlight for multiple tracks */
+.track-row.multi-selected {
+    background: rgba(0, 212, 255, 0.08);
+    border-left: 2px solid var(--accent-primary);
+}
+
+/* ==================== Track Panel Header with Search ==================== */
+.track-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+}
+
+.track-panel-header .search-bar {
+    max-width: 200px;
+}
+
+.track-panel-title {
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-secondary);
+}
+
+.track-panel-count {
+    font-size: 0.625rem;
+    color: var(--text-muted);
+    margin-left: 0.5rem;
+}
+
+/* ==================== Denser Track List ==================== */
+.track-list.dense th {
+    padding: 0.375rem 0.5rem;
+}
+
+.track-list.dense td {
+    padding: 0.25rem 0.5rem;
+}
+
+.track-list.dense .col-number {
+    width: 28px;
+}
+
+.track-list.dense .btn-load {
+    width: 18px;
+    height: 18px;
+    font-size: 0.5625rem;
+}
+
+.track-list.dense .btn-remove {
+    width: 18px;
+    height: 18px;
 }
