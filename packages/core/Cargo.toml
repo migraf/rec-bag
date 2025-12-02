@@ -1,0 +1,22 @@
+[package]
+name = "rec_core"
+version = "0.1.0"
+edition = "2021"
+description = "Core audio engine, playlist logic, and storage traits for rec_bag"
+
+[features]
+default = ["audio"]
+audio = ["dep:rodio"]
+
+[dependencies]
+rodio = { version = "0.20", default-features = false, features = ["symphonia-all"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs-next = "2.0.0"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+

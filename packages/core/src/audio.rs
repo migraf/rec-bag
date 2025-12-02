@@ -1,0 +1,250 @@
+//! Multi-channel audio engine using rodio.
+//!
+//! Provides configurable deck-based playback for DJ applications.
+
+use crate::Track;
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Arc;
+use std::time::Duration;
+use thiserror::Error;
+
+/// Errors that can occur during audio operations.
+#[derive(Debug, Error)]
+pub enum AudioError {
+    #[error("Failed to open audio file: {0}")]
+    FileOpen(#[from] std::io::Error),
+    #[error("Failed to decode audio: {0}")]
+    Decode(#[from] rodio::decoder::DecoderError),
+    #[error("Failed to initialize audio output stream")]
+    StreamInit,
+    #[error("Invalid deck index: {0}")]
+    InvalidDeck(usize),
+    #[error("No track loaded on deck {0}")]
+    NoTrackLoaded(usize),
+}
+
+/// State of a single deck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeckState {
+    /// No track loaded
+    Empty,
+    /// Track loaded but not playing
+    Stopped,
+    /// Track is playing
+    Playing,
+    /// Track is paused
+    Paused,
+}
+
+/// A single playback deck with its own sink and controls.
+pub struct Deck {
+    sink: Sink,
+    state: DeckState,
+    loaded_track: Option<Track>,
+    volume: f32,
+}
+
+impl Deck {
+    /// Create a new deck with the given output stream handle.
+    fn new(stream_handle: &OutputStreamHandle) -> Result<Self, AudioError> {
+        let sink = Sink::try_new(stream_handle).map_err(|_| AudioError::StreamInit)?;
+        sink.pause(); // Start paused
+
+        Ok(Self {
+            sink,
+            state: DeckState::Empty,
+            loaded_track: None,
+            volume: 1.0,
+        })
+    }
+
+    /// Load a track onto this deck.
+    pub fn load(&mut self, track: Track) -> Result<(), AudioError> {
+        // Stop any current playback
+        self.sink.stop();
+
+        // Open and decode the file
+        let file = File::open(&track.path)?;
+        let source = Decoder::new(BufReader::new(file))?;
+
+        // Create new sink and append source
+        self.sink.append(source);
+        self.sink.set_volume(self.volume);
+        self.sink.pause();
+
+        self.loaded_track = Some(track);
+        self.state = DeckState::Stopped;
+
+        Ok(())
+    }
+
+    /// Start or resume playback.
+    pub fn play(&mut self) {
+        if self.loaded_track.is_some() {
+            self.sink.play();
+            self.state = DeckState::Playing;
+        }
+    }
+
+    /// Pause playback.
+    pub fn pause(&mut self) {
+        self.sink.pause();
+        if self.loaded_track.is_some() {
+            self.state = DeckState::Paused;
+        }
+    }
+
+    /// Stop playback and reset position.
+    pub fn stop(&mut self) {
+        self.sink.stop();
+        if self.loaded_track.is_some() {
+            self.state = DeckState::Stopped;
+        }
+    }
+
+    /// Set volume (0.0 to 1.0+).
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.max(0.0);
+        self.sink.set_volume(self.volume);
+    }
+
+    /// Get current volume.
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
+
+    /// Get current state.
+    pub fn state(&self) -> DeckState {
+        self.state
+    }
+
+    /// Get the currently loaded track.
+    pub fn loaded_track(&self) -> Option<&Track> {
+        self.loaded_track.as_ref()
+    }
+
+    /// Check if the sink is empty (track finished).
+    pub fn is_finished(&self) -> bool {
+        self.sink.empty()
+    }
+
+    /// Get playback position (if supported).
+    pub fn position(&self) -> Duration {
+        self.sink.get_pos()
+    }
+
+    /// Seek to a position.
+    pub fn seek(&mut self, position: Duration) -> Result<(), AudioError> {
+        self.sink
+            .try_seek(position)
+            .map_err(|_| AudioError::StreamInit)
+    }
+}
+
+/// Multi-deck audio engine for DJ playback.
+pub struct AudioEngine {
+    // Keep the stream alive - it must outlive all sinks
+    _stream: OutputStream,
+    stream_handle: Arc<OutputStreamHandle>,
+    decks: Vec<Deck>,
+}
+
+impl AudioEngine {
+    /// Create a new audio engine with the specified number of decks.
+    pub fn new(deck_count: usize) -> Result<Self, AudioError> {
+        let (stream, stream_handle) =
+            OutputStream::try_default().map_err(|_| AudioError::StreamInit)?;
+        let stream_handle = Arc::new(stream_handle);
+
+        let mut decks = Vec::with_capacity(deck_count);
+        for _ in 0..deck_count {
+            decks.push(Deck::new(&stream_handle)?);
+        }
+
+        Ok(Self {
+            _stream: stream,
+            stream_handle,
+            decks,
+        })
+    }
+
+    /// Create a standard 2-deck setup.
+    pub fn two_deck() -> Result<Self, AudioError> {
+        Self::new(2)
+    }
+
+    /// Create a 4-deck setup.
+    pub fn four_deck() -> Result<Self, AudioError> {
+        Self::new(4)
+    }
+
+    /// Get the number of decks.
+    pub fn deck_count(&self) -> usize {
+        self.decks.len()
+    }
+
+    /// Add a new deck to the engine.
+    pub fn add_deck(&mut self) -> Result<usize, AudioError> {
+        let deck = Deck::new(&self.stream_handle)?;
+        self.decks.push(deck);
+        Ok(self.decks.len() - 1)
+    }
+
+    /// Get a reference to a deck by index.
+    pub fn deck(&self, index: usize) -> Result<&Deck, AudioError> {
+        self.decks.get(index).ok_or(AudioError::InvalidDeck(index))
+    }
+
+    /// Get a mutable reference to a deck by index.
+    pub fn deck_mut(&mut self, index: usize) -> Result<&mut Deck, AudioError> {
+        self.decks
+            .get_mut(index)
+            .ok_or(AudioError::InvalidDeck(index))
+    }
+
+    /// Load a track onto a specific deck.
+    pub fn load_track(&mut self, deck_index: usize, track: Track) -> Result<(), AudioError> {
+        self.deck_mut(deck_index)?.load(track)
+    }
+
+    /// Play a specific deck.
+    pub fn play(&mut self, deck_index: usize) -> Result<(), AudioError> {
+        self.deck_mut(deck_index)?.play();
+        Ok(())
+    }
+
+    /// Pause a specific deck.
+    pub fn pause(&mut self, deck_index: usize) -> Result<(), AudioError> {
+        self.deck_mut(deck_index)?.pause();
+        Ok(())
+    }
+
+    /// Stop a specific deck.
+    pub fn stop(&mut self, deck_index: usize) -> Result<(), AudioError> {
+        self.deck_mut(deck_index)?.stop();
+        Ok(())
+    }
+
+    /// Set volume for a specific deck.
+    pub fn set_volume(&mut self, deck_index: usize, volume: f32) -> Result<(), AudioError> {
+        self.deck_mut(deck_index)?.set_volume(volume);
+        Ok(())
+    }
+
+    /// Stop all decks.
+    pub fn stop_all(&mut self) {
+        for deck in &mut self.decks {
+            deck.stop();
+        }
+    }
+
+    /// Pause all decks.
+    pub fn pause_all(&mut self) {
+        for deck in &mut self.decks {
+            deck.pause();
+        }
+    }
+}
+

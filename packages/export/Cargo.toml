@@ -1,0 +1,12 @@
+[package]
+name = "export"
+version = "0.1.0"
+edition = "2021"
+description = "Extensible export plugins for rec_bag DJ playlist manager"
+
+[dependencies]
+rec_core = { version = "0.1.0", path = "../core", default-features = false }
+quick-xml = { version = "0.38.4", features = ["serialize"] }
+thiserror.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+

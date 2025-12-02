@@ -1,0 +1,13 @@
+[package]
+name = "ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dioxus = { workspace = true }
+api = { workspace = true }
+rec_core = { version = "0.1.0", path = "../core", default-features = false }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+[features]
+server = ["api/server"]
