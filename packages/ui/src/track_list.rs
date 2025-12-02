@@ -43,28 +43,35 @@ pub fn TrackList(props: TrackListProps) -> Element {
             table {
                 thead {
                     tr {
+                        th { class: "col-number", "#" }
                         th { class: "col-title", "Title" }
                         th { class: "col-artist", "Artist" }
+                        th { class: "col-album", "Album" }
+                        th { class: "col-genre", "Genre" }
                         th { class: "col-bpm", "BPM" }
                         th { class: "col-key", "Key" }
-                        th { class: "col-duration", "Duration" }
+                        th { class: "col-duration", "Time" }
                         th { class: "col-actions", "Load" }
                     }
                 }
                 tbody {
-                    for track in props.tracks.iter() {
+                    for (idx, track) in props.tracks.iter().enumerate() {
                         {
                             let id = track.id;
                             let is_selected = props.selected_id == Some(id);
+                            let row_num = idx + 1;
                             rsx! {
                                 tr {
                                     key: "{id}",
                                     class: if is_selected { "track-row selected" } else { "track-row" },
                                     onclick: move |_| props.on_select.call(id),
+                                    td { class: "col-number", "{row_num}" }
                                     td { class: "col-title", "{track.title}" }
                                     td { class: "col-artist", "{track.artist.clone().unwrap_or_default()}" }
+                                    td { class: "col-album", "{track.album.clone().unwrap_or_default()}" }
+                                    td { class: "col-genre", "{track.genre.clone().unwrap_or_default()}" }
                                     td { class: "col-bpm",
-                                        {track.bpm.map(|b| format!("{:.1}", b)).unwrap_or_default()}
+                                        {track.bpm.map(|b| format!("{:.0}", b)).unwrap_or_default()}
                                     }
                                     td { class: "col-key",
                                         {track.key.clone().unwrap_or_default()}
@@ -105,4 +112,3 @@ pub fn TrackList(props: TrackListProps) -> Element {
         }
     }
 }
-

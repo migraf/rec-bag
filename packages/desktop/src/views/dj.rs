@@ -19,14 +19,44 @@ pub fn DjView() -> Element {
     let mut deck2_track: Signal<Option<Track>> = use_signal(|| None);
     let mut deck1_volume = use_signal(|| 1.0f32);
     let mut deck2_volume = use_signal(|| 1.0f32);
-    let deck1_position = use_signal(|| Duration::ZERO);
-    let deck2_position = use_signal(|| Duration::ZERO);
+    let mut deck1_position = use_signal(|| Duration::ZERO);
+    let mut deck2_position = use_signal(|| Duration::ZERO);
 
     // Track selection (local to this view)
     let mut selected_track_id: Signal<Option<Uuid>> = use_signal(|| None);
 
     // Get tracks for currently selected playlist
     let current_tracks = use_memo(move || app_state.selected_playlist_tracks());
+
+    // Periodically update deck positions while playing
+    use_future(move || async move {
+        loop {
+            // Update every 200ms for smooth display
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // Use try_lock to avoid blocking UI interactions
+            if let Ok(eng) = (app_state.engine)().try_lock() {
+                // Update deck 1 position
+                if let Ok(deck) = eng.deck(0) {
+                    deck1_position.set(deck.position());
+                    // Auto-update state if track finished
+                    if deck1_state() == DeckDisplayState::Playing && deck.is_finished() {
+                        deck1_state.set(DeckDisplayState::Stopped);
+                    }
+                }
+
+                // Update deck 2 position
+                if let Ok(deck) = eng.deck(1) {
+                    deck2_position.set(deck.position());
+                    // Auto-update state if track finished
+                    if deck2_state() == DeckDisplayState::Playing && deck.is_finished() {
+                        deck2_state.set(DeckDisplayState::Stopped);
+                    }
+                }
+            }
+            // If lock is held by a control action, just skip this update
+        }
+    });
 
     // Deck 1 controls
     let on_deck1_play = move |_| {
@@ -57,6 +87,15 @@ pub fn DjView() -> Element {
         }
     };
 
+    let on_deck1_seek = move |pos: Duration| {
+        if let Ok(mut eng) = (app_state.engine)().lock() {
+            if let Ok(deck) = eng.deck_mut(0) {
+                let _ = deck.seek(pos);
+                deck1_position.set(pos);
+            }
+        }
+    };
+
     // Deck 2 controls
     let on_deck2_play = move |_| {
         if let Ok(mut eng) = (app_state.engine)().lock() {
@@ -83,6 +122,15 @@ pub fn DjView() -> Element {
         if let Ok(mut eng) = (app_state.engine)().lock() {
             let _ = eng.set_volume(1, vol);
             deck2_volume.set(vol);
+        }
+    };
+
+    let on_deck2_seek = move |pos: Duration| {
+        if let Ok(mut eng) = (app_state.engine)().lock() {
+            if let Ok(deck) = eng.deck_mut(1) {
+                let _ = deck.seek(pos);
+                deck2_position.set(pos);
+            }
         }
     };
 
@@ -151,6 +199,7 @@ pub fn DjView() -> Element {
                     on_pause: on_deck1_pause,
                     on_stop: on_deck1_stop,
                     on_volume_change: on_deck1_volume,
+                    on_seek: on_deck1_seek,
                     on_file_drop: |_| {}
                 }
                 DeckControl {
@@ -163,6 +212,7 @@ pub fn DjView() -> Element {
                     on_pause: on_deck2_pause,
                     on_stop: on_deck2_stop,
                     on_volume_change: on_deck2_volume,
+                    on_seek: on_deck2_seek,
                     on_file_drop: |_| {}
                 }
             }

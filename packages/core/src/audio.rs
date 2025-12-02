@@ -41,48 +41,54 @@ pub enum DeckState {
 /// A single playback deck with its own sink and controls.
 pub struct Deck {
     sink: Sink,
+    stream_handle: Arc<OutputStreamHandle>,
     state: DeckState,
     loaded_track: Option<Track>,
     volume: f32,
+    /// Track if audio has been loaded (separate from track metadata)
+    has_audio: bool,
 }
 
 impl Deck {
     /// Create a new deck with the given output stream handle.
-    fn new(stream_handle: &OutputStreamHandle) -> Result<Self, AudioError> {
-        let sink = Sink::try_new(stream_handle).map_err(|_| AudioError::StreamInit)?;
+    fn new(stream_handle: Arc<OutputStreamHandle>) -> Result<Self, AudioError> {
+        let sink = Sink::try_new(&stream_handle).map_err(|_| AudioError::StreamInit)?;
         sink.pause(); // Start paused
 
         Ok(Self {
             sink,
+            stream_handle,
             state: DeckState::Empty,
             loaded_track: None,
             volume: 1.0,
+            has_audio: false,
         })
     }
 
     /// Load a track onto this deck.
     pub fn load(&mut self, track: Track) -> Result<(), AudioError> {
-        // Stop any current playback
-        self.sink.stop();
+        // Create a fresh sink to ensure clean state
+        self.sink = Sink::try_new(&self.stream_handle).map_err(|_| AudioError::StreamInit)?;
 
         // Open and decode the file
         let file = File::open(&track.path)?;
         let source = Decoder::new(BufReader::new(file))?;
 
-        // Create new sink and append source
+        // Append source and configure
         self.sink.append(source);
         self.sink.set_volume(self.volume);
         self.sink.pause();
 
         self.loaded_track = Some(track);
         self.state = DeckState::Stopped;
+        self.has_audio = true;
 
         Ok(())
     }
 
     /// Start or resume playback.
     pub fn play(&mut self) {
-        if self.loaded_track.is_some() {
+        if self.has_audio {
             self.sink.play();
             self.state = DeckState::Playing;
         }
@@ -91,17 +97,32 @@ impl Deck {
     /// Pause playback.
     pub fn pause(&mut self) {
         self.sink.pause();
-        if self.loaded_track.is_some() {
+        if self.has_audio {
             self.state = DeckState::Paused;
         }
     }
 
     /// Stop playback and reset position.
     pub fn stop(&mut self) {
-        self.sink.stop();
-        if self.loaded_track.is_some() {
-            self.state = DeckState::Stopped;
+        // Create a fresh sink to reset position
+        if let Ok(new_sink) = Sink::try_new(&self.stream_handle) {
+            self.sink = new_sink;
+            self.sink.set_volume(self.volume);
+            self.sink.pause();
         }
+        
+        // Reload the track if we have one
+        if let Some(ref track) = self.loaded_track {
+            if let Ok(file) = File::open(&track.path) {
+                if let Ok(source) = Decoder::new(BufReader::new(file)) {
+                    self.sink.append(source);
+                    self.sink.pause();
+                    self.has_audio = true;
+                }
+            }
+        }
+        
+        self.state = DeckState::Stopped;
     }
 
     /// Set volume (0.0 to 1.0+).
@@ -125,9 +146,16 @@ impl Deck {
         self.loaded_track.as_ref()
     }
 
-    /// Check if the sink is empty (track finished).
+    /// Check if the track has finished playing.
+    /// This is different from is_empty - it only returns true if
+    /// we had audio and it finished.
     pub fn is_finished(&self) -> bool {
-        self.sink.empty()
+        self.has_audio && self.sink.empty()
+    }
+
+    /// Check if the deck has a track loaded.
+    pub fn has_track(&self) -> bool {
+        self.loaded_track.is_some()
     }
 
     /// Get playback position (if supported).
@@ -140,6 +168,11 @@ impl Deck {
         self.sink
             .try_seek(position)
             .map_err(|_| AudioError::StreamInit)
+    }
+    
+    /// Check if currently playing (based on sink state, not our state tracking).
+    pub fn is_playing(&self) -> bool {
+        !self.sink.is_paused() && !self.sink.empty()
     }
 }
 
@@ -160,7 +193,7 @@ impl AudioEngine {
 
         let mut decks = Vec::with_capacity(deck_count);
         for _ in 0..deck_count {
-            decks.push(Deck::new(&stream_handle)?);
+            decks.push(Deck::new(stream_handle.clone())?);
         }
 
         Ok(Self {
@@ -187,7 +220,7 @@ impl AudioEngine {
 
     /// Add a new deck to the engine.
     pub fn add_deck(&mut self) -> Result<usize, AudioError> {
-        let deck = Deck::new(&self.stream_handle)?;
+        let deck = Deck::new(self.stream_handle.clone())?;
         self.decks.push(deck);
         Ok(self.decks.len() - 1)
     }
@@ -247,4 +280,3 @@ impl AudioEngine {
         }
     }
 }
-

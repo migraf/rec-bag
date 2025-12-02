@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use state::use_app_state_provider;
+use state::{use_app_state_provider, use_storage_init};
 use ui::Navbar;
 use views::{DjView, Library};
 
@@ -29,6 +29,8 @@ fn main() {
 fn App() -> Element {
     // Provide global app state to all components
     use_app_state_provider();
+    // Initialize SQLite storage and auto-save
+    use_storage_init();
 
     rsx! {
         document::Link { rel: "stylesheet", href: MAIN_CSS }

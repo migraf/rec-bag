@@ -17,3 +17,6 @@ pub use playlist_browser::{PlaylistBrowser, PlaylistBrowserProps};
 
 mod track_list;
 pub use track_list::{TrackList, TrackListProps};
+
+mod trackbar;
+pub use trackbar::{Trackbar, TrackbarProps};

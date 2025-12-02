@@ -125,7 +125,11 @@ pub fn Library() -> Element {
                     thead {
                         tr {
                             th { "Title" }
-                            th { "Path" }
+                            th { "Artist" }
+                            th { "Album" }
+                            th { "Duration" }
+                            th { "Genre" }
+                            th { "Bitrate" }
                             th { "Actions" }
                         }
                     }
@@ -133,11 +137,16 @@ pub fn Library() -> Element {
                         for track in library_tracks.iter() {
                             {
                                 let track_clone = track.clone();
-                                let path_display = track.path.display().to_string();
+                                let duration_str = track.duration_string();
+                                let bitrate_str = track.bitrate_string();
                                 rsx! {
                                     tr { key: "{track.id}",
                                         td { "{track.title}" }
-                                        td { class: "path-cell", "{path_display}" }
+                                        td { class: "col-artist", "{track.artist.clone().unwrap_or_default()}" }
+                                        td { class: "col-album", "{track.album.clone().unwrap_or_default()}" }
+                                        td { class: "col-duration", "{duration_str}" }
+                                        td { class: "col-genre", "{track.genre.clone().unwrap_or_default()}" }
+                                        td { class: "col-bitrate", "{bitrate_str}" }
                                         td {
                                             button {
                                                 class: "btn-small",

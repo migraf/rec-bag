@@ -14,6 +14,6 @@ pub mod track;
 #[cfg(feature = "audio")]
 pub use audio::{AudioEngine, Deck, DeckState};
 pub use playlist::{Library, Playlist};
-pub use storage::{LocalStorage, StorageBackend, StorageError};
+pub use storage::{LocalStorage, SqliteStorage, StorageBackend, StorageError};
 pub use track::Track;
 

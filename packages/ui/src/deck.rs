@@ -1,5 +1,6 @@
 //! Deck control component for audio playback.
 
+use crate::Trackbar;
 use dioxus::prelude::*;
 use rec_core::Track;
 use std::time::Duration;
@@ -34,23 +35,21 @@ pub struct DeckControlProps {
     pub on_stop: EventHandler<()>,
     /// Callback when volume changes
     pub on_volume_change: EventHandler<f32>,
+    /// Callback when seeking to a position
+    pub on_seek: EventHandler<Duration>,
     /// Callback when a file is dropped
     pub on_file_drop: EventHandler<String>,
-}
-
-/// Format duration as MM:SS.
-fn format_duration(d: Duration) -> String {
-    let total_secs = d.as_secs();
-    let mins = total_secs / 60;
-    let secs = total_secs % 60;
-    format!("{:02}:{:02}", mins, secs)
 }
 
 /// A single deck control panel.
 #[component]
 pub fn DeckControl(props: DeckControlProps) -> Element {
     let is_playing = props.state == DeckDisplayState::Playing;
+    let is_paused = props.state == DeckDisplayState::Paused;
     let has_track = props.track.is_some();
+    let can_play = has_track && !is_playing;
+    let can_pause = has_track && is_playing;
+    let can_stop = has_track && (is_playing || is_paused);
 
     let track_title = props
         .track
@@ -81,8 +80,10 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
         div { class: "deck deck-{props.deck_number}",
             div { class: "deck-header",
                 span { class: "deck-number", "Deck {props.deck_number}" }
-                if !track_bpm.is_empty() {
-                    span { class: "deck-bpm", "{track_bpm}" }
+                div { class: "deck-header-info",
+                    if !track_bpm.is_empty() {
+                        span { class: "deck-bpm", "{track_bpm}" }
+                    }
                 }
             }
 
@@ -93,48 +94,55 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
                         div { class: "track-artist", "{track_artist}" }
                     }
                 }
-                div { class: "time-display",
-                    span { class: "current-time", "{format_duration(props.position)}" }
-                    span { class: "time-separator", " / " }
-                    span { class: "total-time", "{format_duration(duration)}" }
-                }
             }
 
-            div { class: "deck-controls",
-                button {
-                    class: "control-btn play-btn",
-                    disabled: !has_track || is_playing,
-                    onclick: move |_| props.on_play.call(()),
-                    "▶"
-                }
-                button {
-                    class: "control-btn pause-btn",
-                    disabled: !has_track || !is_playing,
-                    onclick: move |_| props.on_pause.call(()),
-                    "⏸"
-                }
-                button {
-                    class: "control-btn stop-btn",
-                    disabled: !has_track,
-                    onclick: move |_| props.on_stop.call(()),
-                    "⏹"
-                }
+            // Trackbar with waveform placeholder
+            Trackbar {
+                position: props.position,
+                duration,
+                is_playing,
+                has_track,
+                on_seek: props.on_seek.clone(),
+                deck_number: props.deck_number,
             }
 
-            div { class: "volume-control",
-                label { "Volume" }
-                input {
-                    r#type: "range",
-                    min: "0",
-                    max: "100",
-                    value: "{(props.volume * 100.0) as i32}",
-                    oninput: move |e| {
-                        if let Ok(val) = e.value().parse::<f32>() {
-                            props.on_volume_change.call(val / 100.0);
-                        }
+            div { class: "deck-controls-row",
+                div { class: "deck-controls",
+                    button {
+                        class: if can_play { "control-btn play-btn" } else { "control-btn play-btn disabled" },
+                        disabled: !can_play,
+                        onclick: move |_| props.on_play.call(()),
+                        "▶"
+                    }
+                    button {
+                        class: if can_pause { "control-btn pause-btn" } else { "control-btn pause-btn disabled" },
+                        disabled: !can_pause,
+                        onclick: move |_| props.on_pause.call(()),
+                        "⏸"
+                    }
+                    button {
+                        class: if can_stop { "control-btn stop-btn" } else { "control-btn stop-btn disabled" },
+                        disabled: !can_stop,
+                        onclick: move |_| props.on_stop.call(()),
+                        "⏹"
                     }
                 }
-                span { "{(props.volume * 100.0) as i32}%" }
+
+                div { class: "volume-control",
+                    label { "Vol" }
+                    input {
+                        r#type: "range",
+                        min: "0",
+                        max: "100",
+                        value: "{(props.volume * 100.0) as i32}",
+                        oninput: move |e| {
+                            if let Ok(val) = e.value().parse::<f32>() {
+                                props.on_volume_change.call(val / 100.0);
+                            }
+                        }
+                    }
+                    span { class: "volume-value", "{(props.volume * 100.0) as i32}%" }
+                }
             }
         }
     }
