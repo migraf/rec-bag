@@ -1,18 +1,27 @@
-//! Audio analysis module for waveform, BPM, and key detection.
+//! Audio analysis module for waveform, BPM, key, and beat grid detection.
 //!
 //! This module provides a unified analysis pipeline that extracts multiple
 //! features from audio files in a single pass.
 
+mod beatgrid;
 mod bpm;
+mod fft;
+mod freq_waveform;
 mod key;
 mod traits;
 mod types;
 mod waveform;
 
+pub use beatgrid::BeatGridAnalyzer;
 pub use bpm::BpmAnalyzer;
+pub use fft::{BandEnergies, FftProcessor, FrequencyBands, WindowType};
+pub use freq_waveform::FrequencyWaveformAnalyzer;
 pub use key::KeyAnalyzer;
 pub use traits::{Analyzer, AnalyzerOutput};
-pub use types::{AnalysisError, AnalysisResult, BpmResult, KeyResult, MusicalKey};
+pub use types::{
+    AnalysisError, AnalysisResult, BeatGridResult, BpmResult, FrequencyWaveform, KeyResult,
+    MusicalKey,
+};
 pub use waveform::WaveformAnalyzer;
 
 use std::path::Path;
@@ -25,7 +34,7 @@ use symphonia::core::probe::Hint;
 
 /// Analyze an audio file and extract all features.
 ///
-/// This function decodes the audio once and runs all analyzers (waveform, BPM, key)
+/// This function decodes the audio once and runs all analyzers (waveform, BPM, key, beat grid)
 /// on the decoded samples.
 pub fn analyze_track(path: impl AsRef<Path>) -> Result<AnalysisResult, AnalysisError> {
     let path = path.as_ref();
@@ -41,16 +50,30 @@ pub fn analyze_track(path: impl AsRef<Path>) -> Result<AnalysisResult, AnalysisE
 
     // Run analyzers
     let waveform_analyzer = WaveformAnalyzer::new();
+    let freq_waveform_analyzer = FrequencyWaveformAnalyzer::new();
     let bpm_analyzer = BpmAnalyzer::new();
     let key_analyzer = KeyAnalyzer::new();
+    let beat_grid_analyzer = BeatGridAnalyzer::new();
 
-    // Extract waveform
+    // Extract simple waveform (for backward compatibility)
     let waveform_peaks = match waveform_analyzer.analyze(&samples, sample_rate) {
         Ok(AnalyzerOutput::Waveform { peaks }) => peaks,
         Ok(_) => Vec::new(),
         Err(e) => {
             eprintln!("Waveform analysis failed: {}", e);
             Vec::new()
+        }
+    };
+
+    // Extract frequency-band waveform
+    let freq_waveform = match freq_waveform_analyzer.analyze(&samples, sample_rate) {
+        Ok(AnalyzerOutput::FrequencyWaveform { low, mid, high }) => {
+            Some(FrequencyWaveform { low, mid, high })
+        }
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("Frequency waveform analysis failed: {}", e);
+            None
         }
     };
 
@@ -74,8 +97,32 @@ pub fn analyze_track(path: impl AsRef<Path>) -> Result<AnalysisResult, AnalysisE
         }
     };
 
+    // Generate beat grid (requires BPM)
+    let beat_grid = if let Some(ref bpm_result) = bpm {
+        match beat_grid_analyzer.analyze_with_bpm(&samples, sample_rate, bpm_result.bpm) {
+            Ok(AnalyzerOutput::BeatGrid {
+                first_beat_ms,
+                beat_interval_ms,
+                beats,
+            }) => Some(BeatGridResult {
+                first_beat_ms,
+                beat_interval_ms,
+                beats,
+            }),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("Beat grid detection failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(AnalysisResult {
         waveform_peaks,
+        freq_waveform,
+        beat_grid,
         duration_secs,
         sample_rate,
         bpm,

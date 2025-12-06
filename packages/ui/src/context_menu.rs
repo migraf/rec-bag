@@ -114,6 +114,8 @@ pub enum ContextMenuAction {
     FixIssues,
     /// Edit metadata for selected track(s)
     EditMetadata,
+    /// Analyze track(s) (waveform, BPM, key, beat grid)
+    Analyze,
 }
 
 /// Context menu component.
@@ -230,6 +232,23 @@ pub fn ContextMenu(props: ContextMenuProps) -> Element {
                         "Edit Metadata ({props.selected_count})"
                     } else {
                         "Edit Metadata"
+                    }
+                }
+            }
+
+            // Analyze option
+            div {
+                class: "context-menu-item",
+                onclick: move |_| {
+                    props.on_action.call(ContextMenuAction::Analyze);
+                    props.on_close.call(());
+                },
+                span { class: "menu-icon", "🔄" }
+                span { class: "menu-label",
+                    if props.selected_count > 1 {
+                        "Analyze ({props.selected_count})"
+                    } else {
+                        "Analyze"
                     }
                 }
             }

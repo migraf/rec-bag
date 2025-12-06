@@ -30,18 +30,42 @@ pub fn DoctorView() -> Element {
         groups
     });
 
-    // Get check descriptions
+    // Get check descriptions (including built-in duplicate check)
     let doctor = app_state.doctor.read().clone();
-    let check_descriptions: HashMap<String, String> = doctor
+    let mut check_descriptions: HashMap<String, String> = doctor
         .checks()
         .iter()
         .map(|c| (c.name().to_string(), c.description().to_string()))
         .collect();
-    let check_can_fix: HashMap<String, bool> = doctor
+    // Add description for the duplicates check (library-wide, not per-track)
+    check_descriptions.insert(
+        "duplicates".to_string(),
+        "Finds tracks with matching artist and title that may be duplicate files".to_string(),
+    );
+
+    let mut check_can_fix: HashMap<String, bool> = doctor
         .checks()
         .iter()
         .map(|c| (c.name().to_string(), c.can_fix()))
         .collect();
+    // Duplicates cannot be auto-fixed (user must decide which to keep)
+    check_can_fix.insert("duplicates".to_string(), false);
+
+    // Calculate duplicate stats
+    let duplicate_count = diagnoses.iter().filter(|d| d.check_name == "duplicates").count();
+    let duplicate_groups = {
+        let mut groups: HashMap<String, Vec<&Diagnosis>> = HashMap::new();
+        for d in diagnoses.iter().filter(|d| d.check_name == "duplicates") {
+            // Extract group key from message
+            if let Some(start) = d.message.find('"') {
+                if let Some(end) = d.message.rfind('"') {
+                    let key = &d.message[start + 1..end];
+                    groups.entry(key.to_string()).or_default().push(d);
+                }
+            }
+        }
+        groups.len()
+    };
 
     // Handlers
     let on_scan = move |_| {
@@ -92,6 +116,7 @@ pub fn DoctorView() -> Element {
             if scanned_count > 0 {
                 {
                     let issues_class = if total_issues > 0 { "summary-value has-issues" } else { "summary-value" };
+                    let duplicates_class = if duplicate_count > 0 { "summary-value has-duplicates" } else { "summary-value" };
                     rsx! {
                         div { class: "doctor-summary",
                             div { class: "summary-card",
@@ -101,6 +126,10 @@ pub fn DoctorView() -> Element {
                             div { class: "summary-card",
                                 div { class: "{issues_class}", "{total_issues}" }
                                 div { class: "summary-label", "Issues Found" }
+                            }
+                            div { class: "summary-card",
+                                div { class: "{duplicates_class}", "{duplicate_groups}" }
+                                div { class: "summary-label", "Duplicate Groups" }
                             }
                             div { class: "summary-card",
                                 div { class: "summary-value fixable", "{fixable_count}" }
@@ -139,11 +168,7 @@ pub fn DoctorView() -> Element {
                                     onclick: move |_| toggle_group(check_name_clone.clone()),
                                     div { class: "issue-group-info",
                                         span { class: "severity-icon",
-                                            match severity {
-                                                Severity::Error => "⛔",
-                                                Severity::Warning => "⚠️",
-                                                Severity::Info => "ℹ️",
-                                            }
+                                            {get_check_icon(&check_name, severity)}
                                         }
                                         div { class: "issue-group-text",
                                             span { class: "issue-group-name", "{format_check_name(&check_name)}" }
@@ -235,6 +260,7 @@ pub fn DoctorView() -> Element {
                     ul {
                         li { "WAV files with CDJ compatibility problems" }
                         li { "Missing metadata (artist, title, BPM, genre)" }
+                        li { "Duplicate tracks (same artist + title)" }
                     }
                 }
             }
@@ -244,15 +270,34 @@ pub fn DoctorView() -> Element {
 
 /// Format check name for display (e.g., "wav_extensible" -> "WAV Extensible")
 fn format_check_name(name: &str) -> String {
-    name.split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(first) => first.to_uppercase().chain(chars).collect(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    // Special case for common names
+    match name {
+        "duplicates" => "Duplicate Tracks".to_string(),
+        "wav_extensible" => "WAV Extensible (CDJ)".to_string(),
+        "metadata_completeness" => "Missing Metadata".to_string(),
+        _ => name
+            .split('_')
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(first) => first.to_uppercase().chain(chars).collect(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// Get the appropriate icon for a check name
+fn get_check_icon(name: &str, severity: Severity) -> &'static str {
+    match name {
+        "duplicates" => "📋",
+        _ => match severity {
+            Severity::Error => "⛔",
+            Severity::Warning => "⚠️",
+            Severity::Info => "ℹ️",
+        },
+    }
 }
 

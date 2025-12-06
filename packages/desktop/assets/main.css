@@ -135,6 +135,15 @@
     color: var(--accent-primary);
 }
 
+/* ==================== Main Content Container ==================== */
+.main-content {
+    min-height: calc(100vh - 48px);
+}
+
+.main-content.with-playback-bar {
+    padding-bottom: 60px;
+}
+
 /* ==================== DJ View Layout ==================== */
 .dj-view {
     display: flex;
@@ -142,6 +151,10 @@
     height: calc(100vh - 48px);
     padding: 0.625rem;
     gap: 0.625rem;
+}
+
+.with-playback-bar .dj-view {
+    height: calc(100vh - 48px - 60px);
 }
 
 .decks-container {
@@ -331,6 +344,10 @@
     overflow-y: auto;
 }
 
+.with-playback-bar .doctor-view {
+    height: calc(100vh - 48px - 60px);
+}
+
 .doctor-header {
     display: flex;
     justify-content: space-between;
@@ -390,6 +407,10 @@
 
 .summary-value.has-issues {
     color: var(--warning);
+}
+
+.summary-value.has-duplicates {
+    color: var(--info, #5bc0de);
 }
 
 .summary-value.fixable {

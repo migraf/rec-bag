@@ -194,6 +194,10 @@ pub fn Library() -> Element {
                 metadata_editor_track_ids.set(selected.iter().copied().collect());
                 metadata_editor_visible.set(true);
             }
+            ContextMenuAction::Analyze => {
+                // Trigger analysis for selected tracks
+                app_state.analyze_tracks(selected.iter().copied().collect());
+            }
             _ => {}
         }
     };

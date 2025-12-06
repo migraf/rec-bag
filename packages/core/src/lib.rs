@@ -24,21 +24,22 @@ pub mod waveform;
 
 #[cfg(feature = "audio")]
 pub use analysis::{
-    analyze_track, Analyzer, AnalyzerOutput, AnalysisError, AnalysisResult,
-    BpmAnalyzer, BpmResult, KeyAnalyzer, KeyResult, MusicalKey, WaveformAnalyzer,
+    analyze_track, Analyzer, AnalyzerOutput, AnalysisError, AnalysisResult, BeatGridAnalyzer,
+    BeatGridResult, BpmAnalyzer, BpmResult, FrequencyWaveform, FrequencyWaveformAnalyzer,
+    KeyAnalyzer, KeyResult, MusicalKey, WaveformAnalyzer,
 };
 #[cfg(feature = "audio")]
 pub use audio::{AudioEngine, Deck, DeckState};
 pub use doctor::{
     Diagnosis, DiagnosisGroup, DiagnosisSummary, DiagnosticCheck, Doctor, DoctorError,
-    MetadataCheck, Severity, WavExtensibleCheck,
+    DuplicateCheck, DuplicateGroup, DuplicateReport, MetadataCheck, Severity, WavExtensibleCheck,
 };
 pub use folder::{build_folder_tree, is_audio_extension, FolderNode};
 pub use playlist::{Library, Playlist};
 pub use search::SearchEngine;
 pub use source::{LocalSourceConfig, MusicSource, SourceType};
 pub use storage::{LocalStorage, SqliteStorage, StorageBackend, StorageError};
-pub use track::{MetadataError, Track, WaveformPeaks};
+pub use track::{BeatGridData, FrequencyWaveformData, MetadataError, Track, WaveformPeaks};
 #[cfg(feature = "audio")]
 pub use waveform::{extract_waveform, WaveformData, WaveformError};
 

@@ -525,6 +525,8 @@ impl SqliteStorage {
             year: year.map(|y| y as u32),
             track_number: track_number.map(|t| t as u32),
             waveform,
+            freq_waveform: None, // Will be computed on analysis
+            beat_grid: None,     // Will be computed on analysis
         })
     }
 

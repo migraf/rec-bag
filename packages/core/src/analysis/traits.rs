@@ -9,8 +9,20 @@ pub enum AnalyzerOutput {
     Bpm { bpm: f32, confidence: f32 },
     /// Musical key with confidence.
     Key { key: super::types::MusicalKey, confidence: f32 },
-    /// Waveform peaks.
+    /// Waveform peaks (simple amplitude-based).
     Waveform { peaks: Vec<f32> },
+    /// Frequency-band waveform (low/mid/high).
+    FrequencyWaveform {
+        low: Vec<f32>,
+        mid: Vec<f32>,
+        high: Vec<f32>,
+    },
+    /// Beat grid with first beat and beat positions.
+    BeatGrid {
+        first_beat_ms: f64,
+        beat_interval_ms: f64,
+        beats: Vec<f64>,
+    },
 }
 
 /// Trait for audio analyzers.

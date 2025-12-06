@@ -27,7 +27,7 @@ pub use track_list::{
 };
 
 mod trackbar;
-pub use trackbar::{Trackbar, TrackbarProps};
+pub use trackbar::{BeatGrid, FrequencyWaveform, Trackbar, TrackbarProps};
 
 mod sources_panel;
 pub use sources_panel::{SourcesPanel, SourcesPanelProps};
@@ -43,3 +43,6 @@ pub use folder_browser::{FolderBrowser, FolderBrowserProps};
 
 mod metadata_editor;
 pub use metadata_editor::{MetadataEditor, MetadataEditorProps, MetadataFields, MetadataSaveEvent};
+
+mod playback_bar;
+pub use playback_bar::{DeckInfo, PlaybackBar, PlaybackBarProps};

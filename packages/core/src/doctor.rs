@@ -347,12 +347,148 @@ impl DiagnosticCheck for MetadataCheck {
 }
 
 // ============================================================================
+// Duplicate Detection
+// ============================================================================
+
+/// Represents a group of duplicate tracks.
+#[derive(Debug, Clone)]
+pub struct DuplicateGroup {
+    /// The common identifier for this group (e.g., normalized "artist - title")
+    pub key: String,
+    /// Track IDs in this duplicate group
+    pub track_ids: Vec<Uuid>,
+    /// Track paths for display
+    pub track_paths: Vec<std::path::PathBuf>,
+}
+
+/// Result of duplicate detection across the library.
+#[derive(Debug, Clone, Default)]
+pub struct DuplicateReport {
+    /// Groups of duplicate tracks
+    pub groups: Vec<DuplicateGroup>,
+    /// Total number of duplicate tracks (including originals)
+    pub total_duplicates: usize,
+}
+
+impl DuplicateReport {
+    /// Check if there are any duplicates.
+    pub fn has_duplicates(&self) -> bool {
+        !self.groups.is_empty()
+    }
+
+    /// Get total number of duplicate groups.
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Get count of extra tracks (total duplicates minus one per group for the "original")
+    pub fn extra_count(&self) -> usize {
+        self.groups.iter().map(|g| g.track_ids.len().saturating_sub(1)).sum()
+    }
+}
+
+/// Detects duplicate tracks in the library based on artist and title.
+pub struct DuplicateCheck;
+
+impl DuplicateCheck {
+    /// Normalize a string for comparison (lowercase, trim whitespace).
+    fn normalize(s: &str) -> String {
+        s.trim().to_lowercase()
+    }
+
+    /// Generate a comparison key from artist and title.
+    fn make_key(artist: Option<&str>, title: &str) -> String {
+        let normalized_artist = artist
+            .map(|a| Self::normalize(a))
+            .unwrap_or_default();
+        let normalized_title = Self::normalize(title);
+
+        if normalized_artist.is_empty() {
+            normalized_title
+        } else {
+            format!("{} - {}", normalized_artist, normalized_title)
+        }
+    }
+
+    /// Find duplicate tracks in a list of tracks.
+    pub fn find_duplicates(tracks: &[Track]) -> DuplicateReport {
+        use std::collections::HashMap;
+
+        // Group tracks by their normalized key
+        let mut by_key: HashMap<String, Vec<(Uuid, std::path::PathBuf)>> = HashMap::new();
+
+        for track in tracks {
+            let key = Self::make_key(track.artist.as_deref(), &track.title);
+            by_key.entry(key).or_default().push((track.id, track.path.clone()));
+        }
+
+        // Filter to only groups with duplicates (more than one track)
+        let groups: Vec<DuplicateGroup> = by_key
+            .into_iter()
+            .filter(|(_, items)| items.len() > 1)
+            .map(|(key, items)| {
+                let (track_ids, track_paths): (Vec<_>, Vec<_>) = items.into_iter().unzip();
+                DuplicateGroup {
+                    key,
+                    track_ids,
+                    track_paths,
+                }
+            })
+            .collect();
+
+        let total_duplicates: usize = groups.iter().map(|g| g.track_ids.len()).sum();
+
+        DuplicateReport {
+            groups,
+            total_duplicates,
+        }
+    }
+
+    /// Convert duplicate report to diagnoses for individual tracks.
+    pub fn to_diagnoses(report: &DuplicateReport) -> Vec<Diagnosis> {
+        let mut diagnoses = Vec::new();
+
+        for group in &report.groups {
+            // Create a diagnosis for each track in the group
+            for (idx, (track_id, track_path)) in group.track_ids.iter().zip(&group.track_paths).enumerate() {
+                let other_count = group.track_ids.len() - 1;
+                let message = if idx == 0 {
+                    format!(
+                        "Duplicate: {} other track(s) with same artist/title",
+                        other_count
+                    )
+                } else {
+                    format!(
+                        "Duplicate of \"{}\" ({} total copies)",
+                        group.key,
+                        group.track_ids.len()
+                    )
+                };
+
+                diagnoses.push(Diagnosis {
+                    check_name: "duplicates".to_string(),
+                    track_id: *track_id,
+                    track_path: track_path.clone(),
+                    severity: Severity::Warning,
+                    message,
+                    fixable: false, // User must decide which to keep
+                });
+            }
+        }
+
+        diagnoses
+    }
+}
+
+// ============================================================================
 // Doctor - Main diagnostic orchestrator
 // ============================================================================
 
 /// The Doctor orchestrates running diagnostic checks on tracks.
+#[derive(Clone)]
 pub struct Doctor {
-    checks: Vec<Box<dyn DiagnosticCheck>>,
+    checks: Vec<std::sync::Arc<dyn DiagnosticCheck>>,
+    check_duplicates: bool,
 }
 
 impl Default for Doctor {
@@ -365,22 +501,39 @@ impl Doctor {
     /// Create a new Doctor with all built-in checks.
     pub fn new() -> Self {
         Self {
-            checks: vec![Box::new(WavExtensibleCheck), Box::new(MetadataCheck)],
+            checks: vec![
+                std::sync::Arc::new(WavExtensibleCheck),
+                std::sync::Arc::new(MetadataCheck),
+            ],
+            check_duplicates: true,
         }
     }
 
     /// Create a Doctor with custom checks.
-    pub fn with_checks(checks: Vec<Box<dyn DiagnosticCheck>>) -> Self {
-        Self { checks }
+    pub fn with_checks(checks: Vec<std::sync::Arc<dyn DiagnosticCheck>>) -> Self {
+        Self {
+            checks,
+            check_duplicates: true,
+        }
+    }
+
+    /// Enable or disable duplicate checking.
+    pub fn set_check_duplicates(&mut self, enabled: bool) {
+        self.check_duplicates = enabled;
+    }
+
+    /// Check if duplicate checking is enabled.
+    pub fn checks_duplicates(&self) -> bool {
+        self.check_duplicates
     }
 
     /// Add a diagnostic check.
-    pub fn add_check(&mut self, check: Box<dyn DiagnosticCheck>) {
+    pub fn add_check(&mut self, check: std::sync::Arc<dyn DiagnosticCheck>) {
         self.checks.push(check);
     }
 
     /// Get all registered checks.
-    pub fn checks(&self) -> &[Box<dyn DiagnosticCheck>] {
+    pub fn checks(&self) -> &[std::sync::Arc<dyn DiagnosticCheck>] {
         &self.checks
     }
 
@@ -389,12 +542,25 @@ impl Doctor {
         self.checks.iter().filter_map(|c| c.check(track)).collect()
     }
 
-    /// Run all checks on multiple tracks.
+    /// Run all checks on multiple tracks, including library-wide checks like duplicates.
     pub fn check_tracks(&self, tracks: &[Track]) -> Vec<Diagnosis> {
-        tracks
+        let mut diagnoses: Vec<Diagnosis> = tracks
             .iter()
             .flat_map(|track| self.check_track(track))
-            .collect()
+            .collect();
+
+        // Run library-wide duplicate detection
+        if self.check_duplicates {
+            let duplicate_report = DuplicateCheck::find_duplicates(tracks);
+            diagnoses.extend(DuplicateCheck::to_diagnoses(&duplicate_report));
+        }
+
+        diagnoses
+    }
+
+    /// Find duplicates in the library (returns detailed report).
+    pub fn find_duplicates(&self, tracks: &[Track]) -> DuplicateReport {
+        DuplicateCheck::find_duplicates(tracks)
     }
 
     /// Fix a specific diagnosis.
@@ -482,8 +648,6 @@ pub struct DiagnosisGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     fn create_test_track(path: std::path::PathBuf) -> Track {
         Track {
@@ -506,6 +670,34 @@ mod tests {
             year: None,
             track_number: None,
             waveform: None,
+            freq_waveform: None,
+            beat_grid: None,
+        }
+    }
+
+    fn create_track_with_metadata(path: &str, artist: &str, title: &str) -> Track {
+        Track {
+            id: Uuid::new_v4(),
+            path: path.into(),
+            title: title.to_string(),
+            artist: Some(artist.to_string()),
+            album: None,
+            duration: None,
+            bpm: Some(128.0),
+            key: None,
+            genre: Some("Electronic".to_string()),
+            rating: None,
+            comment: None,
+            added_at: chrono::Utc::now(),
+            last_played: None,
+            play_count: 0,
+            sample_rate: None,
+            bitrate: None,
+            year: None,
+            track_number: None,
+            waveform: None,
+            freq_waveform: None,
+            beat_grid: None,
         }
     }
 
@@ -542,6 +734,127 @@ mod tests {
         let doctor = Doctor::new();
         // Should run without panicking even for non-existent files
         let _ = doctor.check_track(&track);
+    }
+
+    #[test]
+    fn test_duplicate_detection_no_duplicates() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/track2.mp3", "Artist B", "Song Two"),
+            create_track_with_metadata("/music/track3.mp3", "Artist C", "Song Three"),
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(!report.has_duplicates());
+        assert_eq!(report.group_count(), 0);
+    }
+
+    #[test]
+    fn test_duplicate_detection_exact_match() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/track2.mp3", "Artist A", "Song One"),
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(report.has_duplicates());
+        assert_eq!(report.group_count(), 1);
+        assert_eq!(report.groups[0].track_ids.len(), 2);
+    }
+
+    #[test]
+    fn test_duplicate_detection_case_insensitive() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/track2.mp3", "ARTIST A", "song one"),
+            create_track_with_metadata("/music/track3.mp3", "artist a", "SONG ONE"),
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(report.has_duplicates());
+        assert_eq!(report.group_count(), 1);
+        assert_eq!(report.groups[0].track_ids.len(), 3);
+    }
+
+    #[test]
+    fn test_duplicate_detection_whitespace_trimmed() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/track2.mp3", "  Artist A  ", "  Song One  "),
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(report.has_duplicates());
+        assert_eq!(report.group_count(), 1);
+    }
+
+    #[test]
+    fn test_duplicate_detection_multiple_groups() {
+        let tracks = vec![
+            create_track_with_metadata("/music/a1.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/a2.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/b1.mp3", "Artist B", "Song Two"),
+            create_track_with_metadata("/music/b2.mp3", "Artist B", "Song Two"),
+            create_track_with_metadata("/music/c1.mp3", "Artist C", "Unique Song"),
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(report.has_duplicates());
+        assert_eq!(report.group_count(), 2);
+        assert_eq!(report.extra_count(), 2); // 2 extra copies (one per group)
+    }
+
+    #[test]
+    fn test_duplicate_to_diagnoses() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/track2.mp3", "Artist A", "Song One"),
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        let diagnoses = DuplicateCheck::to_diagnoses(&report);
+
+        assert_eq!(diagnoses.len(), 2);
+        assert!(diagnoses.iter().all(|d| d.check_name == "duplicates"));
+        assert!(diagnoses.iter().all(|d| d.severity == Severity::Warning));
+        assert!(diagnoses.iter().all(|d| !d.fixable)); // Duplicates require manual intervention
+    }
+
+    #[test]
+    fn test_doctor_includes_duplicates() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/track2.mp3", "Artist A", "Song One"),
+        ];
+
+        let doctor = Doctor::new();
+        let diagnoses = doctor.check_tracks(&tracks);
+
+        // Should include duplicate diagnoses
+        let duplicate_diagnoses: Vec<_> = diagnoses
+            .iter()
+            .filter(|d| d.check_name == "duplicates")
+            .collect();
+        assert_eq!(duplicate_diagnoses.len(), 2);
+    }
+
+    #[test]
+    fn test_doctor_disable_duplicate_check() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/track2.mp3", "Artist A", "Song One"),
+        ];
+
+        let mut doctor = Doctor::new();
+        doctor.set_check_duplicates(false);
+        let diagnoses = doctor.check_tracks(&tracks);
+
+        // Should NOT include duplicate diagnoses
+        let duplicate_diagnoses: Vec<_> = diagnoses
+            .iter()
+            .filter(|d| d.check_name == "duplicates")
+            .collect();
+        assert!(duplicate_diagnoses.is_empty());
     }
 }
 

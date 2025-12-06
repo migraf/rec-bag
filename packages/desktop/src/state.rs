@@ -10,11 +10,29 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use uuid::Uuid;
 
-/// Result from track analysis (waveform, BPM, key)
+/// Frequency waveform data for colored visualization.
+#[derive(Debug, Clone, Default)]
+pub struct FreqWaveformData {
+    pub low: Vec<f32>,
+    pub mid: Vec<f32>,
+    pub high: Vec<f32>,
+}
+
+/// Beat grid data for visualization.
+#[derive(Debug, Clone, Default)]
+pub struct BeatGridInfo {
+    pub first_beat_ms: f64,
+    pub beat_interval_ms: f64,
+    pub beats: Vec<f64>,
+}
+
+/// Result from track analysis (waveform, BPM, key, beat grid)
 #[derive(Debug, Clone)]
 pub struct TrackAnalysisResult {
     pub track_id: Uuid,
     pub peaks: Vec<f32>,
+    pub freq_waveform: Option<FreqWaveformData>,
+    pub beat_grid: Option<BeatGridInfo>,
     pub bpm: Option<f32>,
     pub key: Option<String>,
 }
@@ -45,6 +63,10 @@ pub struct AppState {
     save_pending: Signal<bool>,
     /// Waveform results cache (for reactive updates)
     pub waveform_cache: Signal<HashMap<Uuid, Vec<f32>>>,
+    /// Frequency waveform cache
+    pub freq_waveform_cache: Signal<HashMap<Uuid, FreqWaveformData>>,
+    /// Beat grid cache
+    pub beat_grid_cache: Signal<HashMap<Uuid, BeatGridInfo>>,
     /// Tracks currently being analyzed
     pub analyzing_tracks: Signal<HashSet<Uuid>>,
     /// Channel sender for analysis results
@@ -87,6 +109,8 @@ impl AppState {
             search_query: Signal::new(String::new()),
             save_pending: Signal::new(false),
             waveform_cache: Signal::new(HashMap::new()),
+            freq_waveform_cache: Signal::new(HashMap::new()),
+            beat_grid_cache: Signal::new(HashMap::new()),
             analyzing_tracks: Signal::new(HashSet::new()),
             analysis_tx: Signal::new(tx),
             analysis_rx: Signal::new(Arc::new(StdMutex::new(rx))),
@@ -112,21 +136,56 @@ impl AppState {
                 // Load existing data
                 match storage.load_library_async().await {
                     Ok(library) => {
-                        // Pre-populate waveform cache from loaded tracks
-                        let mut cache = HashMap::new();
-                        for track in &library.loose_tracks {
-                            if let Some(wf) = &track.waveform {
-                                cache.insert(track.id, wf.peaks.clone());
+                        // Pre-populate caches from loaded tracks
+                        let mut wf_cache = HashMap::new();
+                        let mut freq_cache = HashMap::new();
+                        let mut beat_cache = HashMap::new();
+
+                        let populate_caches = |track: &Track,
+                                                wf: &mut HashMap<Uuid, Vec<f32>>,
+                                                freq: &mut HashMap<Uuid, FreqWaveformData>,
+                                                beat: &mut HashMap<Uuid, BeatGridInfo>| {
+                            if let Some(w) = &track.waveform {
+                                wf.insert(track.id, w.peaks.clone());
                             }
+                            if let Some(fw) = &track.freq_waveform {
+                                freq.insert(
+                                    track.id,
+                                    FreqWaveformData {
+                                        low: fw.low.clone(),
+                                        mid: fw.mid.clone(),
+                                        high: fw.high.clone(),
+                                    },
+                                );
+                            }
+                            if let Some(bg) = &track.beat_grid {
+                                beat.insert(
+                                    track.id,
+                                    BeatGridInfo {
+                                        first_beat_ms: bg.first_beat_ms,
+                                        beat_interval_ms: bg.beat_interval_ms,
+                                        beats: bg.beats.clone(),
+                                    },
+                                );
+                            }
+                        };
+
+                        for track in &library.loose_tracks {
+                            populate_caches(track, &mut wf_cache, &mut freq_cache, &mut beat_cache);
                         }
                         for playlist in &library.playlists {
                             for track in &playlist.tracks {
-                                if let Some(wf) = &track.waveform {
-                                    cache.insert(track.id, wf.peaks.clone());
-                                }
+                                populate_caches(
+                                    track,
+                                    &mut wf_cache,
+                                    &mut freq_cache,
+                                    &mut beat_cache,
+                                );
                             }
                         }
-                        self.waveform_cache.set(cache);
+                        self.waveform_cache.set(wf_cache);
+                        self.freq_waveform_cache.set(freq_cache);
+                        self.beat_grid_cache.set(beat_cache);
                         self.playlists.set(library.playlists);
                         self.library_tracks.set(library.loose_tracks);
                     }
@@ -202,6 +261,16 @@ impl AppState {
         self.waveform_cache.read().get(&track_id).cloned()
     }
 
+    /// Get frequency waveform for a track from cache.
+    pub fn get_freq_waveform(&self, track_id: Uuid) -> Option<FreqWaveformData> {
+        self.freq_waveform_cache.read().get(&track_id).cloned()
+    }
+
+    /// Get beat grid for a track from cache.
+    pub fn get_beat_grid(&self, track_id: Uuid) -> Option<BeatGridInfo> {
+        self.beat_grid_cache.read().get(&track_id).cloned()
+    }
+
     /// Check if a track is currently being analyzed.
     pub fn is_analyzing(&self, track_id: Uuid) -> bool {
         self.analyzing_tracks.read().contains(&track_id)
@@ -219,25 +288,57 @@ impl AppState {
         results
     }
 
-    /// Apply analysis result to the state (waveform, BPM, key).
+    /// Apply analysis result to the state (waveform, BPM, key, beat grid).
     pub fn apply_analysis_result(mut self, result: TrackAnalysisResult) {
         let track_id = result.track_id;
         let peaks = result.peaks;
+        let freq_waveform = result.freq_waveform;
+        let beat_grid = result.beat_grid;
         let bpm = result.bpm;
         let key = result.key;
 
-        // Update cache for reactive updates
+        // Update caches for reactive updates
         self.waveform_cache.write().insert(track_id, peaks.clone());
+
+        if let Some(ref fw) = freq_waveform {
+            self.freq_waveform_cache
+                .write()
+                .insert(track_id, fw.clone());
+        }
+
+        if let Some(ref bg) = beat_grid {
+            self.beat_grid_cache.write().insert(track_id, bg.clone());
+        }
 
         // Remove from analyzing set
         self.analyzing_tracks.write().remove(&track_id);
 
         // Update deck tracks if they have this track
-        self.update_deck_analysis(track_id, peaks.clone(), bpm, key.clone());
+        self.update_deck_analysis(
+            track_id,
+            peaks.clone(),
+            freq_waveform.clone(),
+            beat_grid.clone(),
+            bpm,
+            key.clone(),
+        );
 
         // Helper to apply all analysis data to a track
-        fn apply_to_track(track: &mut Track, peaks: Vec<f32>, bpm: Option<f32>, key: Option<String>) {
+        fn apply_to_track(
+            track: &mut Track,
+            peaks: Vec<f32>,
+            freq_waveform: Option<FreqWaveformData>,
+            beat_grid: Option<BeatGridInfo>,
+            bpm: Option<f32>,
+            key: Option<String>,
+        ) {
             track.set_waveform(peaks);
+            if let Some(fw) = freq_waveform {
+                track.set_freq_waveform(fw.low, fw.mid, fw.high);
+            }
+            if let Some(bg) = beat_grid {
+                track.set_beat_grid(bg.first_beat_ms, bg.beat_interval_ms, bg.beats);
+            }
             if let Some(bpm_val) = bpm {
                 track.set_bpm(bpm_val);
             }
@@ -249,7 +350,14 @@ impl AppState {
         // Update library tracks
         let mut library_tracks = self.library_tracks.write();
         if let Some(track) = library_tracks.iter_mut().find(|t| t.id == track_id) {
-            apply_to_track(track, peaks.clone(), bpm, key.clone());
+            apply_to_track(
+                track,
+                peaks.clone(),
+                freq_waveform.clone(),
+                beat_grid.clone(),
+                bpm,
+                key.clone(),
+            );
             drop(library_tracks);
             self.mark_save_pending();
             return;
@@ -260,7 +368,7 @@ impl AppState {
         let mut playlists = self.playlists.write();
         for playlist in playlists.iter_mut() {
             if let Some(track) = playlist.tracks.iter_mut().find(|t| t.id == track_id) {
-                apply_to_track(track, peaks, bpm, key);
+                apply_to_track(track, peaks, freq_waveform, beat_grid, bpm, key);
                 break;
             }
         }
@@ -593,6 +701,20 @@ impl AppState {
             }
         }
 
+        // Check if freq waveform is in cache
+        if !track.has_freq_waveform() {
+            if let Some(fw) = self.get_freq_waveform(track_id) {
+                track.set_freq_waveform(fw.low, fw.mid, fw.high);
+            }
+        }
+
+        // Check if beat grid is in cache
+        if !track.has_beat_grid() {
+            if let Some(bg) = self.get_beat_grid(track_id) {
+                track.set_beat_grid(bg.first_beat_ms, bg.beat_interval_ms, bg.beats);
+            }
+        }
+
         // Load track to audio engine
         let loaded = if let Ok(mut eng) = (self.engine)().lock() {
             let deck_idx = deck - 1; // Convert to 0-indexed (deck 1 = index 0)
@@ -609,7 +731,7 @@ impl AppState {
                 self.deck2_track.set(Some(track.clone()));
             }
 
-            // Spawn background analysis if track needs any analysis (waveform, BPM, or key)
+            // Spawn background analysis if track needs any analysis
             if track.needs_analysis() {
                 spawn_track_analysis(self, track_id, track_path);
             }
@@ -618,18 +740,41 @@ impl AppState {
         loaded
     }
 
-    /// Update deck track with analysis results (waveform, BPM, key).
+    /// Update deck track with analysis results (waveform, freq waveform, beat grid, BPM, key).
     pub fn update_deck_analysis(
         mut self,
         track_id: Uuid,
         peaks: Vec<f32>,
+        freq_waveform: Option<FreqWaveformData>,
+        beat_grid: Option<BeatGridInfo>,
         bpm: Option<f32>,
         key: Option<String>,
     ) {
         // Helper to apply analysis to a track
-        fn apply_analysis(track: &mut Track, peaks: &[f32], bpm: Option<f32>, key: &Option<String>) {
+        fn apply_analysis(
+            track: &mut Track,
+            peaks: &[f32],
+            freq_waveform: &Option<FreqWaveformData>,
+            beat_grid: &Option<BeatGridInfo>,
+            bpm: Option<f32>,
+            key: &Option<String>,
+        ) {
             if !track.has_waveform() && !peaks.is_empty() {
                 track.set_waveform(peaks.to_vec());
+            }
+            if !track.has_freq_waveform() {
+                if let Some(fw) = freq_waveform {
+                    track.set_freq_waveform(fw.low.clone(), fw.mid.clone(), fw.high.clone());
+                }
+            }
+            if !track.has_beat_grid() {
+                if let Some(bg) = beat_grid {
+                    track.set_beat_grid(
+                        bg.first_beat_ms,
+                        bg.beat_interval_ms,
+                        bg.beats.clone(),
+                    );
+                }
             }
             if !track.has_bpm() {
                 if let Some(bpm_val) = bpm {
@@ -648,7 +793,7 @@ impl AppState {
             let track_opt = self.deck1_track.read().clone();
             if let Some(mut track) = track_opt {
                 if track.id == track_id && track.needs_analysis() {
-                    apply_analysis(&mut track, &peaks, bpm, &key);
+                    apply_analysis(&mut track, &peaks, &freq_waveform, &beat_grid, bpm, &key);
                     Some(track)
                 } else {
                     None
@@ -666,7 +811,7 @@ impl AppState {
             let track_opt = self.deck2_track.read().clone();
             if let Some(mut track) = track_opt {
                 if track.id == track_id && track.needs_analysis() {
-                    apply_analysis(&mut track, &peaks, bpm, &key);
+                    apply_analysis(&mut track, &peaks, &freq_waveform, &beat_grid, bpm, &key);
                     Some(track)
                 } else {
                     None
@@ -1045,6 +1190,97 @@ impl AppState {
             .collect()
     }
 
+    // ==================== Analysis Operations ====================
+
+    /// Analyze a track (clears cached data and spawns fresh analysis).
+    pub fn analyze_track(mut self, track_id: Uuid) {
+        // Get track path
+        let track_path = self
+            .library_tracks
+            .read()
+            .iter()
+            .find(|t| t.id == track_id)
+            .map(|t| t.path.clone());
+
+        let Some(path) = track_path else {
+            return;
+        };
+
+        // Clear cached analysis data
+        self.waveform_cache.write().remove(&track_id);
+        self.freq_waveform_cache.write().remove(&track_id);
+        self.beat_grid_cache.write().remove(&track_id);
+
+        // Clear analysis data from track in library
+        let mut library_tracks = self.library_tracks.write();
+        if let Some(track) = library_tracks.iter_mut().find(|t| t.id == track_id) {
+            track.waveform = None;
+            track.freq_waveform = None;
+            track.beat_grid = None;
+            track.bpm = None;
+            track.key = None;
+        }
+        drop(library_tracks);
+
+        // Clear from playlists too
+        let mut playlists = self.playlists.write();
+        for playlist in playlists.iter_mut() {
+            if let Some(track) = playlist.tracks.iter_mut().find(|t| t.id == track_id) {
+                track.waveform = None;
+                track.freq_waveform = None;
+                track.beat_grid = None;
+                track.bpm = None;
+                track.key = None;
+            }
+        }
+        drop(playlists);
+
+        // Clear from decks if loaded
+        let deck1_clear = self
+            .deck1_track
+            .read()
+            .as_ref()
+            .map(|t| t.id == track_id)
+            .unwrap_or(false);
+        if deck1_clear {
+            let mut track = self.deck1_track.write();
+            if let Some(ref mut t) = *track {
+                t.waveform = None;
+                t.freq_waveform = None;
+                t.beat_grid = None;
+            }
+        }
+
+        let deck2_clear = self
+            .deck2_track
+            .read()
+            .as_ref()
+            .map(|t| t.id == track_id)
+            .unwrap_or(false);
+        if deck2_clear {
+            let mut track = self.deck2_track.write();
+            if let Some(ref mut t) = *track {
+                t.waveform = None;
+                t.freq_waveform = None;
+                t.beat_grid = None;
+            }
+        }
+
+        // Remove from analyzing set (in case it was stuck)
+        self.analyzing_tracks.write().remove(&track_id);
+
+        // Spawn new analysis
+        spawn_track_analysis(self, track_id, path);
+        self.mark_save_pending();
+    }
+
+    /// Analyze multiple tracks.
+    pub fn analyze_tracks(self, track_ids: Vec<Uuid>) {
+        for track_id in track_ids {
+            self.analyze_track(track_id);
+        }
+    }
+
     // ==================== Theme Operations ====================
 
     /// Get the current theme name.
@@ -1120,7 +1356,7 @@ pub fn use_storage_init() {
     });
 }
 
-/// Spawn background track analysis (waveform, BPM, key detection).
+/// Spawn background track analysis (waveform, BPM, key, beat grid detection).
 /// Uses std::thread::spawn for CPU-intensive work as per Dioxus docs.
 /// Results are sent via channel and processed by use_storage_init's polling loop.
 pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) {
@@ -1136,24 +1372,42 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) 
     let tx = (*app_state.analysis_tx.read()).clone();
 
     // Spawn on a separate thread to avoid blocking UI
-    // As per Dioxus docs: "If you have an expensive task you need to run, 
+    // As per Dioxus docs: "If you have an expensive task you need to run,
     // you should spawn it on a separate thread using std::thread::spawn"
     std::thread::spawn(move || {
         eprintln!("Starting track analysis for {:?}", path);
-        
+
         match analyze_track(&path) {
             Ok(result) => {
                 eprintln!(
-                    "Analysis complete for track {}: {} peaks, BPM: {:?}, Key: {:?}",
+                    "Analysis complete for track {}: {} peaks, BPM: {:?}, Key: {:?}, Beat grid: {}",
                     track_id,
                     result.waveform_peaks.len(),
                     result.bpm.as_ref().map(|b| b.bpm),
-                    result.key.as_ref().map(|k| k.key.to_notation())
+                    result.key.as_ref().map(|k| k.key.to_notation()),
+                    result.beat_grid.as_ref().map(|b| b.beats.len()).unwrap_or(0)
                 );
+
+                // Convert frequency waveform
+                let freq_waveform = result.freq_waveform.map(|fw| FreqWaveformData {
+                    low: fw.low,
+                    mid: fw.mid,
+                    high: fw.high,
+                });
+
+                // Convert beat grid
+                let beat_grid = result.beat_grid.map(|bg| BeatGridInfo {
+                    first_beat_ms: bg.first_beat_ms,
+                    beat_interval_ms: bg.beat_interval_ms,
+                    beats: bg.beats,
+                });
+
                 // Send result back via channel
                 let _ = tx.send(TrackAnalysisResult {
                     track_id,
                     peaks: result.waveform_peaks,
+                    freq_waveform,
+                    beat_grid,
                     bpm: result.bpm.map(|b| b.bpm),
                     key: result.key.map(|k| k.key.to_string()),
                 });

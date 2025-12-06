@@ -27,6 +27,52 @@ impl WaveformPeaks {
     }
 }
 
+/// Frequency-band waveform data for colored visualization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct FrequencyWaveformData {
+    /// Low frequency (bass) peaks.
+    pub low: Vec<f32>,
+    /// Mid frequency peaks.
+    pub mid: Vec<f32>,
+    /// High frequency (treble) peaks.
+    pub high: Vec<f32>,
+}
+
+impl FrequencyWaveformData {
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.low.is_empty() && self.mid.is_empty() && self.high.is_empty()
+    }
+
+    /// Get length (number of points).
+    pub fn len(&self) -> usize {
+        self.low.len()
+    }
+}
+
+/// Beat grid data for visualization and synchronization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BeatGridData {
+    /// Time of the first beat in milliseconds.
+    pub first_beat_ms: f64,
+    /// Time between beats in milliseconds (derived from BPM).
+    pub beat_interval_ms: f64,
+    /// All beat positions in milliseconds.
+    pub beats: Vec<f64>,
+}
+
+impl BeatGridData {
+    /// Check if the beat grid is empty.
+    pub fn is_empty(&self) -> bool {
+        self.beats.is_empty()
+    }
+
+    /// Check if a beat is the start of a bar (every 4th beat).
+    pub fn is_bar_start(&self, beat_index: usize) -> bool {
+        beat_index % 4 == 0
+    }
+}
+
 /// Represents a single audio track with its metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Track {
@@ -66,9 +112,15 @@ pub struct Track {
     pub year: Option<u32>,
     /// Track number in album
     pub track_number: Option<u32>,
-    /// Waveform peaks for visualization
+    /// Waveform peaks for visualization (simple amplitude-based)
     #[serde(default)]
     pub waveform: Option<WaveformPeaks>,
+    /// Frequency-band waveform for colored visualization
+    #[serde(default)]
+    pub freq_waveform: Option<FrequencyWaveformData>,
+    /// Beat grid for beat markers and synchronization
+    #[serde(default)]
+    pub beat_grid: Option<BeatGridData>,
 }
 
 impl Track {
@@ -107,6 +159,8 @@ impl Track {
             year: None,
             track_number: None,
             waveform: None,
+            freq_waveform: None,
+            beat_grid: None,
         }
     }
 
@@ -115,9 +169,39 @@ impl Track {
         self.waveform = Some(WaveformPeaks { peaks });
     }
 
+    /// Set frequency waveform data.
+    pub fn set_freq_waveform(&mut self, low: Vec<f32>, mid: Vec<f32>, high: Vec<f32>) {
+        self.freq_waveform = Some(FrequencyWaveformData { low, mid, high });
+    }
+
+    /// Set beat grid data.
+    pub fn set_beat_grid(&mut self, first_beat_ms: f64, beat_interval_ms: f64, beats: Vec<f64>) {
+        self.beat_grid = Some(BeatGridData {
+            first_beat_ms,
+            beat_interval_ms,
+            beats,
+        });
+    }
+
     /// Check if waveform data is available.
     pub fn has_waveform(&self) -> bool {
         self.waveform.as_ref().map(|w| !w.is_empty()).unwrap_or(false)
+    }
+
+    /// Check if frequency waveform data is available.
+    pub fn has_freq_waveform(&self) -> bool {
+        self.freq_waveform
+            .as_ref()
+            .map(|w| !w.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Check if beat grid is available.
+    pub fn has_beat_grid(&self) -> bool {
+        self.beat_grid
+            .as_ref()
+            .map(|b| !b.is_empty())
+            .unwrap_or(false)
     }
 
     /// Check if BPM has been detected.
@@ -130,9 +214,13 @@ impl Track {
         self.key.is_some()
     }
 
-    /// Check if the track needs analysis (missing waveform, BPM, or key).
+    /// Check if the track needs analysis (missing waveform, BPM, key, or beat grid).
     pub fn needs_analysis(&self) -> bool {
-        !self.has_waveform() || !self.has_bpm() || !self.has_key()
+        !self.has_waveform()
+            || !self.has_freq_waveform()
+            || !self.has_bpm()
+            || !self.has_key()
+            || !self.has_beat_grid()
     }
 
     /// Load metadata from the audio file.

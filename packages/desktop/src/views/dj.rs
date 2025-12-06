@@ -313,6 +313,10 @@ pub fn DjView() -> Element {
             ContextMenuAction::RemoveFromPlaylist => {
                 on_remove_track(selected.iter().copied().collect());
             }
+            ContextMenuAction::Analyze => {
+                // Trigger analysis for selected tracks
+                app_state.analyze_tracks(selected.iter().copied().collect());
+            }
             _ => {}
         }
     };

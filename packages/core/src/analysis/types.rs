@@ -139,11 +139,92 @@ pub struct KeyResult {
     pub confidence: f32,
 }
 
+/// Frequency-band waveform data for colored visualization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct FrequencyWaveform {
+    /// Low frequency (bass) peaks.
+    pub low: Vec<f32>,
+    /// Mid frequency peaks.
+    pub mid: Vec<f32>,
+    /// High frequency (treble) peaks.
+    pub high: Vec<f32>,
+}
+
+impl FrequencyWaveform {
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.low.is_empty() && self.mid.is_empty() && self.high.is_empty()
+    }
+
+    /// Get length (number of points).
+    pub fn len(&self) -> usize {
+        self.low.len()
+    }
+
+    /// Create combined peaks by summing bands (for backward compatibility).
+    pub fn combined_peaks(&self) -> Vec<f32> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        self.low
+            .iter()
+            .zip(self.mid.iter())
+            .zip(self.high.iter())
+            .map(|((l, m), h)| (l + m + h) / 3.0)
+            .collect()
+    }
+}
+
+/// Beat grid data for visualization and synchronization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BeatGridResult {
+    /// Time of the first beat in milliseconds.
+    pub first_beat_ms: f64,
+    /// Time between beats in milliseconds (derived from BPM).
+    pub beat_interval_ms: f64,
+    /// All beat positions in milliseconds.
+    pub beats: Vec<f64>,
+}
+
+impl BeatGridResult {
+    /// Check if the beat grid is empty.
+    pub fn is_empty(&self) -> bool {
+        self.beats.is_empty()
+    }
+
+    /// Get beat count.
+    pub fn beat_count(&self) -> usize {
+        self.beats.len()
+    }
+
+    /// Get bar count (4 beats per bar).
+    pub fn bar_count(&self) -> usize {
+        self.beats.len() / 4
+    }
+
+    /// Check if a beat is the start of a bar (every 4th beat).
+    pub fn is_bar_start(&self, beat_index: usize) -> bool {
+        beat_index % 4 == 0
+    }
+
+    /// Get beat position as fraction of total duration.
+    pub fn beat_position_fraction(&self, beat_index: usize, duration_ms: f64) -> f64 {
+        if beat_index >= self.beats.len() || duration_ms <= 0.0 {
+            return 0.0;
+        }
+        self.beats[beat_index] / duration_ms
+    }
+}
+
 /// Complete analysis result for a track.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnalysisResult {
-    /// Waveform peaks for visualization (0.0 to 1.0).
+    /// Waveform peaks for visualization (0.0 to 1.0) - legacy/fallback.
     pub waveform_peaks: Vec<f32>,
+    /// Frequency-band waveform for colored visualization.
+    pub freq_waveform: Option<FrequencyWaveform>,
+    /// Beat grid for beat markers and synchronization.
+    pub beat_grid: Option<BeatGridResult>,
     /// Duration of the audio in seconds.
     pub duration_secs: f64,
     /// Sample rate of the source audio.
@@ -159,6 +240,8 @@ impl AnalysisResult {
     pub fn empty() -> Self {
         Self {
             waveform_peaks: Vec::new(),
+            freq_waveform: None,
+            beat_grid: None,
             duration_secs: 0.0,
             sample_rate: 0,
             bpm: None,

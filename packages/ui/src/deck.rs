@@ -1,6 +1,6 @@
 //! Deck control component for audio playback.
 
-use crate::Trackbar;
+use crate::{BeatGrid, FrequencyWaveform, Trackbar};
 use dioxus::prelude::*;
 use rec_core::Track;
 use std::time::Duration;
@@ -91,6 +91,22 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
         .and_then(|t| t.waveform.as_ref())
         .map(|w| w.peaks.clone());
 
+    // Get frequency waveform from track
+    let freq_waveform = props.track.as_ref().and_then(|t| {
+        t.freq_waveform.as_ref().map(|fw| FrequencyWaveform {
+            low: fw.low.clone(),
+            mid: fw.mid.clone(),
+            high: fw.high.clone(),
+        })
+    });
+
+    // Get beat grid from track
+    let beat_grid = props.track.as_ref().and_then(|t| {
+        t.beat_grid.as_ref().map(|bg| BeatGrid {
+            beats: bg.beats.clone(),
+        })
+    });
+
     rsx! {
         document::Stylesheet { href: DECK_CSS }
         div { class: "deck deck-{props.deck_number}",
@@ -117,13 +133,15 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
                 }
             }
 
-            // Trackbar with waveform
+            // Trackbar with waveform, frequency bands, and beat grid
             Trackbar {
                 position: props.position,
                 duration,
                 is_playing,
                 has_track,
                 waveform_peaks,
+                freq_waveform,
+                beat_grid,
                 on_seek: props.on_seek.clone(),
                 deck_number: props.deck_number,
             }
