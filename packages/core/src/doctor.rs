@@ -387,21 +387,117 @@ impl DuplicateReport {
     }
 }
 
-/// Detects duplicate tracks in the library based on artist and title.
+/// How a duplicate match was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateMatchType {
+    /// Exact match on normalized artist + title
+    Exact,
+    /// Artist-Title pattern found in another track's title (e.g., "Artist - Title" in title field)
+    ArtistTitleInTitle,
+    /// Match after removing common suffixes like "(Original Mix)", "(Radio Edit)", etc.
+    NormalizedSuffix,
+    /// Fuzzy match - titles are very similar (low edit distance)
+    Fuzzy,
+}
+
+impl DuplicateMatchType {
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Exact => "exact match",
+            Self::ArtistTitleInTitle => "artist/title in filename",
+            Self::NormalizedSuffix => "same track, different version",
+            Self::Fuzzy => "similar title",
+        }
+    }
+}
+
+/// Detects duplicate tracks in the library using multiple smart strategies.
 pub struct DuplicateCheck;
 
 impl DuplicateCheck {
-    /// Normalize a string for comparison (lowercase, trim whitespace).
-    fn normalize(s: &str) -> String {
+    /// Common suffixes/patterns to strip for normalized comparison
+    const STRIP_PATTERNS: &'static [&'static str] = &[
+        "(original mix)",
+        "(original)",
+        "(radio edit)",
+        "(radio mix)",
+        "(extended mix)",
+        "(extended)",
+        "(club mix)",
+        "(club edit)",
+        "(remix)",
+        "(remaster)",
+        "(remastered)",
+        "(deluxe)",
+        "(bonus track)",
+        "(single version)",
+        "(album version)",
+        "(live)",
+        "(acoustic)",
+        "(instrumental)",
+        "[original mix]",
+        "[radio edit]",
+        "[extended mix]",
+        "[remastered]",
+    ];
+
+    /// Words to normalize (e.g., "feat." -> "ft")
+    const FEATURING_PATTERNS: &'static [&'static str] = &[
+        "featuring",
+        "feat.",
+        "feat",
+        "ft.",
+        "ft",
+        "with",
+    ];
+
+    /// Basic normalization: lowercase and trim
+    fn normalize_basic(s: &str) -> String {
         s.trim().to_lowercase()
     }
 
-    /// Generate a comparison key from artist and title.
+    /// Deep normalization: remove common suffixes and normalize featuring patterns
+    fn normalize_deep(s: &str) -> String {
+        let mut result = Self::normalize_basic(s);
+
+        // Remove common suffixes
+        for pattern in Self::STRIP_PATTERNS {
+            result = result.replace(pattern, "");
+        }
+
+        // Normalize featuring patterns to a common form
+        for pattern in Self::FEATURING_PATTERNS {
+            if result.contains(pattern) {
+                // Just remove the featuring part entirely for comparison
+                if let Some(pos) = result.find(pattern) {
+                    // Find the end of the featuring clause (usually ends at next major punctuation or end)
+                    let rest = &result[pos..];
+                    let end = rest.find(|c: char| c == ')' || c == ']' || c == '-')
+                        .map(|p| pos + p)
+                        .unwrap_or(result.len());
+                    result = format!("{}{}", &result[..pos], &result[end..]);
+                }
+            }
+        }
+
+        // Remove extra whitespace and punctuation
+        result = result
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        result.trim().to_string()
+    }
+
+    /// Generate a comparison key from artist and title (basic normalization).
     fn make_key(artist: Option<&str>, title: &str) -> String {
         let normalized_artist = artist
-            .map(|a| Self::normalize(a))
+            .map(|a| Self::normalize_basic(a))
             .unwrap_or_default();
-        let normalized_title = Self::normalize(title);
+        let normalized_title = Self::normalize_basic(title);
 
         if normalized_artist.is_empty() {
             normalized_title
@@ -410,31 +506,275 @@ impl DuplicateCheck {
         }
     }
 
-    /// Find duplicate tracks in a list of tracks.
-    pub fn find_duplicates(tracks: &[Track]) -> DuplicateReport {
-        use std::collections::HashMap;
+    /// Generate a deeply normalized key for fuzzy matching.
+    fn make_deep_key(artist: Option<&str>, title: &str) -> String {
+        let normalized_artist = artist
+            .map(|a| Self::normalize_deep(a))
+            .unwrap_or_default();
+        let normalized_title = Self::normalize_deep(title);
 
-        // Group tracks by their normalized key
-        let mut by_key: HashMap<String, Vec<(Uuid, std::path::PathBuf)>> = HashMap::new();
+        if normalized_artist.is_empty() {
+            normalized_title
+        } else {
+            format!("{} - {}", normalized_artist, normalized_title)
+        }
+    }
 
-        for track in tracks {
-            let key = Self::make_key(track.artist.as_deref(), &track.title);
-            by_key.entry(key).or_default().push((track.id, track.path.clone()));
+    /// Try to extract artist and title from a combined string like "Artist - Title"
+    fn parse_artist_title(s: &str) -> Option<(String, String)> {
+        // Common separators: " - ", " – ", " — ", " / "
+        let separators = [" - ", " – ", " — ", " / "];
+
+        for sep in separators {
+            if let Some(pos) = s.find(sep) {
+                let artist = s[..pos].trim().to_string();
+                let title = s[pos + sep.len()..].trim().to_string();
+                if !artist.is_empty() && !title.is_empty() {
+                    return Some((artist, title));
+                }
+            }
+        }
+        None
+    }
+
+    /// Calculate Levenshtein edit distance between two strings.
+    fn edit_distance(a: &str, b: &str) -> usize {
+        let a_chars: Vec<char> = a.chars().collect();
+        let b_chars: Vec<char> = b.chars().collect();
+        let a_len = a_chars.len();
+        let b_len = b_chars.len();
+
+        if a_len == 0 { return b_len; }
+        if b_len == 0 { return a_len; }
+
+        let mut matrix = vec![vec![0usize; b_len + 1]; a_len + 1];
+
+        for i in 0..=a_len { matrix[i][0] = i; }
+        for j in 0..=b_len { matrix[0][j] = j; }
+
+        for i in 1..=a_len {
+            for j in 1..=b_len {
+                let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+                matrix[i][j] = (matrix[i - 1][j] + 1)
+                    .min(matrix[i][j - 1] + 1)
+                    .min(matrix[i - 1][j - 1] + cost);
+            }
         }
 
-        // Filter to only groups with duplicates (more than one track)
-        let groups: Vec<DuplicateGroup> = by_key
-            .into_iter()
-            .filter(|(_, items)| items.len() > 1)
-            .map(|(key, items)| {
-                let (track_ids, track_paths): (Vec<_>, Vec<_>) = items.into_iter().unzip();
-                DuplicateGroup {
-                    key,
+        matrix[a_len][b_len]
+    }
+
+    /// Check if two strings are similar enough (fuzzy match).
+    /// Returns true if edit distance is within threshold based on string length.
+    fn is_fuzzy_match(a: &str, b: &str) -> bool {
+        let a_norm = Self::normalize_deep(a);
+        let b_norm = Self::normalize_deep(b);
+
+        // Exact match after normalization
+        if a_norm == b_norm {
+            return true;
+        }
+
+        let max_len = a_norm.len().max(b_norm.len());
+        if max_len == 0 {
+            return false;
+        }
+
+        let distance = Self::edit_distance(&a_norm, &b_norm);
+
+        // Allow ~15% difference, minimum 2 chars, maximum 5 chars
+        let threshold = (max_len / 7).clamp(2, 5);
+        distance <= threshold
+    }
+
+    /// Find duplicate tracks using multiple detection strategies.
+    pub fn find_duplicates(tracks: &[Track]) -> DuplicateReport {
+        use std::collections::{HashMap, HashSet};
+
+        // Track which track IDs have been assigned to a group
+        let mut assigned: HashSet<Uuid> = HashSet::new();
+        let mut groups: Vec<DuplicateGroup> = Vec::new();
+
+        // Strategy 1: Exact match on normalized artist + title
+        let mut by_exact_key: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, track) in tracks.iter().enumerate() {
+            let key = Self::make_key(track.artist.as_deref(), &track.title);
+            by_exact_key.entry(key).or_default().push(idx);
+        }
+
+        for (key, indices) in by_exact_key.iter() {
+            if indices.len() > 1 {
+                let track_ids: Vec<Uuid> = indices.iter().map(|&i| tracks[i].id).collect();
+                let track_paths: Vec<_> = indices.iter().map(|&i| tracks[i].path.clone()).collect();
+
+                for &id in &track_ids {
+                    assigned.insert(id);
+                }
+
+                groups.push(DuplicateGroup {
+                    key: key.clone(),
                     track_ids,
                     track_paths,
+                });
+            }
+        }
+
+        // Strategy 2: Artist-Title pattern in title field
+        // e.g., Track A: artist="", title="Daft Punk - Around The World"
+        //       Track B: artist="Daft Punk", title="Around The World"
+        for (idx_a, track_a) in tracks.iter().enumerate() {
+            if assigned.contains(&track_a.id) {
+                continue;
+            }
+
+            // Try to parse "Artist - Title" from track_a's title
+            if let Some((parsed_artist, parsed_title)) = Self::parse_artist_title(&track_a.title) {
+                let parsed_key = Self::make_key(Some(&parsed_artist), &parsed_title);
+
+                for (idx_b, track_b) in tracks.iter().enumerate() {
+                    if idx_a == idx_b || assigned.contains(&track_b.id) {
+                        continue;
+                    }
+
+                    let key_b = Self::make_key(track_b.artist.as_deref(), &track_b.title);
+
+                    if Self::normalize_basic(&parsed_key) == Self::normalize_basic(&key_b) {
+                        // Found a match
+                        assigned.insert(track_a.id);
+                        assigned.insert(track_b.id);
+
+                        groups.push(DuplicateGroup {
+                            key: key_b,
+                            track_ids: vec![track_a.id, track_b.id],
+                            track_paths: vec![track_a.path.clone(), track_b.path.clone()],
+                        });
+                        break;
+                    }
                 }
-            })
-            .collect();
+            }
+        }
+
+        // Strategy 3: Normalized suffix removal (same track, different version)
+        // Group by deeply normalized key
+        let mut by_deep_key: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, track) in tracks.iter().enumerate() {
+            if assigned.contains(&track.id) {
+                continue;
+            }
+            let key = Self::make_deep_key(track.artist.as_deref(), &track.title);
+            if !key.is_empty() {
+                by_deep_key.entry(key).or_default().push(idx);
+            }
+        }
+
+        for (key, indices) in by_deep_key.iter() {
+            if indices.len() > 1 {
+                // Verify they're not already exact matches (those were handled above)
+                let track_ids: Vec<Uuid> = indices.iter()
+                    .filter(|&&i| !assigned.contains(&tracks[i].id))
+                    .map(|&i| tracks[i].id)
+                    .collect();
+
+                if track_ids.len() > 1 {
+                    let track_paths: Vec<_> = indices.iter()
+                        .filter(|&&i| !assigned.contains(&tracks[i].id))
+                        .map(|&i| tracks[i].path.clone())
+                        .collect();
+
+                    for &id in &track_ids {
+                        assigned.insert(id);
+                    }
+
+                    // Use original title of first track for the key display
+                    let display_key = format!("{} (versions)", key);
+                    groups.push(DuplicateGroup {
+                        key: display_key,
+                        track_ids,
+                        track_paths,
+                    });
+                }
+            }
+        }
+
+        // Strategy 4: Fuzzy matching for remaining tracks (same artist, similar title)
+        let mut by_artist: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, track) in tracks.iter().enumerate() {
+            if assigned.contains(&track.id) {
+                continue;
+            }
+            if let Some(artist) = &track.artist {
+                let artist_key = Self::normalize_deep(artist);
+                if !artist_key.is_empty() {
+                    by_artist.entry(artist_key).or_default().push(idx);
+                }
+            }
+        }
+
+        for (_artist, indices) in by_artist.iter() {
+            if indices.len() < 2 {
+                continue;
+            }
+
+            // Compare pairs within the same artist
+            let mut fuzzy_groups: Vec<Vec<usize>> = Vec::new();
+
+            for &idx_a in indices {
+                if assigned.contains(&tracks[idx_a].id) {
+                    continue;
+                }
+
+                let title_a = &tracks[idx_a].title;
+                let mut group = vec![idx_a];
+
+                for &idx_b in indices {
+                    if idx_a >= idx_b || assigned.contains(&tracks[idx_b].id) {
+                        continue;
+                    }
+
+                    let title_b = &tracks[idx_b].title;
+
+                    if Self::is_fuzzy_match(title_a, title_b) {
+                        group.push(idx_b);
+                    }
+                }
+
+                if group.len() > 1 {
+                    fuzzy_groups.push(group);
+                }
+            }
+
+            // Add fuzzy groups
+            for group_indices in fuzzy_groups {
+                let track_ids: Vec<Uuid> = group_indices.iter()
+                    .filter(|&&i| !assigned.contains(&tracks[i].id))
+                    .map(|&i| tracks[i].id)
+                    .collect();
+
+                if track_ids.len() > 1 {
+                    let track_paths: Vec<_> = group_indices.iter()
+                        .filter(|&&i| !assigned.contains(&tracks[i].id))
+                        .map(|&i| tracks[i].path.clone())
+                        .collect();
+
+                    for &id in &track_ids {
+                        assigned.insert(id);
+                    }
+
+                    // Use first track's info for key
+                    let first_idx = group_indices[0];
+                    let key = format!(
+                        "{} (similar)",
+                        Self::make_key(tracks[first_idx].artist.as_deref(), &tracks[first_idx].title)
+                    );
+
+                    groups.push(DuplicateGroup {
+                        key,
+                        track_ids,
+                        track_paths,
+                    });
+                }
+            }
+        }
 
         let total_duplicates: usize = groups.iter().map(|g| g.track_ids.len()).sum();
 
@@ -449,21 +789,16 @@ impl DuplicateCheck {
         let mut diagnoses = Vec::new();
 
         for group in &report.groups {
+            let total_copies = group.track_ids.len();
+
             // Create a diagnosis for each track in the group
-            for (idx, (track_id, track_path)) in group.track_ids.iter().zip(&group.track_paths).enumerate() {
-                let other_count = group.track_ids.len() - 1;
-                let message = if idx == 0 {
-                    format!(
-                        "Duplicate: {} other track(s) with same artist/title",
-                        other_count
-                    )
-                } else {
-                    format!(
-                        "Duplicate of \"{}\" ({} total copies)",
-                        group.key,
-                        group.track_ids.len()
-                    )
-                };
+            // All messages include the key for consistent grouping in the UI
+            for (track_id, track_path) in group.track_ids.iter().zip(&group.track_paths) {
+                let message = format!(
+                    "Duplicate of \"{}\" ({} total copies)",
+                    group.key,
+                    total_copies
+                );
 
                 diagnoses.push(Diagnosis {
                     check_name: "duplicates".to_string(),
@@ -818,6 +1153,8 @@ mod tests {
         assert!(diagnoses.iter().all(|d| d.check_name == "duplicates"));
         assert!(diagnoses.iter().all(|d| d.severity == Severity::Warning));
         assert!(diagnoses.iter().all(|d| !d.fixable)); // Duplicates require manual intervention
+        // All diagnoses should have consistent message format with the key
+        assert!(diagnoses.iter().all(|d| d.message.contains("artist a - song one")));
     }
 
     #[test]
@@ -855,6 +1192,125 @@ mod tests {
             .filter(|d| d.check_name == "duplicates")
             .collect();
         assert!(duplicate_diagnoses.is_empty());
+    }
+
+    // ==================== Smart Duplicate Detection Tests ====================
+
+    #[test]
+    fn test_duplicate_artist_title_in_title() {
+        // Track B has "Artist - Title" pattern in title field, Track A has them separated
+        let mut track_a = create_track_with_metadata("/music/proper.mp3", "Daft Punk", "Around The World");
+        let mut track_b = create_test_track("/music/combined.mp3".into());
+        track_b.artist = None;
+        track_b.title = "Daft Punk - Around The World".to_string();
+
+        let tracks = vec![track_a, track_b];
+        let report = DuplicateCheck::find_duplicates(&tracks);
+
+        assert!(report.has_duplicates(), "Should detect artist-title pattern in title");
+        assert_eq!(report.group_count(), 1);
+    }
+
+    #[test]
+    fn test_duplicate_normalized_suffix_original_mix() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/track2.mp3", "Artist A", "Song One (Original Mix)"),
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(report.has_duplicates(), "Should match tracks ignoring (Original Mix)");
+    }
+
+    #[test]
+    fn test_duplicate_normalized_suffix_radio_edit() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song One"),
+            create_track_with_metadata("/music/track2.mp3", "Artist A", "Song One (Radio Edit)"),
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(report.has_duplicates(), "Should match tracks ignoring (Radio Edit)");
+    }
+
+    #[test]
+    fn test_duplicate_normalized_suffix_extended() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song One (Original Mix)"),
+            create_track_with_metadata("/music/track2.mp3", "Artist A", "Song One (Extended Mix)"),
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(report.has_duplicates(), "Should match different versions of the same track");
+    }
+
+    #[test]
+    fn test_duplicate_fuzzy_match_typo() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Around The World"),
+            create_track_with_metadata("/music/track2.mp3", "Artist A", "Around The Wolrd"), // typo
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(report.has_duplicates(), "Should fuzzy match tracks with typos");
+    }
+
+    #[test]
+    fn test_duplicate_fuzzy_match_slight_difference() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Song Title"),
+            create_track_with_metadata("/music/track2.mp3", "Artist A", "Song Titles"), // extra 's'
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(report.has_duplicates(), "Should fuzzy match tracks with slight differences");
+    }
+
+    #[test]
+    fn test_duplicate_fuzzy_no_match_different_songs() {
+        let tracks = vec![
+            create_track_with_metadata("/music/track1.mp3", "Artist A", "Completely Different Song"),
+            create_track_with_metadata("/music/track2.mp3", "Artist A", "Another Unique Track"),
+        ];
+
+        let report = DuplicateCheck::find_duplicates(&tracks);
+        assert!(!report.has_duplicates(), "Should not match completely different songs");
+    }
+
+    #[test]
+    fn test_edit_distance() {
+        assert_eq!(DuplicateCheck::edit_distance("hello", "hello"), 0);
+        assert_eq!(DuplicateCheck::edit_distance("hello", "hallo"), 1);
+        assert_eq!(DuplicateCheck::edit_distance("hello", "help"), 2);
+        assert_eq!(DuplicateCheck::edit_distance("", "hello"), 5);
+        assert_eq!(DuplicateCheck::edit_distance("hello", ""), 5);
+    }
+
+    #[test]
+    fn test_parse_artist_title() {
+        assert_eq!(
+            DuplicateCheck::parse_artist_title("Artist - Title"),
+            Some(("Artist".to_string(), "Title".to_string()))
+        );
+        assert_eq!(
+            DuplicateCheck::parse_artist_title("Daft Punk - Around The World"),
+            Some(("Daft Punk".to_string(), "Around The World".to_string()))
+        );
+        assert_eq!(
+            DuplicateCheck::parse_artist_title("No separator here"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_normalize_deep_removes_suffixes() {
+        let result = DuplicateCheck::normalize_deep("Song Title (Original Mix)");
+        assert!(!result.contains("original"));
+        assert!(!result.contains("mix"));
+
+        let result = DuplicateCheck::normalize_deep("Song Title (Radio Edit)");
+        assert!(!result.contains("radio"));
+        assert!(!result.contains("edit"));
     }
 }
 

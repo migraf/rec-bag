@@ -10,6 +10,33 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use uuid::Uuid;
 
+/// Scan a folder recursively for audio files.
+/// This is a standalone function to allow running in a blocking thread.
+fn scan_folder_for_tracks(path: &str) -> Vec<Track> {
+    let mut found_tracks = Vec::new();
+
+    fn scan_recursive(path: &std::path::Path, tracks: &mut Vec<Track>) {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let file_path = entry.path();
+                if file_path.is_dir() {
+                    scan_recursive(&file_path, tracks);
+                } else if file_path.is_file() {
+                    if let Some(ext) = file_path.extension() {
+                        let ext = ext.to_string_lossy().to_lowercase();
+                        if matches!(ext.as_str(), "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac") {
+                            tracks.push(Track::new(file_path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    scan_recursive(std::path::Path::new(path), &mut found_tracks);
+    found_tracks
+}
+
 /// Frequency waveform data for colored visualization.
 #[derive(Debug, Clone, Default)]
 pub struct FreqWaveformData {
@@ -441,8 +468,8 @@ impl AppState {
         let mut source = MusicSource::new_local(&path);
         let source_id = source.id;
 
-        // Scan the folder for tracks
-        let tracks = self.scan_source_folder(&path);
+        // Scan the folder for tracks in a separate thread to avoid blocking UI
+        let tracks = self.scan_source_folder_async(path.clone()).await;
         source.set_track_count(tracks.len() as u32);
 
         // Save source to storage
@@ -499,7 +526,8 @@ impl AppState {
             }
 
             let path = source.uri.clone();
-            let tracks = self.scan_source_folder(&path);
+            // Scan the folder in a separate thread to avoid blocking UI
+            let tracks = self.scan_source_folder_async(path).await;
             source.set_track_count(tracks.len() as u32);
 
             // Update storage
@@ -579,30 +607,16 @@ impl AppState {
     }
 
     /// Scan a folder for audio files (internal helper).
+    /// This runs synchronously - use scan_source_folder_async for non-blocking scanning.
     fn scan_source_folder(&self, path: &str) -> Vec<Track> {
-        let mut found_tracks = Vec::new();
+        scan_folder_for_tracks(path)
+    }
 
-        fn scan_recursive(path: &std::path::Path, tracks: &mut Vec<Track>) {
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    let file_path = entry.path();
-                    if file_path.is_dir() {
-                        scan_recursive(&file_path, tracks);
-                    } else if file_path.is_file() {
-                        if let Some(ext) = file_path.extension() {
-                            let ext = ext.to_string_lossy().to_lowercase();
-                            if matches!(ext.as_str(), "mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac")
-                            {
-                                tracks.push(Track::new(file_path));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        scan_recursive(std::path::Path::new(path), &mut found_tracks);
-        found_tracks
+    /// Scan a folder for audio files asynchronously in a separate thread.
+    async fn scan_source_folder_async(&self, path: String) -> Vec<Track> {
+        tokio::task::spawn_blocking(move || scan_folder_for_tracks(&path))
+            .await
+            .unwrap_or_default()
     }
 
     /// Scan a folder for audio files (legacy method, kept for compatibility).

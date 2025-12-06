@@ -32,7 +32,8 @@ pub use analysis::{
 pub use audio::{AudioEngine, Deck, DeckState};
 pub use doctor::{
     Diagnosis, DiagnosisGroup, DiagnosisSummary, DiagnosticCheck, Doctor, DoctorError,
-    DuplicateCheck, DuplicateGroup, DuplicateReport, MetadataCheck, Severity, WavExtensibleCheck,
+    DuplicateCheck, DuplicateGroup, DuplicateMatchType, DuplicateReport, MetadataCheck, Severity,
+    WavExtensibleCheck,
 };
 pub use folder::{build_folder_tree, is_audio_extension, FolderNode};
 pub use playlist::{Library, Playlist};

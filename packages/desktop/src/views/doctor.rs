@@ -159,6 +159,15 @@ pub fn DoctorView() -> Element {
                         let severity_class = severity.as_str();
                         let check_name_clone = check_name.clone();
                         let check_name_for_fix = check_name.clone();
+                        let is_duplicates = check_name == "duplicates";
+
+                        // For duplicates, count unique groups instead of individual tracks
+                        let display_count = if is_duplicates {
+                            let groups = group_duplicates_by_key(&items);
+                            format!("{} groups", groups.len())
+                        } else {
+                            format!("{} tracks", items.len())
+                        };
 
                         rsx! {
                             div { class: "issue-group {severity_class}",
@@ -172,7 +181,7 @@ pub fn DoctorView() -> Element {
                                         }
                                         div { class: "issue-group-text",
                                             span { class: "issue-group-name", "{format_check_name(&check_name)}" }
-                                            span { class: "issue-group-count", "{items.len()} tracks" }
+                                            span { class: "issue-group-count", "{display_count}" }
                                         }
                                     }
                                     {
@@ -202,40 +211,46 @@ pub fn DoctorView() -> Element {
 
                                 // Expanded content
                                 if is_expanded {
-                                    div { class: "issue-list",
-                                        for diagnosis in items.iter() {
-                                            {
-                                                let track = app_state.library_tracks.read()
-                                                    .iter()
-                                                    .find(|t| t.id == diagnosis.track_id)
-                                                    .cloned();
+                                    if is_duplicates {
+                                        // Render duplicates grouped by artist/title
+                                        {render_duplicate_groups(&items)}
+                                    } else {
+                                        // Render regular issues
+                                        div { class: "issue-list",
+                                            for diagnosis in items.iter() {
+                                                {
+                                                    let track = app_state.library_tracks.read()
+                                                        .iter()
+                                                        .find(|t| t.id == diagnosis.track_id)
+                                                        .cloned();
 
-                                                let track_title = track.as_ref()
-                                                    .map(|t| t.title.clone())
-                                                    .unwrap_or_else(|| "Unknown".to_string());
-                                                let track_artist = track.as_ref()
-                                                    .and_then(|t| t.artist.clone())
-                                                    .unwrap_or_else(|| "Unknown Artist".to_string());
-                                                let diagnosis_message = diagnosis.message.clone();
-                                                let is_fixable = diagnosis.fixable;
-                                                let track_id = diagnosis.track_id;
-                                                let check_name_fix = diagnosis.check_name.clone();
+                                                    let track_title = track.as_ref()
+                                                        .map(|t| t.title.clone())
+                                                        .unwrap_or_else(|| "Unknown".to_string());
+                                                    let track_artist = track.as_ref()
+                                                        .and_then(|t| t.artist.clone())
+                                                        .unwrap_or_else(|| "Unknown Artist".to_string());
+                                                    let diagnosis_message = diagnosis.message.clone();
+                                                    let is_fixable = diagnosis.fixable;
+                                                    let track_id = diagnosis.track_id;
+                                                    let check_name_fix = diagnosis.check_name.clone();
 
-                                                rsx! {
-                                                    div { class: "issue-item",
-                                                        div { class: "issue-track-info",
-                                                            span { class: "issue-track-title", "{track_title}" }
-                                                            span { class: "issue-track-artist", "{track_artist}" }
-                                                        }
-                                                        span { class: "issue-message", "{diagnosis_message}" }
-                                                        div { class: "issue-actions",
-                                                            if is_fixable {
-                                                                button {
-                                                                    class: "btn-fix",
-                                                                    onclick: move |_| {
-                                                                        let _ = app_state.fix_diagnosis(track_id, &check_name_fix);
-                                                                    },
-                                                                    "Fix"
+                                                    rsx! {
+                                                        div { class: "issue-item",
+                                                            div { class: "issue-track-info",
+                                                                span { class: "issue-track-title", "{track_title}" }
+                                                                span { class: "issue-track-artist", "{track_artist}" }
+                                                            }
+                                                            span { class: "issue-message", "{diagnosis_message}" }
+                                                            div { class: "issue-actions",
+                                                                if is_fixable {
+                                                                    button {
+                                                                        class: "btn-fix",
+                                                                        onclick: move |_| {
+                                                                            let _ = app_state.fix_diagnosis(track_id, &check_name_fix);
+                                                                        },
+                                                                        "Fix"
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -298,6 +313,80 @@ fn get_check_icon(name: &str, severity: Severity) -> &'static str {
             Severity::Warning => "⚠️",
             Severity::Info => "ℹ️",
         },
+    }
+}
+
+/// Represents a group of duplicate files with the same artist/title
+struct DuplicateDisplayGroup {
+    /// The normalized "artist - title" key
+    key: String,
+    /// File paths in this group
+    paths: Vec<std::path::PathBuf>,
+}
+
+/// Group duplicate diagnoses by their artist/title key
+fn group_duplicates_by_key(diagnoses: &[Diagnosis]) -> Vec<DuplicateDisplayGroup> {
+    let mut groups: HashMap<String, Vec<std::path::PathBuf>> = HashMap::new();
+
+    for d in diagnoses {
+        // The key is stored in track_path's parent context, but we can derive it
+        // by normalizing artist + title from the path, or use the path directly
+        // For now, group by the duplicate key extracted from message or use path
+        let key = extract_duplicate_key(d);
+        groups
+            .entry(key)
+            .or_default()
+            .push(d.track_path.clone());
+    }
+
+    groups
+        .into_iter()
+        .map(|(key, paths)| DuplicateDisplayGroup { key, paths })
+        .collect()
+}
+
+/// Extract the duplicate key from a diagnosis
+fn extract_duplicate_key(d: &Diagnosis) -> String {
+    // Try to extract key from message like: Duplicate of "artist - title" (N total copies)
+    if let Some(start) = d.message.find('"') {
+        if let Some(end) = d.message.rfind('"') {
+            if end > start {
+                return d.message[start + 1..end].to_string();
+            }
+        }
+    }
+
+    // Fallback: use the file stem as key
+    d.track_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+/// Render duplicate groups in a compact format
+fn render_duplicate_groups(diagnoses: &[Diagnosis]) -> Element {
+    let groups = group_duplicates_by_key(diagnoses);
+
+    rsx! {
+        div { class: "duplicate-groups",
+            for group in groups.iter() {
+                div { class: "duplicate-group",
+                    div { class: "duplicate-group-header",
+                        span { class: "duplicate-icon", "🔁" }
+                        span { class: "duplicate-key", "{group.key}" }
+                        span { class: "duplicate-count", "{group.paths.len()} copies" }
+                    }
+                    div { class: "duplicate-paths",
+                        for path in group.paths.iter() {
+                            div { class: "duplicate-path",
+                                span { class: "path-icon", "📄" }
+                                span { class: "path-text", "{path.display()}" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

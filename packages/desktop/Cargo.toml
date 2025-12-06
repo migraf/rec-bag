@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 dioxus = { workspace = true, features = ["router", "fullstack"] }
 rec_core = { version = "0.1.0", path = "../core", features = ["audio"] }
-tokio = { version = "1.48.0", features = ["time"] }
+tokio = { version = "1.48.0", features = ["time", "rt"] }
 ui = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 
