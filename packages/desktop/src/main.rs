@@ -134,31 +134,41 @@ fn DesktopNavbar() -> Element {
         }
         // Sticky playback bar (only when tracks are loaded and not on DJ view)
         if show_playback_bar {
-            {render_playback_bar(app_state)}
+            PlaybackBarWrapper {}
         }
     }
 }
 
-/// Render the playback bar with deck state from AppState.
-fn render_playback_bar(app_state: state::AppState) -> Element {
-    // Get deck states from audio engine
-    let (deck1_position, deck1_playing, deck2_position, deck2_playing) = {
-        if let Ok(eng) = app_state.engine.read().lock() {
-            let d1_pos = eng.deck(0).map(|d| d.position()).unwrap_or(Duration::ZERO);
-            let d1_playing = eng
-                .deck(0)
-                .map(|d| d.state() == rec_core::DeckState::Playing)
-                .unwrap_or(false);
-            let d2_pos = eng.deck(1).map(|d| d.position()).unwrap_or(Duration::ZERO);
-            let d2_playing = eng
-                .deck(1)
-                .map(|d| d.state() == rec_core::DeckState::Playing)
-                .unwrap_or(false);
-            (d1_pos, d1_playing, d2_pos, d2_playing)
-        } else {
-            (Duration::ZERO, false, Duration::ZERO, false)
+/// Wrapper component for the playback bar with reactive position updates.
+#[component]
+fn PlaybackBarWrapper() -> Element {
+    let app_state = use_app_state();
+
+    // Reactive signals for deck positions
+    let mut deck1_position = use_signal(|| Duration::ZERO);
+    let mut deck2_position = use_signal(|| Duration::ZERO);
+    let mut deck1_playing = use_signal(|| false);
+    let mut deck2_playing = use_signal(|| false);
+
+    // Periodically update positions (every 50ms for smooth display)
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            if let Ok(eng) = app_state.engine.read().lock() {
+                // Update deck 1
+                if let Ok(deck) = eng.deck(0) {
+                    deck1_position.set(deck.position());
+                    deck1_playing.set(deck.state() == rec_core::DeckState::Playing);
+                }
+                // Update deck 2
+                if let Ok(deck) = eng.deck(1) {
+                    deck2_position.set(deck.position());
+                    deck2_playing.set(deck.state() == rec_core::DeckState::Playing);
+                }
+            }
         }
-    };
+    });
 
     // Build deck info from track state
     let deck1_track = app_state.deck1_track.read().clone();
@@ -168,9 +178,9 @@ fn render_playback_bar(app_state: state::AppState) -> Element {
         .map(|t| DeckInfo {
             title: t.title.clone(),
             artist: t.artist.clone(),
-            position: deck1_position,
+            position: deck1_position(),
             duration: t.duration.unwrap_or(Duration::ZERO),
-            is_playing: deck1_playing,
+            is_playing: deck1_playing(),
             waveform_peaks: t.waveform.as_ref().map(|w| w.peaks.clone()),
             freq_waveform: t.freq_waveform.as_ref().map(|fw| FrequencyWaveform {
                 low: fw.low.clone(),
@@ -188,9 +198,9 @@ fn render_playback_bar(app_state: state::AppState) -> Element {
         .map(|t| DeckInfo {
             title: t.title.clone(),
             artist: t.artist.clone(),
-            position: deck2_position,
+            position: deck2_position(),
             duration: t.duration.unwrap_or(Duration::ZERO),
-            is_playing: deck2_playing,
+            is_playing: deck2_playing(),
             waveform_peaks: t.waveform.as_ref().map(|w| w.peaks.clone()),
             freq_waveform: t.freq_waveform.as_ref().map(|fw| FrequencyWaveform {
                 low: fw.low.clone(),
@@ -238,11 +248,15 @@ fn render_playback_bar(app_state: state::AppState) -> Element {
                 if let Ok(mut eng) = app_state.engine.read().lock() {
                     let _ = eng.deck_mut(0).map(|d| d.seek(pos));
                 }
+                // Immediately update position signal for responsive UI
+                deck1_position.set(pos);
             },
             on_deck2_seek: move |pos: Duration| {
                 if let Ok(mut eng) = app_state.engine.read().lock() {
                     let _ = eng.deck_mut(1).map(|d| d.seek(pos));
                 }
+                // Immediately update position signal for responsive UI
+                deck2_position.set(pos);
             },
         }
     }
