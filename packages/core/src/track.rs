@@ -120,6 +120,21 @@ impl Track {
         self.waveform.as_ref().map(|w| !w.is_empty()).unwrap_or(false)
     }
 
+    /// Check if BPM has been detected.
+    pub fn has_bpm(&self) -> bool {
+        self.bpm.is_some()
+    }
+
+    /// Check if musical key has been detected.
+    pub fn has_key(&self) -> bool {
+        self.key.is_some()
+    }
+
+    /// Check if the track needs analysis (missing waveform, BPM, or key).
+    pub fn needs_analysis(&self) -> bool {
+        !self.has_waveform() || !self.has_bpm() || !self.has_key()
+    }
+
     /// Load metadata from the audio file.
     pub fn load_metadata(&mut self) {
         if let Err(e) = self.try_load_metadata() {

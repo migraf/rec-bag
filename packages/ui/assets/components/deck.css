@@ -49,14 +49,25 @@
     color: var(--accent-secondary);
 }
 
-.deck-bpm {
-    font-size: 0.75rem;
-    font-weight: 600;
+.deck-bpm,
+.deck-key {
+    font-size: 0.875rem;
+    font-weight: 700;
     font-variant-numeric: tabular-nums;
-    color: var(--text-secondary);
-    background: var(--bg-primary);
-    padding: 0.125rem 0.375rem;
-    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+}
+
+.deck-info-label {
+    font-size: 0.5rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    margin-right: 0.75rem;
+}
+
+.deck-info-label:last-child {
+    margin-right: 0;
 }
 
 /* Deck Display */

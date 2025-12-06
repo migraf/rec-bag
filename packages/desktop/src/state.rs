@@ -2,7 +2,7 @@
 
 use dioxus::prelude::*;
 use rec_core::{
-    extract_waveform, AudioEngine, Diagnosis, Doctor, Library, MusicSource, Playlist,
+    analyze_track, AudioEngine, Diagnosis, Doctor, Library, MusicSource, Playlist,
     SearchEngine, SqliteStorage, Track,
 };
 use std::collections::{HashMap, HashSet};
@@ -10,17 +10,19 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use uuid::Uuid;
 
-/// Result from waveform analysis
+/// Result from track analysis (waveform, BPM, key)
 #[derive(Debug, Clone)]
-pub struct WaveformResult {
+pub struct TrackAnalysisResult {
     pub track_id: Uuid,
     pub peaks: Vec<f32>,
+    pub bpm: Option<f32>,
+    pub key: Option<String>,
 }
 
-/// Channel sender for waveform results (thread-safe, clonable)
-pub type WaveformSender = mpsc::Sender<WaveformResult>;
-/// Channel receiver for waveform results
-pub type WaveformReceiver = mpsc::Receiver<WaveformResult>;
+/// Channel sender for analysis results (thread-safe, clonable)
+pub type AnalysisSender = mpsc::Sender<TrackAnalysisResult>;
+/// Channel receiver for analysis results
+pub type AnalysisReceiver = mpsc::Receiver<TrackAnalysisResult>;
 
 /// Global application state shared across all views.
 #[derive(Clone, Copy)]
@@ -45,10 +47,10 @@ pub struct AppState {
     pub waveform_cache: Signal<HashMap<Uuid, Vec<f32>>>,
     /// Tracks currently being analyzed
     pub analyzing_tracks: Signal<HashSet<Uuid>>,
-    /// Channel sender for waveform results
-    pub waveform_tx: Signal<WaveformSender>,
-    /// Channel receiver for waveform results (wrapped in Arc<Mutex> for sharing)
-    waveform_rx: Signal<Arc<StdMutex<WaveformReceiver>>>,
+    /// Channel sender for analysis results
+    pub analysis_tx: Signal<AnalysisSender>,
+    /// Channel receiver for analysis results (wrapped in Arc<Mutex> for sharing)
+    analysis_rx: Signal<Arc<StdMutex<AnalysisReceiver>>>,
     /// Track loaded on deck 1 (shared across views)
     pub deck1_track: Signal<Option<Track>>,
     /// Track loaded on deck 2 (shared across views)
@@ -86,8 +88,8 @@ impl AppState {
             save_pending: Signal::new(false),
             waveform_cache: Signal::new(HashMap::new()),
             analyzing_tracks: Signal::new(HashSet::new()),
-            waveform_tx: Signal::new(tx),
-            waveform_rx: Signal::new(Arc::new(StdMutex::new(rx))),
+            analysis_tx: Signal::new(tx),
+            analysis_rx: Signal::new(Arc::new(StdMutex::new(rx))),
             deck1_track: Signal::new(None),
             deck2_track: Signal::new(None),
             // Doctor state
@@ -205,11 +207,11 @@ impl AppState {
         self.analyzing_tracks.read().contains(&track_id)
     }
 
-    /// Poll for completed waveform results (non-blocking).
+    /// Poll for completed analysis results (non-blocking).
     /// Returns all available results.
-    pub fn poll_waveform_results(self) -> Vec<WaveformResult> {
+    pub fn poll_analysis_results(self) -> Vec<TrackAnalysisResult> {
         let mut results = Vec::new();
-        if let Ok(rx) = self.waveform_rx.read().try_lock() {
+        if let Ok(rx) = self.analysis_rx.read().try_lock() {
             while let Ok(result) = rx.try_recv() {
                 results.push(result);
             }
@@ -217,10 +219,12 @@ impl AppState {
         results
     }
 
-    /// Apply waveform result to the state.
-    pub fn apply_waveform_result(mut self, result: WaveformResult) {
+    /// Apply analysis result to the state (waveform, BPM, key).
+    pub fn apply_analysis_result(mut self, result: TrackAnalysisResult) {
         let track_id = result.track_id;
         let peaks = result.peaks;
+        let bpm = result.bpm;
+        let key = result.key;
 
         // Update cache for reactive updates
         self.waveform_cache.write().insert(track_id, peaks.clone());
@@ -229,12 +233,23 @@ impl AppState {
         self.analyzing_tracks.write().remove(&track_id);
 
         // Update deck tracks if they have this track
-        self.update_deck_waveform(track_id, peaks.clone());
+        self.update_deck_analysis(track_id, peaks.clone(), bpm, key.clone());
+
+        // Helper to apply all analysis data to a track
+        fn apply_to_track(track: &mut Track, peaks: Vec<f32>, bpm: Option<f32>, key: Option<String>) {
+            track.set_waveform(peaks);
+            if let Some(bpm_val) = bpm {
+                track.set_bpm(bpm_val);
+            }
+            if let Some(key_val) = key {
+                track.set_key(key_val);
+            }
+        }
 
         // Update library tracks
         let mut library_tracks = self.library_tracks.write();
         if let Some(track) = library_tracks.iter_mut().find(|t| t.id == track_id) {
-            track.set_waveform(peaks.clone());
+            apply_to_track(track, peaks.clone(), bpm, key.clone());
             drop(library_tracks);
             self.mark_save_pending();
             return;
@@ -245,7 +260,7 @@ impl AppState {
         let mut playlists = self.playlists.write();
         for playlist in playlists.iter_mut() {
             if let Some(track) = playlist.tracks.iter_mut().find(|t| t.id == track_id) {
-                track.set_waveform(peaks);
+                apply_to_track(track, peaks, bpm, key);
                 break;
             }
         }
@@ -570,10 +585,9 @@ impl AppState {
     pub fn load_track_to_deck(mut self, mut track: Track, deck: usize) -> bool {
         let track_id = track.id;
         let track_path = track.path.clone();
-        let needs_waveform = !track.has_waveform();
 
         // Check if waveform is in cache
-        if needs_waveform {
+        if !track.has_waveform() {
             if let Some(peaks) = self.get_waveform(track_id) {
                 track.set_waveform(peaks);
             }
@@ -595,23 +609,46 @@ impl AppState {
                 self.deck2_track.set(Some(track.clone()));
             }
 
-            // Spawn background waveform analysis if needed
-            if needs_waveform && self.get_waveform(track_id).is_none() {
-                spawn_waveform_analysis(self, track_id, track_path);
+            // Spawn background analysis if track needs any analysis (waveform, BPM, or key)
+            if track.needs_analysis() {
+                spawn_track_analysis(self, track_id, track_path);
             }
         }
 
         loaded
     }
 
-    /// Update deck track with new waveform data.
-    pub fn update_deck_waveform(mut self, track_id: Uuid, peaks: Vec<f32>) {
+    /// Update deck track with analysis results (waveform, BPM, key).
+    pub fn update_deck_analysis(
+        mut self,
+        track_id: Uuid,
+        peaks: Vec<f32>,
+        bpm: Option<f32>,
+        key: Option<String>,
+    ) {
+        // Helper to apply analysis to a track
+        fn apply_analysis(track: &mut Track, peaks: &[f32], bpm: Option<f32>, key: &Option<String>) {
+            if !track.has_waveform() && !peaks.is_empty() {
+                track.set_waveform(peaks.to_vec());
+            }
+            if !track.has_bpm() {
+                if let Some(bpm_val) = bpm {
+                    track.set_bpm(bpm_val);
+                }
+            }
+            if !track.has_key() {
+                if let Some(key_val) = key {
+                    track.set_key(key_val.clone());
+                }
+            }
+        }
+
         // Update deck 1 if it has this track
         let deck1_update = {
             let track_opt = self.deck1_track.read().clone();
             if let Some(mut track) = track_opt {
-                if track.id == track_id && !track.has_waveform() {
-                    track.set_waveform(peaks.clone());
+                if track.id == track_id && track.needs_analysis() {
+                    apply_analysis(&mut track, &peaks, bpm, &key);
                     Some(track)
                 } else {
                     None
@@ -628,8 +665,8 @@ impl AppState {
         let deck2_update = {
             let track_opt = self.deck2_track.read().clone();
             if let Some(mut track) = track_opt {
-                if track.id == track_id && !track.has_waveform() {
-                    track.set_waveform(peaks);
+                if track.id == track_id && track.needs_analysis() {
+                    apply_analysis(&mut track, &peaks, bpm, &key);
                     Some(track)
                 } else {
                     None
@@ -1075,18 +1112,18 @@ pub fn use_storage_init() {
     use_future(move || async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let results = app_state.poll_waveform_results();
+            let results = app_state.poll_analysis_results();
             for result in results {
-                app_state.apply_waveform_result(result);
+                app_state.apply_analysis_result(result);
             }
         }
     });
 }
 
-/// Spawn background waveform analysis for a track.
+/// Spawn background track analysis (waveform, BPM, key detection).
 /// Uses std::thread::spawn for CPU-intensive work as per Dioxus docs.
 /// Results are sent via channel and processed by use_storage_init's polling loop.
-pub fn spawn_waveform_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) {
+pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) {
     // Check if already analyzing or has waveform
     if app_state.is_analyzing(track_id) || app_state.get_waveform(track_id).is_some() {
         return;
@@ -1096,26 +1133,35 @@ pub fn spawn_waveform_analysis(app_state: AppState, track_id: Uuid, path: PathBu
     app_state.mark_analyzing(track_id);
 
     // Clone the sender before spawning (Sender is Send)
-    let tx = (*app_state.waveform_tx.read()).clone();
+    let tx = (*app_state.analysis_tx.read()).clone();
 
     // Spawn on a separate thread to avoid blocking UI
     // As per Dioxus docs: "If you have an expensive task you need to run, 
     // you should spawn it on a separate thread using std::thread::spawn"
     std::thread::spawn(move || {
-        eprintln!("Starting waveform extraction for {:?}", path);
+        eprintln!("Starting track analysis for {:?}", path);
         
-        match extract_waveform(&path) {
-            Ok(waveform) => {
-                eprintln!("Extracted waveform: {} peaks for track {}", waveform.peaks.len(), track_id);
-                // Send result back via channel
-                let _ = tx.send(WaveformResult {
+        match analyze_track(&path) {
+            Ok(result) => {
+                eprintln!(
+                    "Analysis complete for track {}: {} peaks, BPM: {:?}, Key: {:?}",
                     track_id,
-                    peaks: waveform.peaks,
+                    result.waveform_peaks.len(),
+                    result.bpm.as_ref().map(|b| b.bpm),
+                    result.key.as_ref().map(|k| k.key.to_notation())
+                );
+                // Send result back via channel
+                let _ = tx.send(TrackAnalysisResult {
+                    track_id,
+                    peaks: result.waveform_peaks,
+                    bpm: result.bpm.map(|b| b.bpm),
+                    key: result.key.map(|k| k.key.to_string()),
                 });
             }
             Err(e) => {
-                eprintln!("Waveform extraction failed for {}: {}", track_id, e);
+                eprintln!("Track analysis failed for {}: {}", track_id, e);
             }
         }
     });
 }
+

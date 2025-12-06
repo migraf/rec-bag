@@ -133,6 +133,13 @@
     font-size: 0.75rem;
 }
 
+.col-bpm:empty::after,
+.col-key:empty::after {
+    content: "—";
+    color: var(--text-muted);
+    opacity: 0.5;
+}
+
 .col-bitrate {
     width: 60px;
     font-variant-numeric: tabular-nums;

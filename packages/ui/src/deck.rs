@@ -69,7 +69,13 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
         .track
         .as_ref()
         .and_then(|t| t.bpm)
-        .map(|b| format!("{:.1} BPM", b))
+        .map(|b| format!("{:.1}", b))
+        .unwrap_or_default();
+
+    let track_key = props
+        .track
+        .as_ref()
+        .and_then(|t| t.key.clone())
         .unwrap_or_default();
 
     let duration = props
@@ -93,6 +99,11 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
                 div { class: "deck-header-info",
                     if !track_bpm.is_empty() {
                         span { class: "deck-bpm", "{track_bpm}" }
+                        span { class: "deck-info-label", "BPM" }
+                    }
+                    if !track_key.is_empty() {
+                        span { class: "deck-key", "{track_key}" }
+                        span { class: "deck-info-label", "KEY" }
                     }
                 }
             }
