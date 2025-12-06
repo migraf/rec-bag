@@ -4,6 +4,8 @@ use dioxus::prelude::*;
 use rec_core::Playlist;
 use uuid::Uuid;
 
+const PLAYLIST_BROWSER_CSS: Asset = asset!("/assets/components/playlist-browser.css");
+
 /// Props for the PlaylistBrowser component.
 #[derive(Props, Clone, PartialEq)]
 pub struct PlaylistBrowserProps {
@@ -26,6 +28,7 @@ pub fn PlaylistBrowser(props: PlaylistBrowserProps) -> Element {
     let mut show_create_form = use_signal(|| false);
 
     rsx! {
+        document::Stylesheet { href: PLAYLIST_BROWSER_CSS }
         div { class: "playlist-browser",
             div { class: "playlist-header",
                 h3 { "Playlists" }

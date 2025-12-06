@@ -2,8 +2,8 @@
 
 use dioxus::prelude::*;
 use rec_core::{
-    extract_waveform, AudioEngine, Library, MusicSource, Playlist, SearchEngine, SqliteStorage,
-    Track,
+    extract_waveform, AudioEngine, Diagnosis, Doctor, Library, MusicSource, Playlist,
+    SearchEngine, SqliteStorage, Track,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -53,6 +53,20 @@ pub struct AppState {
     pub deck1_track: Signal<Option<Track>>,
     /// Track loaded on deck 2 (shared across views)
     pub deck2_track: Signal<Option<Track>>,
+    // ==================== Doctor State ====================
+    /// Doctor instance for running diagnostics
+    pub doctor: Signal<Arc<Doctor>>,
+    /// Current diagnoses from the last scan
+    pub diagnoses: Signal<Vec<Diagnosis>>,
+    /// Whether a doctor scan is currently running
+    pub doctor_scanning: Signal<bool>,
+    /// Number of tracks scanned in current/last scan
+    pub doctor_scanned_count: Signal<usize>,
+    /// Diagnoses indexed by track ID for quick lookup
+    pub diagnoses_by_track: Signal<HashMap<Uuid, Vec<Diagnosis>>>,
+    // ==================== Theme State ====================
+    /// Current theme name (e.g., "dark", "light")
+    pub current_theme: Signal<String>,
 }
 
 impl AppState {
@@ -76,6 +90,14 @@ impl AppState {
             waveform_rx: Signal::new(Arc::new(StdMutex::new(rx))),
             deck1_track: Signal::new(None),
             deck2_track: Signal::new(None),
+            // Doctor state
+            doctor: Signal::new(Arc::new(Doctor::new())),
+            diagnoses: Signal::new(Vec::new()),
+            doctor_scanning: Signal::new(false),
+            doctor_scanned_count: Signal::new(0),
+            diagnoses_by_track: Signal::new(HashMap::new()),
+            // Theme state
+            current_theme: Signal::new("dark".to_string()),
         }
     }
 
@@ -118,6 +140,19 @@ impl AppState {
                     }
                     Err(e) => {
                         eprintln!("Failed to load sources: {}", e);
+                    }
+                }
+
+                // Load theme preference
+                match storage.get_setting("theme").await {
+                    Ok(Some(theme)) => {
+                        self.current_theme.set(theme);
+                    }
+                    Ok(None) => {
+                        // Keep default "dark" theme
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to load theme setting: {}", e);
                     }
                 }
 
@@ -606,6 +641,397 @@ impl AppState {
         if let Some(track) = deck2_update {
             self.deck2_track.set(Some(track));
         }
+    }
+
+    // ==================== Doctor Operations ====================
+
+    /// Run doctor diagnostics on all library tracks.
+    pub fn run_doctor_scan(mut self) {
+        self.doctor_scanning.set(true);
+        self.doctor_scanned_count.set(0);
+
+        let tracks = self.library_tracks.read().clone();
+        let doctor = self.doctor.read().clone();
+
+        // Run diagnostics
+        let all_diagnoses = doctor.check_tracks(&tracks);
+
+        // Build index by track ID
+        let mut by_track: HashMap<Uuid, Vec<Diagnosis>> = HashMap::new();
+        for diagnosis in &all_diagnoses {
+            by_track
+                .entry(diagnosis.track_id)
+                .or_default()
+                .push(diagnosis.clone());
+        }
+
+        // Update state
+        self.diagnoses.set(all_diagnoses);
+        self.diagnoses_by_track.set(by_track);
+        self.doctor_scanned_count.set(tracks.len());
+        self.doctor_scanning.set(false);
+    }
+
+    /// Get diagnoses for a specific track.
+    pub fn get_diagnoses_for_track(&self, track_id: Uuid) -> Vec<Diagnosis> {
+        self.diagnoses_by_track
+            .read()
+            .get(&track_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Check if a track has any issues.
+    pub fn track_has_issues(&self, track_id: Uuid) -> bool {
+        self.diagnoses_by_track.read().contains_key(&track_id)
+    }
+
+    /// Check if a track has fixable issues.
+    pub fn track_has_fixable_issues(&self, track_id: Uuid) -> bool {
+        self.diagnoses_by_track
+            .read()
+            .get(&track_id)
+            .map(|d| d.iter().any(|diag| diag.fixable))
+            .unwrap_or(false)
+    }
+
+    /// Fix a single diagnosis for a track.
+    pub fn fix_diagnosis(mut self, track_id: Uuid, check_name: &str) -> Result<(), String> {
+        // Find the track
+        let track = self
+            .library_tracks
+            .read()
+            .iter()
+            .find(|t| t.id == track_id)
+            .cloned();
+
+        let Some(track) = track else {
+            return Err("Track not found".to_string());
+        };
+
+        // Find the diagnosis
+        let diagnosis = self
+            .diagnoses
+            .read()
+            .iter()
+            .find(|d| d.track_id == track_id && d.check_name == check_name)
+            .cloned();
+
+        let Some(diagnosis) = diagnosis else {
+            return Err("Diagnosis not found".to_string());
+        };
+
+        // Apply the fix
+        let doctor = self.doctor.read().clone();
+        doctor
+            .fix_diagnosis(&diagnosis, &track)
+            .map_err(|e| e.to_string())?;
+
+        // Re-scan the track to update diagnoses
+        let new_diagnoses: Vec<Diagnosis> = doctor
+            .check_track(&track)
+            .into_iter()
+            .collect();
+
+        // Update the diagnoses state
+        let mut all_diagnoses = self.diagnoses.write();
+        all_diagnoses.retain(|d| d.track_id != track_id);
+        all_diagnoses.extend(new_diagnoses.clone());
+        drop(all_diagnoses);
+
+        // Update the by-track index
+        let mut by_track = self.diagnoses_by_track.write();
+        if new_diagnoses.is_empty() {
+            by_track.remove(&track_id);
+        } else {
+            by_track.insert(track_id, new_diagnoses);
+        }
+
+        Ok(())
+    }
+
+    /// Fix all fixable issues for a specific check type.
+    pub fn fix_all_by_check(mut self, check_name: &str) -> (usize, usize) {
+        let diagnoses_to_fix: Vec<Diagnosis> = self
+            .diagnoses
+            .read()
+            .iter()
+            .filter(|d| d.check_name == check_name && d.fixable)
+            .cloned()
+            .collect();
+
+        let mut fixed = 0;
+        let mut failed = 0;
+
+        for diagnosis in diagnoses_to_fix {
+            match self.fix_diagnosis(diagnosis.track_id, &diagnosis.check_name) {
+                Ok(_) => fixed += 1,
+                Err(_) => failed += 1,
+            }
+        }
+
+        (fixed, failed)
+    }
+
+    /// Fix all fixable issues for a specific track.
+    pub fn fix_all_for_track(mut self, track_id: Uuid) -> (usize, usize) {
+        let diagnoses_to_fix: Vec<Diagnosis> = self
+            .get_diagnoses_for_track(track_id)
+            .into_iter()
+            .filter(|d| d.fixable)
+            .collect();
+
+        let mut fixed = 0;
+        let mut failed = 0;
+
+        for diagnosis in diagnoses_to_fix {
+            match self.fix_diagnosis(track_id, &diagnosis.check_name) {
+                Ok(_) => fixed += 1,
+                Err(_) => failed += 1,
+            }
+        }
+
+        (fixed, failed)
+    }
+
+    // ==================== Metadata Operations ====================
+
+    /// Update metadata for a single track.
+    /// If `write_to_file` is true, also saves the changes to the audio file.
+    pub fn update_track_metadata(
+        mut self,
+        track_id: Uuid,
+        title: Option<String>,
+        artist: Option<Option<String>>,
+        album: Option<Option<String>>,
+        genre: Option<Option<String>>,
+        bpm: Option<Option<f32>>,
+        key: Option<Option<String>>,
+        year: Option<Option<u32>>,
+        track_number: Option<Option<u32>>,
+        comment: Option<Option<String>>,
+        rating: Option<Option<u8>>,
+        write_to_file: bool,
+    ) -> Result<(), String> {
+        // Update library tracks
+        let mut library_tracks = self.library_tracks.write();
+        if let Some(track) = library_tracks.iter_mut().find(|t| t.id == track_id) {
+            track.update_metadata(
+                title.clone(),
+                artist.clone(),
+                album.clone(),
+                genre.clone(),
+                bpm,
+                key.clone(),
+                year,
+                track_number,
+                comment.clone(),
+                rating,
+            );
+
+            if write_to_file {
+                if let Err(e) = track.save_metadata() {
+                    eprintln!("Failed to save metadata to file: {}", e);
+                    // Continue anyway, memory state is updated
+                }
+            }
+        }
+        drop(library_tracks);
+
+        // Also update in playlists
+        let mut playlists = self.playlists.write();
+        for playlist in playlists.iter_mut() {
+            if let Some(track) = playlist.tracks.iter_mut().find(|t| t.id == track_id) {
+                track.update_metadata(
+                    title.clone(),
+                    artist.clone(),
+                    album.clone(),
+                    genre.clone(),
+                    bpm,
+                    key.clone(),
+                    year,
+                    track_number,
+                    comment.clone(),
+                    rating,
+                );
+
+                if write_to_file {
+                    let _ = track.save_metadata();
+                }
+            }
+        }
+        drop(playlists);
+
+        // Update deck tracks if loaded
+        let deck1_update = {
+            let deck1_track = self.deck1_track.read().clone();
+            if let Some(mut track) = deck1_track {
+                if track.id == track_id {
+                    track.update_metadata(
+                        title.clone(),
+                        artist.clone(),
+                        album.clone(),
+                        genre.clone(),
+                        bpm,
+                        key.clone(),
+                        year,
+                        track_number,
+                        comment.clone(),
+                        rating,
+                    );
+                    Some(track)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(track) = deck1_update {
+            self.deck1_track.set(Some(track));
+        }
+
+        let deck2_update = {
+            let deck2_track = self.deck2_track.read().clone();
+            if let Some(mut track) = deck2_track {
+                if track.id == track_id {
+                    track.update_metadata(
+                        title,
+                        artist,
+                        album,
+                        genre,
+                        bpm,
+                        key,
+                        year,
+                        track_number,
+                        comment,
+                        rating,
+                    );
+                    Some(track)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(track) = deck2_update {
+            self.deck2_track.set(Some(track));
+        }
+
+        self.mark_save_pending();
+
+        // Re-run doctor for this track since metadata changed
+        self.recheck_track_diagnoses(track_id);
+
+        Ok(())
+    }
+
+    /// Update metadata for multiple tracks (batch operation).
+    /// Only non-None fields will be updated.
+    pub fn batch_update_metadata(
+        self,
+        track_ids: Vec<Uuid>,
+        title: Option<String>,
+        artist: Option<Option<String>>,
+        album: Option<Option<String>>,
+        genre: Option<Option<String>>,
+        bpm: Option<Option<f32>>,
+        key: Option<Option<String>>,
+        year: Option<Option<u32>>,
+        track_number: Option<Option<u32>>,
+        comment: Option<Option<String>>,
+        rating: Option<Option<u8>>,
+        write_to_file: bool,
+    ) -> (usize, usize) {
+        let mut success = 0;
+        let mut failed = 0;
+
+        for track_id in track_ids {
+            match self.update_track_metadata(
+                track_id,
+                title.clone(),
+                artist.clone(),
+                album.clone(),
+                genre.clone(),
+                bpm,
+                key.clone(),
+                year,
+                track_number,
+                comment.clone(),
+                rating,
+                write_to_file,
+            ) {
+                Ok(_) => success += 1,
+                Err(_) => failed += 1,
+            }
+        }
+
+        (success, failed)
+    }
+
+    /// Re-check diagnoses for a specific track after metadata changes.
+    fn recheck_track_diagnoses(mut self, track_id: Uuid) {
+        let track = self
+            .library_tracks
+            .read()
+            .iter()
+            .find(|t| t.id == track_id)
+            .cloned();
+
+        if let Some(track) = track {
+            let doctor = self.doctor.read().clone();
+            let new_diagnoses: Vec<Diagnosis> = doctor.check_track(&track);
+
+            // Update the diagnoses state
+            let mut all_diagnoses = self.diagnoses.write();
+            all_diagnoses.retain(|d| d.track_id != track_id);
+            all_diagnoses.extend(new_diagnoses.clone());
+            drop(all_diagnoses);
+
+            // Update the by-track index
+            let mut by_track = self.diagnoses_by_track.write();
+            if new_diagnoses.is_empty() {
+                by_track.remove(&track_id);
+            } else {
+                by_track.insert(track_id, new_diagnoses);
+            }
+        }
+    }
+
+    /// Get tracks by their IDs.
+    pub fn get_tracks_by_ids(&self, track_ids: &[Uuid]) -> Vec<Track> {
+        let library_tracks = self.library_tracks.read();
+        track_ids
+            .iter()
+            .filter_map(|id| library_tracks.iter().find(|t| t.id == *id).cloned())
+            .collect()
+    }
+
+    // ==================== Theme Operations ====================
+
+    /// Get the current theme name.
+    pub fn get_theme(&self) -> String {
+        self.current_theme.read().clone()
+    }
+
+    /// Set the current theme and save to storage.
+    pub async fn set_theme(mut self, theme: String) {
+        self.current_theme.set(theme.clone());
+
+        // Save to storage
+        if let Some(storage) = self.storage.read().as_ref() {
+            if let Err(e) = storage.set_setting("theme", &theme).await {
+                eprintln!("Failed to save theme setting: {}", e);
+            }
+        }
+    }
+
+    /// Toggle between dark and light themes.
+    pub async fn toggle_theme(self) {
+        let current = self.get_theme();
+        let new_theme = if current == "dark" { "light" } else { "dark" };
+        self.set_theme(new_theme.to_string()).await;
     }
 }
 

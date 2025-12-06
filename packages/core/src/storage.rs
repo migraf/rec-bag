@@ -270,6 +270,19 @@ impl SqliteStorage {
             )
             .await?;
 
+        // Create settings table for app preferences (theme, etc.)
+        self.conn
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                "#,
+                (),
+            )
+            .await?;
+
         Ok(())
     }
 
@@ -733,6 +746,51 @@ impl SqliteStorage {
                     .ok()
             }),
         })
+    }
+
+    // ==================== Settings Management ====================
+
+    /// Get a setting value by key.
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>, StorageError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key.to_string()],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let value: String = row.get(0)?;
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Set a setting value. Creates or updates the setting.
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<(), StorageError> {
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO settings (key, value) VALUES (?1, ?2)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                "#,
+                params![key.to_string(), value.to_string()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a setting by key.
+    pub async fn delete_setting(&self, key: &str) -> Result<(), StorageError> {
+        self.conn
+            .execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![key.to_string()],
+            )
+            .await?;
+        Ok(())
     }
 }
 

@@ -1,0 +1,177 @@
+/* Trackbar Component Styles */
+
+.trackbar {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.trackbar.disabled {
+    opacity: 0.4;
+    pointer-events: none;
+}
+
+/* Waveform Container */
+.trackbar-waveform {
+    position: relative;
+    height: 40px;
+    background: var(--bg-waveform);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    cursor: pointer;
+    border: 1px solid var(--border-color);
+}
+
+/* Progress Overlay */
+.trackbar-progress {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    background: linear-gradient(
+        to right,
+        rgba(0, 212, 255, 0.15),
+        rgba(0, 212, 255, 0.25)
+    );
+    pointer-events: none;
+}
+
+.deck-2-trackbar .trackbar-progress {
+    background: linear-gradient(
+        to right,
+        rgba(255, 107, 53, 0.15),
+        rgba(255, 107, 53, 0.25)
+    );
+}
+
+/* Light theme adjustments */
+.theme-light .trackbar-progress {
+    background: linear-gradient(
+        to right,
+        rgba(0, 149, 179, 0.2),
+        rgba(0, 149, 179, 0.3)
+    );
+}
+
+.theme-light .deck-2-trackbar .trackbar-progress {
+    background: linear-gradient(
+        to right,
+        rgba(229, 90, 43, 0.2),
+        rgba(229, 90, 43, 0.3)
+    );
+}
+
+/* Playhead */
+.trackbar-playhead {
+    position: absolute;
+    top: 0;
+    width: 2px;
+    height: 100%;
+    background: var(--accent-primary);
+    box-shadow: 0 0 6px var(--accent-primary);
+    pointer-events: none;
+    transform: translateX(-1px);
+}
+
+.deck-2-trackbar .trackbar-playhead {
+    background: var(--accent-secondary);
+    box-shadow: 0 0 6px var(--accent-secondary);
+}
+
+/* Waveform Pattern Background */
+.trackbar-waveform-pattern {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: repeating-linear-gradient(
+        90deg,
+        transparent,
+        transparent 2px,
+        rgba(255, 255, 255, 0.03) 2px,
+        rgba(255, 255, 255, 0.03) 4px
+    );
+    pointer-events: none;
+}
+
+.theme-light .trackbar-waveform-pattern {
+    background: repeating-linear-gradient(
+        90deg,
+        transparent,
+        transparent 2px,
+        rgba(0, 0, 0, 0.03) 2px,
+        rgba(0, 0, 0, 0.03) 4px
+    );
+}
+
+/* Waveform Bars */
+.waveform-bars {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    padding: 2px;
+    pointer-events: none;
+}
+
+.waveform-bar {
+    flex: 1;
+    min-width: 1px;
+    background: rgba(255, 255, 255, 0.25);
+    border-radius: 1px;
+    transition: background var(--transition-fast);
+}
+
+.theme-light .waveform-bar {
+    background: rgba(0, 0, 0, 0.2);
+}
+
+.waveform-bar.played {
+    background: var(--accent-primary);
+    opacity: 0.7;
+}
+
+.deck-2-trackbar .waveform-bar.played {
+    background: var(--accent-secondary);
+}
+
+/* Hidden Slider for Seeking */
+.trackbar-slider {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    cursor: pointer;
+    margin: 0;
+    padding: 0;
+    z-index: 10;
+    -webkit-appearance: none;
+}
+
+/* Time Display */
+.trackbar-times {
+    display: flex;
+    justify-content: space-between;
+    font-family: 'JetBrains Mono', 'SF Mono', 'Menlo', monospace;
+    font-size: 0.6875rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+    padding: 0 0.125rem;
+}
+
+.trackbar-current {
+    color: var(--text-primary);
+}
+
+.trackbar-remaining {
+    color: var(--text-muted);
+}
+

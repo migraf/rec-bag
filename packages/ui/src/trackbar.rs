@@ -5,6 +5,8 @@
 use dioxus::prelude::*;
 use std::time::Duration;
 
+const TRACKBAR_CSS: Asset = asset!("/assets/components/trackbar.css");
+
 /// Props for the Trackbar component.
 #[derive(Props, Clone, PartialEq)]
 pub struct TrackbarProps {
@@ -96,6 +98,7 @@ pub fn Trackbar(props: TrackbarProps) -> Element {
     let has_waveform = !display_peaks.is_empty();
 
     rsx! {
+        document::Stylesheet { href: TRACKBAR_CSS }
         div {
             class: "{deck_class}",
 

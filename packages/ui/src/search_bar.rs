@@ -2,6 +2,8 @@
 
 use dioxus::prelude::*;
 
+const SEARCH_BAR_CSS: Asset = asset!("/assets/components/search-bar.css");
+
 /// Props for the SearchBar component.
 #[derive(Props, Clone, PartialEq)]
 pub struct SearchBarProps {
@@ -34,6 +36,7 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
     let show_results = has_value && props.result_count.is_some();
 
     rsx! {
+        document::Stylesheet { href: SEARCH_BAR_CSS }
         div {
             class: if props.compact { "search-bar compact" } else { "search-bar" },
             class: if is_focused() { "focused" } else { "" },

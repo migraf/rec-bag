@@ -273,3 +273,159 @@ impl Track {
 pub fn analyze_tracks(paths: Vec<PathBuf>) -> Vec<Track> {
     paths.into_iter().map(Track::new).collect()
 }
+
+/// Error type for metadata operations.
+#[derive(Debug, Clone)]
+pub enum MetadataError {
+    /// Failed to read the file
+    FileReadError(String),
+    /// Failed to write to the file
+    FileWriteError(String),
+    /// Unsupported file format
+    UnsupportedFormat,
+}
+
+impl std::fmt::Display for MetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetadataError::FileReadError(e) => write!(f, "Failed to read file: {}", e),
+            MetadataError::FileWriteError(e) => write!(f, "Failed to write file: {}", e),
+            MetadataError::UnsupportedFormat => write!(f, "Unsupported file format"),
+        }
+    }
+}
+
+impl std::error::Error for MetadataError {}
+
+impl Track {
+    /// Save metadata changes to the audio file.
+    ///
+    /// This writes the current metadata back to the file using lofty.
+    /// Supported formats: MP3, FLAC, OGG, WAV (with ID3), M4A/AAC.
+    pub fn save_metadata(&self) -> Result<(), MetadataError> {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{Accessor, Tag, TagExt, TagType};
+
+        // Open the file
+        let tagged_file = Probe::open(&self.path)
+            .map_err(|e| MetadataError::FileReadError(e.to_string()))?
+            .read()
+            .map_err(|e| MetadataError::FileReadError(e.to_string()))?;
+
+        // Determine the best tag type for this file
+        let tag_type = tagged_file
+            .primary_tag()
+            .map(|t| t.tag_type())
+            .or_else(|| tagged_file.first_tag().map(|t| t.tag_type()))
+            .unwrap_or_else(|| {
+                // Default tag type based on file extension
+                match self.path.extension().and_then(|e| e.to_str()) {
+                    Some("mp3") => TagType::Id3v2,
+                    Some("flac") => TagType::VorbisComments,
+                    Some("ogg") => TagType::VorbisComments,
+                    Some("m4a") | Some("aac") => TagType::Mp4Ilst,
+                    Some("wav") => TagType::Id3v2,
+                    _ => TagType::Id3v2,
+                }
+            });
+
+        // Create or clone the tag
+        let mut tag = tagged_file
+            .primary_tag()
+            .cloned()
+            .or_else(|| tagged_file.first_tag().cloned())
+            .unwrap_or_else(|| Tag::new(tag_type));
+
+        // Update tag fields
+        tag.set_title(self.title.clone());
+
+        if let Some(ref artist) = self.artist {
+            tag.set_artist(artist.clone());
+        } else {
+            tag.remove_artist();
+        }
+
+        if let Some(ref album) = self.album {
+            tag.set_album(album.clone());
+        } else {
+            tag.remove_album();
+        }
+
+        if let Some(ref genre) = self.genre {
+            tag.set_genre(genre.clone());
+        } else {
+            tag.remove_genre();
+        }
+
+        if let Some(year) = self.year {
+            tag.set_year(year);
+        } else {
+            tag.remove_year();
+        }
+
+        if let Some(track_num) = self.track_number {
+            tag.set_track(track_num);
+        } else {
+            tag.remove_track();
+        }
+
+        if let Some(ref comment) = self.comment {
+            tag.set_comment(comment.clone());
+        } else {
+            tag.remove_comment();
+        }
+
+        // Save the tag to file
+        tag.save_to_path(&self.path, WriteOptions::default())
+            .map_err(|e| MetadataError::FileWriteError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Update metadata fields from optional values.
+    /// Only updates fields that are Some.
+    pub fn update_metadata(
+        &mut self,
+        title: Option<String>,
+        artist: Option<Option<String>>,
+        album: Option<Option<String>>,
+        genre: Option<Option<String>>,
+        bpm: Option<Option<f32>>,
+        key: Option<Option<String>>,
+        year: Option<Option<u32>>,
+        track_number: Option<Option<u32>>,
+        comment: Option<Option<String>>,
+        rating: Option<Option<u8>>,
+    ) {
+        if let Some(t) = title {
+            self.title = t;
+        }
+        if let Some(a) = artist {
+            self.artist = a;
+        }
+        if let Some(a) = album {
+            self.album = a;
+        }
+        if let Some(g) = genre {
+            self.genre = g;
+        }
+        if let Some(b) = bpm {
+            self.bpm = b;
+        }
+        if let Some(k) = key {
+            self.key = k;
+        }
+        if let Some(y) = year {
+            self.year = y;
+        }
+        if let Some(t) = track_number {
+            self.track_number = t;
+        }
+        if let Some(c) = comment {
+            self.comment = c;
+        }
+        if let Some(r) = rating {
+            self.rating = r;
+        }
+    }
+}

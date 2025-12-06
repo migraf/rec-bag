@@ -1,0 +1,241 @@
+/* rec_bag Base Styles & Theme System
+ * This file defines CSS Custom Properties for theming and base styles.
+ * Include this file in all platform packages (desktop, web, mobile).
+ */
+
+/* ==================== Theme Variables ==================== */
+
+/* Default theme (dark) - applied to :root and .theme-dark */
+:root,
+.theme-dark {
+    /* Backgrounds */
+    --bg-primary: #0a0a0f;
+    --bg-secondary: #12121a;
+    --bg-tertiary: #1a1a24;
+    --bg-waveform: #0d0d14;
+
+    /* Accent colors */
+    --accent-primary: #00d4ff;
+    --accent-secondary: #ff6b35;
+
+    /* Text colors */
+    --text-primary: #ffffff;
+    --text-secondary: #a0a0b0;
+    --text-muted: #606070;
+
+    /* Border */
+    --border-color: #2a2a3a;
+
+    /* Status colors */
+    --success: #00ff88;
+    --warning: #ffaa00;
+    --danger: #ff4444;
+
+    /* Shadows */
+    --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+    /* Transitions */
+    --transition-fast: 0.1s ease;
+    --transition-normal: 0.15s ease;
+    --transition-slow: 0.2s ease;
+
+    /* Border radius */
+    --radius-sm: 3px;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+    --radius-xl: 12px;
+
+    /* Spacing */
+    --space-xs: 0.125rem;
+    --space-sm: 0.25rem;
+    --space-md: 0.5rem;
+    --space-lg: 0.75rem;
+    --space-xl: 1rem;
+}
+
+/* Light theme */
+.theme-light {
+    /* Backgrounds */
+    --bg-primary: #f5f5f7;
+    --bg-secondary: #ffffff;
+    --bg-tertiary: #e8e8ec;
+    --bg-waveform: #e0e0e8;
+
+    /* Accent colors - slightly adjusted for light backgrounds */
+    --accent-primary: #0095b3;
+    --accent-secondary: #e55a2b;
+
+    /* Text colors */
+    --text-primary: #1a1a2e;
+    --text-secondary: #4a4a5a;
+    --text-muted: #8a8a9a;
+
+    /* Border */
+    --border-color: #d0d0da;
+
+    /* Status colors - slightly darker for visibility */
+    --success: #00c96d;
+    --warning: #e69500;
+    --danger: #e53535;
+
+    /* Shadows - lighter for light theme */
+    --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.08);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.12);
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.16);
+}
+
+/* Theme wrapper - ensures background and text colors apply to the wrapper and children */
+.theme-dark,
+.theme-light {
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+}
+
+/* ==================== Base Reset ==================== */
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+    font-size: 13px;
+    transition: background-color var(--transition-normal), color var(--transition-normal);
+}
+
+/* Ensure text elements inherit theme colors properly */
+h1, h2, h3, h4, h5, h6, p, span, div, li, label, td, th {
+    color: inherit;
+}
+
+/* ==================== Scrollbar ==================== */
+
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: var(--radius-sm);
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
+}
+
+/* ==================== Common Button Styles ==================== */
+
+.btn-icon {
+    width: 22px;
+    height: 22px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 1rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all var(--transition-normal);
+}
+
+.btn-icon:hover {
+    border-color: var(--accent-primary);
+    color: var(--accent-primary);
+}
+
+.btn-small {
+    padding: 0.25rem 0.5rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 0.6875rem;
+    cursor: pointer;
+    transition: all var(--transition-normal);
+}
+
+.btn-small:hover:not(:disabled) {
+    border-color: var(--accent-primary);
+    background: rgba(0, 212, 255, 0.1);
+}
+
+.theme-light .btn-small:hover:not(:disabled) {
+    background: rgba(0, 149, 179, 0.1);
+}
+
+.btn-small:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.btn-cancel {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.btn-cancel:hover {
+    background: rgba(255, 68, 68, 0.1) !important;
+}
+
+.btn-danger {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.btn-danger:hover {
+    background: rgba(255, 68, 68, 0.15) !important;
+}
+
+/* ==================== Message Styles ==================== */
+
+.error-message {
+    background: rgba(255, 68, 68, 0.15);
+    border: 1px solid var(--danger);
+    border-radius: var(--radius-md);
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.75rem;
+    color: var(--danger);
+    font-size: 0.8125rem;
+}
+
+.warning-message {
+    background: rgba(255, 170, 0, 0.15);
+    border: 1px solid var(--warning);
+    border-radius: var(--radius-md);
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.75rem;
+    color: var(--warning);
+    font-size: 0.8125rem;
+}
+
+/* ==================== Empty State ==================== */
+
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+    color: var(--text-muted);
+    text-align: center;
+    font-size: 0.8125rem;
+}
+
+.empty-state p {
+    margin: 0.375rem 0;
+}
+

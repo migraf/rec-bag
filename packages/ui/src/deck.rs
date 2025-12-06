@@ -5,6 +5,8 @@ use dioxus::prelude::*;
 use rec_core::Track;
 use std::time::Duration;
 
+const DECK_CSS: Asset = asset!("/assets/components/deck.css");
+
 /// State of a deck for UI display.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeckDisplayState {
@@ -84,6 +86,7 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
         .map(|w| w.peaks.clone());
 
     rsx! {
+        document::Stylesheet { href: DECK_CSS }
         div { class: "deck deck-{props.deck_number}",
             div { class: "deck-header",
                 span { class: "deck-number", "Deck {props.deck_number}" }

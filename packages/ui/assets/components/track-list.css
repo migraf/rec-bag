@@ -1,0 +1,274 @@
+/* Track List Component Styles */
+
+.track-panel {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.track-list {
+    flex: 1;
+    overflow: auto;
+}
+
+.track-list table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.track-list thead {
+    position: sticky;
+    top: 0;
+    background: var(--bg-tertiary);
+    z-index: 1;
+}
+
+.track-list th {
+    text-align: left;
+    padding: 0.5rem 0.625rem;
+    font-size: 0.625rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.track-list td {
+    padding: 0.375rem 0.625rem;
+    border-bottom: 1px solid var(--border-color);
+    font-size: 0.8125rem;
+    color: var(--text-primary);
+}
+
+/* Track Row */
+.track-row {
+    cursor: pointer;
+    transition: background var(--transition-fast);
+}
+
+.track-row:hover {
+    background: var(--bg-tertiary);
+}
+
+.track-row.selected {
+    background: rgba(0, 212, 255, 0.1);
+}
+
+.theme-light .track-row.selected {
+    background: rgba(0, 149, 179, 0.1);
+}
+
+.track-row.selected:hover {
+    background: rgba(0, 212, 255, 0.15);
+}
+
+.theme-light .track-row.selected:hover {
+    background: rgba(0, 149, 179, 0.15);
+}
+
+/* Multi-Selection */
+.track-row.multi-selected {
+    background: rgba(0, 212, 255, 0.08);
+    border-left: 2px solid var(--accent-primary);
+}
+
+.theme-light .track-row.multi-selected {
+    background: rgba(0, 149, 179, 0.08);
+}
+
+/* Column Styles */
+.col-checkbox {
+    width: 28px;
+    text-align: center;
+}
+
+.col-checkbox input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+    accent-color: var(--accent-primary);
+}
+
+.col-number {
+    width: 32px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+.col-title {
+    min-width: 140px;
+}
+
+.col-artist {
+    min-width: 100px;
+    color: var(--text-secondary);
+}
+
+.col-album {
+    min-width: 100px;
+    color: var(--text-muted);
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.col-genre {
+    width: 80px;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+.col-bpm,
+.col-key,
+.col-duration {
+    width: 50px;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+    font-size: 0.75rem;
+}
+
+.col-bitrate {
+    width: 60px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+}
+
+.col-actions {
+    width: 80px;
+}
+
+/* Action Buttons */
+.btn-load {
+    width: 20px;
+    height: 20px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-color);
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+    font-size: 0.625rem;
+    font-weight: 600;
+    cursor: pointer;
+    margin-right: 3px;
+    transition: all var(--transition-normal);
+}
+
+.btn-load:hover {
+    border-color: var(--accent-primary);
+    color: var(--accent-primary);
+}
+
+.btn-remove {
+    width: 20px;
+    height: 20px;
+    border-radius: var(--radius-sm);
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all var(--transition-normal);
+}
+
+.btn-remove:hover {
+    background: rgba(255, 68, 68, 0.2);
+    color: var(--danger);
+}
+
+/* Track Panel Header with Search */
+.track-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+}
+
+.track-panel-header .search-bar {
+    max-width: 200px;
+}
+
+.track-panel-title {
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-secondary);
+}
+
+.track-panel-count {
+    font-size: 0.625rem;
+    color: var(--text-muted);
+    margin-left: 0.5rem;
+}
+
+/* Dense Track List */
+.track-list.dense th {
+    padding: 0.375rem 0.5rem;
+}
+
+.track-list.dense td {
+    padding: 0.25rem 0.5rem;
+}
+
+.track-list.dense .col-number {
+    width: 28px;
+}
+
+.track-list.dense .btn-load {
+    width: 18px;
+    height: 18px;
+    font-size: 0.5625rem;
+}
+
+.track-list.dense .btn-remove {
+    width: 18px;
+    height: 18px;
+}
+
+/* Track Issue Indicators */
+.track-issue-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    font-size: 0.625rem;
+    border-radius: 50%;
+    margin-right: 0.375rem;
+    cursor: help;
+}
+
+.track-issue-badge.warning {
+    background: rgba(255, 170, 0, 0.2);
+    color: var(--warning);
+}
+
+.track-issue-badge.info {
+    background: rgba(160, 160, 176, 0.2);
+    color: var(--text-muted);
+}
+
+.track-issue-badge.fixable {
+    background: rgba(0, 212, 255, 0.2);
+    color: var(--accent-primary);
+    cursor: pointer;
+}
+
+.track-issue-badge.fixable:hover {
+    background: rgba(0, 212, 255, 0.3);
+}
+
+.theme-light .track-issue-badge.fixable {
+    background: rgba(0, 149, 179, 0.2);
+}
+
+.theme-light .track-issue-badge.fixable:hover {
+    background: rgba(0, 149, 179, 0.3);
+}
+

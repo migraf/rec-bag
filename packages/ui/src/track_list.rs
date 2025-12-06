@@ -6,11 +6,24 @@ use std::collections::HashSet;
 use std::time::Duration;
 use uuid::Uuid;
 
+const TRACK_LIST_CSS: Asset = asset!("/assets/components/track-list.css");
+
 /// Reference to a playlist (for displaying badges).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaylistRef {
     pub id: Uuid,
     pub name: String,
+}
+
+/// Track issue information for display in track list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackIssueInfo {
+    /// Total number of issues
+    pub count: usize,
+    /// Number of fixable issues
+    pub fixable_count: usize,
+    /// Summary message to show on hover
+    pub summary: String,
 }
 
 /// Props for the TrackList component.
@@ -36,6 +49,12 @@ pub struct TrackListProps {
     /// Whether to show playlist badges column
     #[props(default = false)]
     pub show_playlist_badges: bool,
+    /// Issue info for tracks (keyed by track ID)
+    #[props(default)]
+    pub track_issues: std::collections::HashMap<Uuid, TrackIssueInfo>,
+    /// Callback when user clicks to fix issues for a track
+    #[props(default)]
+    pub on_fix_issues: Option<EventHandler<Uuid>>,
 }
 
 /// Selection event with modifier keys.
@@ -76,6 +95,7 @@ pub fn TrackList(props: TrackListProps) -> Element {
     let mut last_clicked_index: Signal<Option<usize>> = use_signal(|| None);
 
     rsx! {
+        document::Stylesheet { href: TRACK_LIST_CSS }
         div { class: "track-list",
             table {
                 thead {
@@ -111,6 +131,9 @@ pub fn TrackList(props: TrackListProps) -> Element {
                             let playlist_badges: Vec<PlaylistRef> = props.get_playlists
                                 .map(|f| f(id))
                                 .unwrap_or_default();
+
+                            // Get issue info from the HashMap
+                            let issue_info: Option<TrackIssueInfo> = props.track_issues.get(&id).cloned();
 
                             // Clone selected_ids for use in closures
                             let selected_ids_for_context = props.selected_ids.clone();
@@ -161,7 +184,38 @@ pub fn TrackList(props: TrackListProps) -> Element {
                                         }
                                     }
                                     td { class: "col-number", "{row_num}" }
-                                    td { class: "col-title", "{track_title}" }
+                                    td { class: "col-title",
+                                        // Show issue badge if track has issues
+                                        if let Some(ref info) = issue_info {
+                                            {
+                                                let badge_class = if info.fixable_count > 0 {
+                                                    "track-issue-badge fixable"
+                                                } else {
+                                                    "track-issue-badge warning"
+                                                };
+                                                let summary = info.summary.clone();
+                                                let has_fix_handler = props.on_fix_issues.is_some();
+                                                let can_fix = info.fixable_count > 0;
+                                                
+                                                rsx! {
+                                                    span {
+                                                        class: "{badge_class}",
+                                                        title: "{summary}",
+                                                        onclick: move |e| {
+                                                            if has_fix_handler && can_fix {
+                                                                e.stop_propagation();
+                                                                if let Some(handler) = &props.on_fix_issues {
+                                                                    handler.call(id);
+                                                                }
+                                                            }
+                                                        },
+                                                        "⚠"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        "{track_title}"
+                                    }
                                     td { class: "col-artist", "{track_artist}" }
                                     if props.show_playlist_badges {
                                         td { class: "col-playlists",

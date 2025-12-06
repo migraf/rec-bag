@@ -1,0 +1,189 @@
+/* Deck Control Component Styles */
+
+/* Deck Container */
+.deck {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    padding: 0.625rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.deck-1 {
+    border-left: 2px solid var(--accent-primary);
+}
+
+.deck-2 {
+    border-left: 2px solid var(--accent-secondary);
+}
+
+/* Deck Header */
+.deck-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-bottom: 0.25rem;
+}
+
+.deck-header-info {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.deck-number {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-secondary);
+}
+
+.deck-1 .deck-number {
+    color: var(--accent-primary);
+}
+
+.deck-2 .deck-number {
+    color: var(--accent-secondary);
+}
+
+.deck-bpm {
+    font-size: 0.75rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+    background: var(--bg-primary);
+    padding: 0.125rem 0.375rem;
+    border-radius: var(--radius-sm);
+}
+
+/* Deck Display */
+.deck-display {
+    background: var(--bg-primary);
+    border-radius: var(--radius-md);
+    padding: 0.5rem 0.625rem;
+}
+
+.track-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    height: 2.25rem;
+    justify-content: center;
+}
+
+.track-title {
+    font-size: 0.875rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 1.2;
+    color: var(--text-primary);
+}
+
+.track-artist {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Deck Controls Row */
+.deck-controls-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.deck-controls {
+    display: flex;
+    gap: 0.375rem;
+    flex-shrink: 0;
+}
+
+/* Control Buttons */
+.control-btn {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 0.875rem;
+    cursor: pointer;
+    transition: all var(--transition-normal);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.control-btn:hover:not(:disabled) {
+    border-color: var(--accent-primary);
+    background: rgba(0, 212, 255, 0.1);
+}
+
+.theme-light .control-btn:hover:not(:disabled) {
+    background: rgba(0, 149, 179, 0.1);
+}
+
+.control-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.play-btn:hover:not(:disabled) {
+    border-color: var(--success);
+    color: var(--success);
+}
+
+.stop-btn:hover:not(:disabled) {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+/* Volume Control */
+.volume-control {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex: 1;
+    min-width: 100px;
+}
+
+.volume-control label {
+    font-size: 0.625rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.volume-control input[type="range"] {
+    flex: 1;
+    height: 4px;
+    -webkit-appearance: none;
+    background: var(--bg-primary);
+    border-radius: 2px;
+    cursor: pointer;
+}
+
+.volume-control input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px;
+    height: 12px;
+    background: var(--accent-primary);
+    border-radius: 50%;
+    cursor: pointer;
+}
+
+.volume-control .volume-value {
+    font-size: 0.6875rem;
+    font-variant-numeric: tabular-nums;
+    min-width: 2.5em;
+    text-align: right;
+    color: var(--text-secondary);
+}
+

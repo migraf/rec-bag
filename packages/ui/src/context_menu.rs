@@ -3,6 +3,8 @@
 use dioxus::prelude::*;
 use uuid::Uuid;
 
+const CONTEXT_MENU_CSS: Asset = asset!("/assets/components/context-menu.css");
+
 /// A menu item in the context menu.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MenuItem {
@@ -88,6 +90,9 @@ pub struct ContextMenuProps {
     pub on_action: EventHandler<ContextMenuAction>,
     /// Callback when menu should close
     pub on_close: EventHandler<()>,
+    /// Whether selected tracks have fixable issues (shows "Fix Issues" option)
+    #[props(default = false)]
+    pub has_fixable_issues: bool,
 }
 
 /// Actions that can be triggered from the context menu.
@@ -105,6 +110,10 @@ pub enum ContextMenuAction {
     LoadToDeck2,
     /// Show track info
     ShowInfo,
+    /// Fix issues for the selected track(s)
+    FixIssues,
+    /// Edit metadata for selected track(s)
+    EditMetadata,
 }
 
 /// Context menu component.
@@ -123,6 +132,7 @@ pub fn ContextMenu(props: ContextMenuProps) -> Element {
     };
 
     rsx! {
+        document::Stylesheet { href: CONTEXT_MENU_CSS }
         // Backdrop to catch clicks outside
         div {
             class: "context-menu-backdrop",
@@ -203,6 +213,38 @@ pub fn ContextMenu(props: ContextMenuProps) -> Element {
                 },
                 span { class: "menu-icon", "2" }
                 span { class: "menu-label", "Load to Deck 2" }
+            }
+
+            div { class: "context-menu-separator" }
+
+            // Edit Metadata option
+            div {
+                class: "context-menu-item",
+                onclick: move |_| {
+                    props.on_action.call(ContextMenuAction::EditMetadata);
+                    props.on_close.call(());
+                },
+                span { class: "menu-icon", "📝" }
+                span { class: "menu-label",
+                    if props.selected_count > 1 {
+                        "Edit Metadata ({props.selected_count})"
+                    } else {
+                        "Edit Metadata"
+                    }
+                }
+            }
+
+            // Fix Issues option (only shown if tracks have fixable issues)
+            if props.has_fixable_issues {
+                div {
+                    class: "context-menu-item",
+                    onclick: move |_| {
+                        props.on_action.call(ContextMenuAction::FixIssues);
+                        props.on_close.call(());
+                    },
+                    span { class: "menu-icon", "🔧" }
+                    span { class: "menu-label", "Fix Issues" }
+                }
             }
 
             div { class: "context-menu-separator" }

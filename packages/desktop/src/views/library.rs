@@ -4,9 +4,10 @@ use crate::state::use_app_state;
 use dioxus::prelude::*;
 use rec_core::Track;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use ui::{
-    ContextMenu, ContextMenuAction, ContextMenuEvent, PlaylistInfo, SearchBar, SelectionEvent,
-    SourcesPanel, TrackList,
+    ContextMenu, ContextMenuAction, ContextMenuEvent, MetadataEditor, MetadataSaveEvent,
+    PlaylistInfo, SearchBar, SelectionEvent, SourcesPanel, TrackIssueInfo, TrackList,
 };
 use uuid::Uuid;
 
@@ -20,6 +21,7 @@ pub fn Library() -> Element {
     let mut search_query = use_signal(|| String::new());
     let mut selected_track_ids: Signal<HashSet<Uuid>> = use_signal(|| HashSet::new());
     let mut last_clicked_index: Signal<Option<usize>> = use_signal(|| None);
+    let mut selected_folder: Signal<Option<PathBuf>> = use_signal(|| None);
 
     // Context menu state
     let mut context_menu_visible = use_signal(|| false);
@@ -27,16 +29,34 @@ pub fn Library() -> Element {
     let mut context_menu_y = use_signal(|| 0i32);
     let mut context_menu_selected: Signal<HashSet<Uuid>> = use_signal(|| HashSet::new());
 
-    // Get filtered tracks based on search
+    // Metadata editor state
+    let mut metadata_editor_visible = use_signal(|| false);
+    let mut metadata_editor_track_ids: Signal<Vec<Uuid>> = use_signal(|| Vec::new());
+
+    // Get filtered tracks based on search and folder selection
     let library_tracks = app_state.library_tracks.read().clone();
     let filtered_tracks = use_memo(move || {
         let query = search_query();
-        if query.is_empty() {
+        let folder = selected_folder();
+
+        // First filter by folder if one is selected
+        let folder_filtered: Vec<Track> = if let Some(folder_path) = folder {
+            library_tracks
+                .iter()
+                .filter(|t| t.path.starts_with(&folder_path))
+                .cloned()
+                .collect()
+        } else {
             library_tracks.clone()
+        };
+
+        // Then filter by search query
+        if query.is_empty() {
+            folder_filtered
         } else {
             let mut engine = rec_core::SearchEngine::new();
             engine
-                .search(&query, &library_tracks)
+                .search(&query, &folder_filtered)
                 .into_iter()
                 .map(|r| r.track)
                 .collect()
@@ -163,8 +183,24 @@ pub fn Library() -> Element {
                     load_track_to_deck(*track_id, 2);
                 }
             }
+            ContextMenuAction::FixIssues => {
+                // Fix issues for all selected tracks
+                for track_id in selected {
+                    app_state.fix_all_for_track(track_id);
+                }
+            }
+            ContextMenuAction::EditMetadata => {
+                // Open metadata editor for selected tracks
+                metadata_editor_track_ids.set(selected.iter().copied().collect());
+                metadata_editor_visible.set(true);
+            }
             _ => {}
         }
+    };
+
+    // Handler for fixing issues from the track list badge click
+    let on_fix_issues = move |track_id: Uuid| {
+        app_state.fix_all_for_track(track_id);
     };
 
     let on_load = move |(track_id, deck): (Uuid, usize)| {
@@ -187,10 +223,98 @@ pub fn Library() -> Element {
 
     let track_count = filtered_tracks().len();
     let has_search = !search_query().is_empty();
+    let has_folder = selected_folder().is_some();
+
+    // Build track issues map for doctor integration
+    let diagnoses_by_track = app_state.diagnoses_by_track.read().clone();
+    let track_issues: std::collections::HashMap<Uuid, TrackIssueInfo> = diagnoses_by_track
+        .iter()
+        .map(|(track_id, diagnoses)| {
+            let fixable_count = diagnoses.iter().filter(|d| d.fixable).count();
+            let summary = diagnoses
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            (
+                *track_id,
+                TrackIssueInfo {
+                    count: diagnoses.len(),
+                    fixable_count,
+                    summary,
+                },
+            )
+        })
+        .collect();
+
+    // Check if any selected track has fixable issues (for context menu)
+    let selected_have_fixable_issues = context_menu_selected()
+        .iter()
+        .any(|id| {
+            track_issues
+                .get(id)
+                .map(|info| info.fixable_count > 0)
+                .unwrap_or(false)
+        });
+
+    // Get tracks for metadata editor
+    let metadata_editor_tracks = app_state.get_tracks_by_ids(&metadata_editor_track_ids());
+
+    // Metadata save handler
+    let on_metadata_save = move |event: MetadataSaveEvent| {
+        let fields = event.fields;
+
+        // Convert MetadataFields to the format expected by update_track_metadata
+        let title = fields.title;
+        let artist = fields.artist.map(Some);
+        let album = fields.album.map(Some);
+        let genre = fields.genre.map(Some);
+        let bpm = fields.bpm.map(Some);
+        let key = fields.key.map(Some);
+        let year = fields.year.map(Some);
+        let track_number = fields.track_number.map(Some);
+        let comment = fields.comment.map(Some);
+        let rating = fields.rating.map(Some);
+
+        app_state.batch_update_metadata(
+            event.track_ids,
+            title,
+            artist,
+            album,
+            genre,
+            bpm,
+            key,
+            year,
+            track_number,
+            comment,
+            rating,
+            event.write_to_file,
+        );
+
+        metadata_editor_visible.set(false);
+        metadata_editor_track_ids.set(Vec::new());
+    };
+
+    // Get current folder name for display
+    let folder_display = selected_folder()
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+
+    let on_folder_select = move |path: PathBuf| {
+        selected_folder.set(Some(path));
+    };
+
+    let on_show_all = move |_| {
+        selected_folder.set(None);
+    };
+
+    let total_track_count = app_state.library_tracks.read().len();
 
     rsx! {
         div { class: "library-view",
-            // Sources panel (collapsible)
+            // Sources panel (collapsible) with folder browser
             SourcesPanel {
                 sources: sources,
                 collapsed: sources_collapsed(),
@@ -199,14 +323,30 @@ pub fn Library() -> Element {
                 on_rescan: on_rescan_source,
                 on_rescan_all: on_rescan_all,
                 on_create_playlist: on_create_playlist_from_source,
-                on_toggle_collapse: move |collapsed| sources_collapsed.set(collapsed)
+                on_toggle_collapse: move |collapsed| sources_collapsed.set(collapsed),
+                on_folder_select: on_folder_select,
+                on_show_all: on_show_all,
+                selected_folder: selected_folder(),
+                total_track_count: total_track_count
             }
 
             // Track panel header with search
             div { class: "track-panel-header",
                 div { class: "track-panel-title",
-                    "Library"
-                    span { class: "track-panel-count", "({track_count} tracks)" }
+                    if let Some(ref folder_name) = folder_display {
+                        span { class: "folder-breadcrumb",
+                            button {
+                                class: "breadcrumb-btn",
+                                onclick: move |_| selected_folder.set(None),
+                                "Library"
+                            }
+                            span { class: "breadcrumb-sep", "/" }
+                            span { class: "breadcrumb-current", "{folder_name}" }
+                        }
+                    } else {
+                        "Library"
+                    }
+                    span { class: "track-panel-count", "({track_count})" }
                 }
                 SearchBar {
                     value: search_query(),
@@ -227,15 +367,24 @@ pub fn Library() -> Element {
                     on_remove: on_remove,
                     on_context_menu: on_context_menu,
                     deck_count: 2,
-                    show_playlist_badges: true
+                    show_playlist_badges: true,
+                    track_issues: track_issues.clone(),
+                    on_fix_issues: on_fix_issues
                 }
             }
 
-            if track_count == 0 && !has_search {
+            if track_count == 0 && !has_search && !has_folder {
                 div { class: "empty-state",
                     p { "No tracks in library." }
                     p { "Add a music source folder above to scan for music files." }
                     p { "Supported formats: MP3, WAV, FLAC, OGG, M4A, AAC" }
+                }
+            }
+
+            if track_count == 0 && !has_search && has_folder {
+                div { class: "empty-state",
+                    p { "No audio files in this folder." }
+                    p { "Select a different folder or browse subfolders." }
                 }
             }
 
@@ -253,7 +402,19 @@ pub fn Library() -> Element {
                 playlists: playlist_infos,
                 selected_count: context_menu_selected().len(),
                 on_action: on_context_action,
-                on_close: move |_| context_menu_visible.set(false)
+                on_close: move |_| context_menu_visible.set(false),
+                has_fixable_issues: selected_have_fixable_issues
+            }
+
+            // Metadata editor modal
+            MetadataEditor {
+                visible: metadata_editor_visible(),
+                tracks: metadata_editor_tracks,
+                on_close: move |_| {
+                    metadata_editor_visible.set(false);
+                    metadata_editor_track_ids.set(Vec::new());
+                },
+                on_save: on_metadata_save
             }
         }
     }
