@@ -134,7 +134,10 @@ pub fn Trackbar(props: TrackbarProps) -> Element {
             format!("trackbar deck-{}-trackbar", props.deck_number)
         }
     } else if props.compact {
-        format!("trackbar deck-{}-trackbar compact disabled", props.deck_number)
+        format!(
+            "trackbar deck-{}-trackbar compact disabled",
+            props.deck_number
+        )
     } else {
         format!("trackbar deck-{}-trackbar disabled", props.deck_number)
     };

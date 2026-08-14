@@ -1,0 +1,12 @@
+{
+  "collection": [
+    {
+      "id": 102,
+      "title": "Preview upload",
+      "access": "preview",
+      "permalink_url": "https://soundcloud.com/micha/preview-upload",
+      "user": { "id": 42 }
+    }
+  ],
+  "next_href": null
+}

@@ -56,11 +56,7 @@ impl FrequencyWaveformAnalyzer {
     }
 
     /// Extract frequency bands from audio samples.
-    fn extract_bands(
-        &self,
-        samples: &[f32],
-        sample_rate: u32,
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    fn extract_bands(&self, samples: &[f32], sample_rate: u32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let samples_per_point = sample_rate as usize / self.points_per_second;
         let hop_size = self.fft_size / 4; // 75% overlap for smooth results
 
@@ -215,4 +211,3 @@ mod tests {
         }
     }
 }
-

@@ -310,7 +310,9 @@ mod tests {
         let analyzer = KeyAnalyzer::new();
 
         // Identical arrays should have correlation of 1.0
-        let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let a = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
         let corr = analyzer.pearson_correlation(&a, &a);
         assert!((corr - 1.0).abs() < 0.001);
     }
@@ -323,4 +325,3 @@ mod tests {
         assert!(matches!(result, Err(AnalysisError::InsufficientData)));
     }
 }
-

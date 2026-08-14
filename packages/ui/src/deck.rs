@@ -187,4 +187,3 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
         }
     }
 }
-

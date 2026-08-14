@@ -185,7 +185,10 @@ impl Track {
 
     /// Check if waveform data is available.
     pub fn has_waveform(&self) -> bool {
-        self.waveform.as_ref().map(|w| !w.is_empty()).unwrap_or(false)
+        self.waveform
+            .as_ref()
+            .map(|w| !w.is_empty())
+            .unwrap_or(false)
     }
 
     /// Check if frequency waveform data is available.
@@ -242,7 +245,10 @@ impl Track {
         self.bitrate = properties.audio_bitrate();
 
         // Get tags (try primary tag first, then any available)
-        if let Some(tag) = tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) {
+        if let Some(tag) = tagged_file
+            .primary_tag()
+            .or_else(|| tagged_file.first_tag())
+        {
             // Title
             if let Some(title) = tag.title() {
                 let title_str = title.to_string();

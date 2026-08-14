@@ -5,6 +5,14 @@ edition = "2021"
 
 [dependencies]
 dioxus = { workspace = true, features = ["fullstack"] }
+dotenvy = { version = "0.15", optional = true }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"], optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = "2.5"
 
 [features]
-server = ["dioxus/server"]
+server = ["dioxus/server", "dep:dotenvy", "dep:reqwest"]
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["macros", "rt"] }

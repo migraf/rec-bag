@@ -292,6 +292,18 @@
     font-size: 0.6875rem;
 }
 
+.sp-provider-source-content {
+    display: grid;
+    gap: 0.2rem;
+    padding: 0.75rem 0.5rem;
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+}
+
+.sp-provider-source-content strong {
+    color: var(--text-secondary);
+}
+
 /* Legacy Sources Panel Styles (for compatibility) */
 .sources-header {
     display: flex;

@@ -1,0 +1,18 @@
+{
+  "collection": [
+    {
+      "id": 77,
+      "title": "Ordered private set",
+      "description": "A fixture playlist",
+      "last_modified": "2026-08-13T12:00:00Z",
+      "permalink_url": "https://soundcloud.com/micha/sets/ordered-private-set",
+      "user": { "id": 42 },
+      "tracks": [
+        { "id": 2, "title": "Second", "access": "playable", "user": { "id": 9 } },
+        { "id": 1, "title": "First", "access": "blocked", "user": { "id": 10 } },
+        { "id": 2, "title": "Second duplicate", "access": "playable", "user": { "id": 9 } }
+      ]
+    }
+  ],
+  "next_href": null
+}

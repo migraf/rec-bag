@@ -1,0 +1,17 @@
+{
+  "collection": [
+    {
+      "urn": "soundcloud:tracks:30",
+      "title": "Temporarily inaccessible upload",
+      "state": "failed",
+      "user": { "urn": "soundcloud:users:42" }
+    },
+    {
+      "urn": "soundcloud:tracks:40",
+      "title": "Removed upload",
+      "state": "removed",
+      "user": { "urn": "soundcloud:users:42" }
+    }
+  ],
+  "next_href": null
+}

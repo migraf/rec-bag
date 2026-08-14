@@ -32,6 +32,16 @@ pub use trackbar::{BeatGrid, FrequencyWaveform, Trackbar, TrackbarProps};
 mod sources_panel;
 pub use sources_panel::{SourcesPanel, SourcesPanelProps};
 
+mod music_management;
+pub use music_management::{
+    mock_music_management_view, BackupPolicyView, CleanupItemView, CompletenessView, HealthTone,
+    JobProgressView, MatchCandidateView, MusicManagementDashboard, MusicManagementDashboardProps,
+    MusicManagementEvent, MusicManagementMock, MusicManagementView, PlaylistCompletenessView,
+    PrimaryConfigurationView, PrimaryMigrationPlanView, ProviderChoice, SourceCollectionView,
+    SourceView, StorageRoleView, StorageView, TrackFilter, TrackStorageView,
+    UnknownPrimaryFileView,
+};
+
 mod search_bar;
 pub use search_bar::{SearchBar, SearchBarProps};
 

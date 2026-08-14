@@ -1,0 +1,8 @@
+{
+  "urn": "soundcloud:users:42",
+  "username": "micha",
+  "full_name": "Micha Example",
+  "permalink_url": "https://soundcloud.com/micha",
+  "locale": "en",
+  "secret_token": "must-not-persist"
+}

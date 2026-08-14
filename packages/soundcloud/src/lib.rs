@@ -1,0 +1,1221 @@
+//! SoundCloud's read-only catalog adapter.
+//!
+//! The application supplies a token provider backed by its credential store. API responses are
+//! decoded into typed DTOs and retained as non-secret provider metadata while being normalized
+//! into `rec_core` contracts.
+
+use chrono::{DateTime, Utc};
+use rec_core::{
+    BoxFuture, CatalogSourceConnector, ExternalPlaylist, ExternalPlaylistEntry, HealthStatus,
+    MetadataValue, SourceAccount, SourceAvailability, SourceCapabilities, SourceCollection,
+    SourceCollectionRelationship, SourceCollectionRelationshipIdentity, SourceEntityKind,
+    SourceError, SourceErrorKind, SourceHealth, SourceRemoval, SourceSyncItem, SourceSyncMode,
+    SourceSyncPage, SourceSyncRequest, SourceTrackIdentity, SourceTrackOccurrence, SyncCursor,
+    SyncProgress,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
+use url::Url;
+use uuid::Uuid;
+
+const DEFAULT_PAGE_SIZE: u32 = 50;
+const MAX_PAGE_SIZE: u32 = 200;
+const DEFAULT_API_URL: &str = "https://api.soundcloud.com/";
+const CURSOR_VERSION: u8 = 1;
+
+/// A non-secret access token provider. Implementations must atomically replace persisted refresh
+/// token state before returning because SoundCloud refresh tokens are single-use.
+pub trait SoundCloudTokenProvider: Send + Sync {
+    fn access_token(&self) -> BoxFuture<'_, Result<String, SourceError>>;
+    fn refresh_access_token(&self) -> BoxFuture<'_, Result<String, SourceError>>;
+}
+
+/// A deliberately small HTTP boundary that makes exact API fixtures testable without a server.
+pub trait SoundCloudHttpTransport: Send + Sync {
+    fn execute(
+        &self,
+        request: SoundCloudHttpRequest,
+    ) -> BoxFuture<'_, Result<SoundCloudHttpResponse, SoundCloudTransportError>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundCloudHttpRequest {
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundCloudHttpResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundCloudTransportError {
+    pub message: String,
+}
+
+impl SoundCloudTransportError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ReqwestSoundCloudTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestSoundCloudTransport {
+    pub fn new(client: reqwest::Client) -> Self {
+        Self { client }
+    }
+}
+
+impl SoundCloudHttpTransport for ReqwestSoundCloudTransport {
+    fn execute(
+        &self,
+        request: SoundCloudHttpRequest,
+    ) -> BoxFuture<'_, Result<SoundCloudHttpResponse, SoundCloudTransportError>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let mut builder = client.get(request.url);
+            for (name, value) in request.headers {
+                builder = builder.header(name, value);
+            }
+            let response = builder
+                .send()
+                .await
+                .map_err(|error| SoundCloudTransportError::new(error.to_string()))?;
+            let status = response.status().as_u16();
+            let headers = response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+                })
+                .collect();
+            let body = response
+                .text()
+                .await
+                .map_err(|error| SoundCloudTransportError::new(error.to_string()))?;
+            Ok(SoundCloudHttpResponse {
+                status,
+                headers,
+                body,
+            })
+        })
+    }
+}
+
+pub trait SoundCloudSleeper: Send + Sync {
+    fn sleep(&self, duration: Duration) -> BoxFuture<'_, ()>;
+}
+
+#[derive(Default)]
+pub struct TokioSoundCloudSleeper;
+
+impl SoundCloudSleeper for TokioSoundCloudSleeper {
+    fn sleep(&self, duration: Duration) -> BoxFuture<'_, ()> {
+        Box::pin(async move { tokio::time::sleep(duration).await })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoundCloudRetryPolicy {
+    pub max_retries: u8,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for SoundCloudRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SoundCloudClient {
+    transport: Arc<dyn SoundCloudHttpTransport>,
+    tokens: Arc<dyn SoundCloudTokenProvider>,
+    sleeper: Arc<dyn SoundCloudSleeper>,
+    retry_policy: SoundCloudRetryPolicy,
+    api_url: Url,
+}
+
+impl SoundCloudClient {
+    pub fn new(
+        transport: Arc<dyn SoundCloudHttpTransport>,
+        tokens: Arc<dyn SoundCloudTokenProvider>,
+    ) -> Result<Self, SourceError> {
+        Self::with_options(
+            transport,
+            tokens,
+            Arc::new(TokioSoundCloudSleeper),
+            SoundCloudRetryPolicy::default(),
+            DEFAULT_API_URL,
+        )
+    }
+
+    pub fn with_options(
+        transport: Arc<dyn SoundCloudHttpTransport>,
+        tokens: Arc<dyn SoundCloudTokenProvider>,
+        sleeper: Arc<dyn SoundCloudSleeper>,
+        retry_policy: SoundCloudRetryPolicy,
+        api_url: &str,
+    ) -> Result<Self, SourceError> {
+        let api_url =
+            Url::parse(api_url).map_err(|_| invalid_data("invalid SoundCloud API URL"))?;
+        if api_url.scheme().is_empty() || api_url.host_str().is_none() {
+            return Err(invalid_data(
+                "SoundCloud API URL must include a scheme and host",
+            ));
+        }
+        Ok(Self {
+            transport,
+            tokens,
+            sleeper,
+            retry_policy,
+            api_url,
+        })
+    }
+
+    /// Fetches and normalizes `GET /me`.
+    pub async fn account(&self, source_id: Uuid) -> Result<SourceAccount, SourceError> {
+        let dto: AccountDto = self.get(self.url_for_path("me")?).await?;
+        map_account(source_id, &dto)
+    }
+
+    async fn collection_page(
+        &self,
+        collection: SourceCollection,
+        href: Option<&str>,
+        page_size: u32,
+    ) -> Result<CollectionPage, SourceError> {
+        let url = match href {
+            Some(href) => self.validated_next_href(href)?,
+            None => self.collection_url(collection, page_size)?,
+        };
+        match collection {
+            SourceCollection::UploadedTracks | SourceCollection::LikedTracks => {
+                let page: ApiCollection<TrackDto> = self.get(url).await?;
+                Ok(CollectionPage::Tracks(page.into_page()))
+            }
+            SourceCollection::OwnedPlaylists | SourceCollection::LikedPlaylists => {
+                let page: ApiCollection<PlaylistDto> = self.get(url).await?;
+                Ok(CollectionPage::Playlists(page.into_page()))
+            }
+        }
+    }
+
+    async fn playlist(&self, id: &str) -> Result<PlaylistDto, SourceError> {
+        let mut url = self.url_for_path(&format!("playlists/{id}"))?;
+        url.query_pairs_mut().append_pair("show_tracks", "true");
+        self.get(url).await
+    }
+
+    fn collection_url(
+        &self,
+        collection: SourceCollection,
+        page_size: u32,
+    ) -> Result<Url, SourceError> {
+        let path = match collection {
+            SourceCollection::UploadedTracks => "me/tracks",
+            SourceCollection::LikedTracks => "me/likes/tracks",
+            SourceCollection::OwnedPlaylists => "me/playlists",
+            SourceCollection::LikedPlaylists => "me/likes/playlists",
+        };
+        let mut url = self.url_for_path(path)?;
+        let mut query = url.query_pairs_mut();
+        query.append_pair("linked_partitioning", "true");
+        query.append_pair("limit", &page_size.to_string());
+        if matches!(
+            collection,
+            SourceCollection::OwnedPlaylists | SourceCollection::LikedPlaylists
+        ) {
+            query.append_pair("show_tracks", "true");
+        }
+        drop(query);
+        Ok(url)
+    }
+
+    fn url_for_path(&self, path: &str) -> Result<Url, SourceError> {
+        self.api_url
+            .join(path)
+            .map_err(|_| invalid_data("invalid SoundCloud API path"))
+    }
+
+    fn validated_next_href(&self, href: &str) -> Result<Url, SourceError> {
+        let url = Url::parse(href)
+            .map_err(|_| invalid_data("SoundCloud returned an invalid next_href"))?;
+        if url.scheme() != self.api_url.scheme()
+            || url.host_str() != self.api_url.host_str()
+            || url.port_or_known_default() != self.api_url.port_or_known_default()
+        {
+            return Err(invalid_data(
+                "SoundCloud next_href has an unexpected origin",
+            ));
+        }
+        Ok(url)
+    }
+
+    async fn get<T: DeserializeOwned>(&self, url: Url) -> Result<T, SourceError> {
+        let mut token = self.tokens.access_token().await?;
+        let mut refreshed = false;
+        let mut retries = 0_u8;
+        loop {
+            let response = self
+                .transport
+                .execute(SoundCloudHttpRequest {
+                    url: url.to_string(),
+                    headers: BTreeMap::from([
+                        (
+                            "accept".to_string(),
+                            "application/json; charset=utf-8".to_string(),
+                        ),
+                        ("authorization".to_string(), format!("OAuth {token}")),
+                    ]),
+                })
+                .await;
+            match response {
+                Ok(response) if (200..300).contains(&response.status) => {
+                    return serde_json::from_str(&response.body).map_err(|error| {
+                        invalid_data(format!(
+                            "SoundCloud returned a response outside the validated schema: {error}"
+                        ))
+                    });
+                }
+                Ok(response) if response.status == 401 && !refreshed => {
+                    token = self.tokens.refresh_access_token().await?;
+                    refreshed = true;
+                }
+                Ok(response) => {
+                    let error = response_error(&response);
+                    if error.is_retryable() && retries < self.retry_policy.max_retries {
+                        let delay = retry_delay(&response, retries, self.retry_policy);
+                        retries += 1;
+                        self.sleeper.sleep(delay).await;
+                    } else {
+                        return Err(error);
+                    }
+                }
+                Err(_error) if retries < self.retry_policy.max_retries => {
+                    let delay = exponential_delay(retries, self.retry_policy);
+                    retries += 1;
+                    self.sleeper.sleep(delay).await;
+                }
+                Err(error) => {
+                    return Err(SourceError::new(
+                        SourceErrorKind::TemporarilyUnavailable,
+                        format!(
+                            "SoundCloud request could not be completed: {}",
+                            error.message
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SoundCloudConnector {
+    source_id: Uuid,
+    client: SoundCloudClient,
+}
+
+impl SoundCloudConnector {
+    pub fn new(source_id: Uuid, client: SoundCloudClient) -> Self {
+        Self { source_id, client }
+    }
+
+    pub fn source_id(&self) -> Uuid {
+        self.source_id
+    }
+
+    async fn sync_page_inner(
+        &self,
+        request: SourceSyncRequest,
+    ) -> Result<SourceSyncPage, SourceError> {
+        let page_size = validated_page_size(request.page_size)?;
+        let requested_collections = selected_collections(&request.collections);
+        let expected_base_cursor = match &request.mode {
+            SourceSyncMode::Full => None,
+            SourceSyncMode::Incremental { cursor } => Some(cursor.value.clone()),
+        };
+
+        let (mut state, mut items) = if let Some(cursor) = &request.page_cursor {
+            let state: SoundCloudPageCursor = decode_cursor(&cursor.value, "page")?;
+            if state.version != CURSOR_VERSION
+                || state.collections != requested_collections
+                || state.base_sync_cursor != expected_base_cursor
+            {
+                return Err(invalid_data(
+                    "SoundCloud page cursor does not match this sync request",
+                ));
+            }
+            (state, Vec::new())
+        } else {
+            let previous_relationships = match &request.mode {
+                SourceSyncMode::Full => Vec::new(),
+                SourceSyncMode::Incremental { cursor } => {
+                    let snapshot: SoundCloudSyncCursor = decode_cursor(&cursor.value, "sync")?;
+                    if snapshot.version != CURSOR_VERSION
+                        || snapshot.collections != requested_collections
+                    {
+                        return Err(invalid_data(
+                            "SoundCloud sync cursor does not match the requested collections",
+                        ));
+                    }
+                    snapshot.relationships
+                }
+            };
+            let account = self.client.account(self.source_id).await?;
+            let account_id = account.external_id.clone();
+            (
+                SoundCloudPageCursor {
+                    version: CURSOR_VERSION,
+                    collections: requested_collections,
+                    collection_index: 0,
+                    next_href: None,
+                    observed_at: Utc::now(),
+                    account_external_id: account_id,
+                    base_sync_cursor: expected_base_cursor,
+                    previous_relationships,
+                    current_relationships: Vec::new(),
+                    emitted_tracks: Vec::new(),
+                    emitted_playlists: Vec::new(),
+                    emitted_removals: Vec::new(),
+                },
+                vec![SourceSyncItem::Account(account)],
+            )
+        };
+
+        let collection = state
+            .collections
+            .get(state.collection_index)
+            .copied()
+            .ok_or_else(|| invalid_data("SoundCloud page cursor has no collection"))?;
+        let page = self
+            .client
+            .collection_page(collection, state.next_href.as_deref(), page_size)
+            .await?;
+        let mut current: HashSet<_> = state.current_relationships.drain(..).collect();
+        let mut emitted_tracks: HashSet<_> = state.emitted_tracks.drain(..).collect();
+        let mut emitted_playlists: HashSet<_> = state.emitted_playlists.drain(..).collect();
+        let mut emitted_removals: HashSet<_> = state.emitted_removals.drain(..).collect();
+        let mut removals = Vec::new();
+
+        let provider_next = match page {
+            CollectionPage::Tracks(page) => {
+                for track in page.collection {
+                    add_track_and_relationship(
+                        &mut items,
+                        &mut removals,
+                        &mut current,
+                        &mut emitted_tracks,
+                        &mut emitted_removals,
+                        self.source_id,
+                        &state.account_external_id,
+                        collection,
+                        &track,
+                        state.observed_at,
+                    )?;
+                }
+                page.next_href
+            }
+            CollectionPage::Playlists(page) => {
+                for mut playlist in page.collection {
+                    if playlist.tracks.is_none() {
+                        playlist = self.client.playlist(&playlist.external_id()?).await?;
+                    }
+                    add_playlist_and_entries(
+                        &mut items,
+                        &mut removals,
+                        &mut current,
+                        &mut emitted_tracks,
+                        &mut emitted_playlists,
+                        &mut emitted_removals,
+                        self.source_id,
+                        &state.account_external_id,
+                        collection,
+                        &playlist,
+                        state.observed_at,
+                    )?;
+                }
+                page.next_href
+            }
+        };
+
+        state.current_relationships = sorted_relationships(current);
+        state.emitted_tracks = sorted_strings(emitted_tracks);
+        state.emitted_playlists = sorted_strings(emitted_playlists);
+        state.emitted_removals = sorted_entities(emitted_removals);
+        if let Some(next_href) = provider_next {
+            state.next_href = Some(next_href);
+        } else {
+            state.collection_index += 1;
+            state.next_href = None;
+        }
+
+        let complete = state.collection_index >= state.collections.len();
+        let (next_page_cursor, next_sync_cursor) = if complete {
+            let previous: HashSet<_> = state.previous_relationships.iter().cloned().collect();
+            let current: HashSet<_> = state.current_relationships.iter().cloned().collect();
+            let mut missing: Vec<_> = previous.difference(&current).cloned().collect();
+            sort_relationship_slice(&mut missing);
+            items.extend(missing.into_iter().map(SourceSyncItem::RelationshipRemoval));
+            let snapshot = SoundCloudSyncCursor {
+                version: CURSOR_VERSION,
+                collections: state.collections.clone(),
+                relationships: state.current_relationships.clone(),
+            };
+            (
+                None,
+                Some(SyncCursor::at(
+                    serde_json::to_string(&snapshot)
+                        .map_err(|_| invalid_data("could not encode SoundCloud sync cursor"))?,
+                    state.observed_at,
+                )),
+            )
+        } else {
+            (
+                Some(SyncCursor::at(
+                    serde_json::to_string(&state)
+                        .map_err(|_| invalid_data("could not encode SoundCloud page cursor"))?,
+                    state.observed_at,
+                )),
+                None,
+            )
+        };
+
+        let record_count = items.len() as u64 + removals.len() as u64;
+        Ok(SourceSyncPage {
+            items,
+            removals,
+            next_page_cursor,
+            next_sync_cursor,
+            progress: Some(SyncProgress {
+                discovered_items: record_count,
+                processed_items: record_count,
+                succeeded_items: record_count,
+                ..SyncProgress::default()
+            }),
+        })
+    }
+}
+
+impl CatalogSourceConnector for SoundCloudConnector {
+    fn health(&self) -> BoxFuture<'_, Result<SourceHealth, SourceError>> {
+        Box::pin(async move {
+            match self.client.account(self.source_id).await {
+                Ok(_) => Ok(SourceHealth {
+                    status: HealthStatus::Healthy,
+                    checked_at: Utc::now(),
+                    message: None,
+                    capabilities: soundcloud_capabilities(),
+                }),
+                Err(error) if error.kind == SourceErrorKind::AuthenticationRequired => {
+                    Ok(SourceHealth {
+                        status: HealthStatus::AuthenticationRequired,
+                        checked_at: Utc::now(),
+                        message: Some("SoundCloud authorization is required".to_string()),
+                        capabilities: soundcloud_capabilities(),
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn sync_page(
+        &self,
+        request: SourceSyncRequest,
+    ) -> BoxFuture<'_, Result<SourceSyncPage, SourceError>> {
+        Box::pin(async move { self.sync_page_inner(request).await })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SoundCloudSyncCursor {
+    version: u8,
+    collections: Vec<SourceCollection>,
+    relationships: Vec<SourceCollectionRelationshipIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SoundCloudPageCursor {
+    version: u8,
+    collections: Vec<SourceCollection>,
+    collection_index: usize,
+    next_href: Option<String>,
+    observed_at: DateTime<Utc>,
+    account_external_id: String,
+    base_sync_cursor: Option<String>,
+    previous_relationships: Vec<SourceCollectionRelationshipIdentity>,
+    current_relationships: Vec<SourceCollectionRelationshipIdentity>,
+    emitted_tracks: Vec<String>,
+    emitted_playlists: Vec<String>,
+    emitted_removals: Vec<EntityIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct EntityIdentity {
+    entity_kind: SourceEntityKind,
+    external_id: String,
+}
+
+#[derive(Debug)]
+enum CollectionPage {
+    Tracks(TypedPage<TrackDto>),
+    Playlists(TypedPage<PlaylistDto>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ApiCollection<T> {
+    Paginated(TypedPage<T>),
+    Legacy(Vec<T>),
+}
+
+impl<T> ApiCollection<T> {
+    fn into_page(self) -> TypedPage<T> {
+        match self {
+            Self::Paginated(page) => page,
+            Self::Legacy(collection) => TypedPage {
+                collection,
+                next_href: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TypedPage<T> {
+    collection: Vec<T>,
+    #[serde(default)]
+    next_href: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum LegacyId {
+    String(String),
+    Number(u64),
+}
+
+impl LegacyId {
+    fn as_string(&self) -> String {
+        match self {
+            Self::String(value) => value.clone(),
+            Self::Number(value) => value.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AccountDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    urn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<LegacyId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    full_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permalink_url: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    urn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<LegacyId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permalink_url: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+impl UserDto {
+    fn external_id(&self) -> Option<String> {
+        provider_id(self.urn.as_deref(), self.id.as_ref())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrackDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    urn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<LegacyId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    downloadable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    download_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permalink_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<UserDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sharing: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+impl TrackDto {
+    fn external_id(&self) -> Result<String, SourceError> {
+        provider_id(self.urn.as_deref(), self.id.as_ref())
+            .ok_or_else(|| invalid_data("SoundCloud track is missing a valid urn or id"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlaylistDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    urn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<LegacyId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_modified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permalink_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<UserDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sharing: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tracks: Option<Vec<TrackDto>>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+impl PlaylistDto {
+    fn external_id(&self) -> Result<String, SourceError> {
+        provider_id(self.urn.as_deref(), self.id.as_ref())
+            .ok_or_else(|| invalid_data("SoundCloud playlist is missing a valid urn or id"))
+    }
+}
+
+fn provider_id(urn: Option<&str>, id: Option<&LegacyId>) -> Option<String> {
+    urn.filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            id.map(LegacyId::as_string)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn decode_cursor<T: DeserializeOwned>(value: &str, kind: &str) -> Result<T, SourceError> {
+    serde_json::from_str(value)
+        .map_err(|_| invalid_data(format!("invalid SoundCloud {kind} cursor")))
+}
+
+fn selected_collections(request: &[SourceCollection]) -> Vec<SourceCollection> {
+    let requested = if request.is_empty() {
+        vec![
+            SourceCollection::UploadedTracks,
+            SourceCollection::OwnedPlaylists,
+            SourceCollection::LikedTracks,
+            SourceCollection::LikedPlaylists,
+        ]
+    } else {
+        request.to_vec()
+    };
+    let mut selected = Vec::new();
+    for collection in requested {
+        if !selected.contains(&collection) {
+            selected.push(collection);
+        }
+    }
+    selected
+}
+
+fn validated_page_size(value: Option<u32>) -> Result<u32, SourceError> {
+    let value = value.unwrap_or(DEFAULT_PAGE_SIZE);
+    if value == 0 || value > MAX_PAGE_SIZE {
+        return Err(invalid_data(format!(
+            "SoundCloud page size must be between 1 and {MAX_PAGE_SIZE}"
+        )));
+    }
+    Ok(value)
+}
+
+fn soundcloud_capabilities() -> SourceCapabilities {
+    SourceCapabilities {
+        library_sync: true,
+        playlist_sync: true,
+        search: false,
+        streaming: false,
+        download: false,
+        metadata: true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_track_and_relationship(
+    output: &mut Vec<SourceSyncItem>,
+    removals: &mut Vec<SourceRemoval>,
+    current: &mut HashSet<SourceCollectionRelationshipIdentity>,
+    emitted_tracks: &mut HashSet<String>,
+    emitted_removals: &mut HashSet<EntityIdentity>,
+    source_id: Uuid,
+    account_id: &str,
+    collection: SourceCollection,
+    track: &TrackDto,
+    observed_at: DateTime<Utc>,
+) -> Result<(), SourceError> {
+    let external_id = track.external_id()?;
+    emit_track(
+        output,
+        removals,
+        emitted_tracks,
+        emitted_removals,
+        source_id,
+        track,
+        observed_at,
+    )?;
+    emit_relationship(
+        output,
+        current,
+        SourceCollectionRelationshipIdentity::new(
+            source_id,
+            account_id,
+            collection,
+            SourceEntityKind::Track,
+            external_id,
+        ),
+        observed_at,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_playlist_and_entries(
+    output: &mut Vec<SourceSyncItem>,
+    removals: &mut Vec<SourceRemoval>,
+    current: &mut HashSet<SourceCollectionRelationshipIdentity>,
+    emitted_tracks: &mut HashSet<String>,
+    emitted_playlists: &mut HashSet<String>,
+    emitted_removals: &mut HashSet<EntityIdentity>,
+    source_id: Uuid,
+    account_id: &str,
+    collection: SourceCollection,
+    value: &PlaylistDto,
+    observed_at: DateTime<Utc>,
+) -> Result<(), SourceError> {
+    let mut playlist = map_playlist(source_id, value, observed_at)?;
+    let playlist_id = playlist.external_id.clone();
+    let emit_playlist = emitted_playlists.insert(playlist_id.clone());
+    emit_relationship(
+        output,
+        current,
+        SourceCollectionRelationshipIdentity::new(
+            source_id,
+            account_id,
+            collection,
+            SourceEntityKind::Playlist,
+            playlist_id.clone(),
+        ),
+        observed_at,
+    );
+
+    for (position, track) in value
+        .tracks
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        let track_id = track.external_id()?;
+        emit_track(
+            output,
+            removals,
+            emitted_tracks,
+            emitted_removals,
+            source_id,
+            track,
+            observed_at,
+        )?;
+        let entry = ExternalPlaylistEntry::new(
+            position as u32,
+            SourceTrackIdentity::new(source_id, track_id.clone()),
+        );
+        playlist.entries.push(entry.clone());
+        if emit_playlist {
+            output.push(SourceSyncItem::PlaylistEntry {
+                playlist_external_id: playlist_id.clone(),
+                snapshot: playlist.snapshot.clone(),
+                entry,
+            });
+        }
+        emit_relationship(
+            output,
+            current,
+            SourceCollectionRelationshipIdentity::new(
+                source_id,
+                account_id,
+                collection,
+                SourceEntityKind::Track,
+                track_id,
+            )
+            .with_parent(playlist_id.clone(), Some(position as u32)),
+            observed_at,
+        );
+    }
+    if emit_playlist {
+        playlist.sort_entries();
+        output.push(SourceSyncItem::Playlist(playlist));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_track(
+    output: &mut Vec<SourceSyncItem>,
+    removals: &mut Vec<SourceRemoval>,
+    emitted_tracks: &mut HashSet<String>,
+    emitted_removals: &mut HashSet<EntityIdentity>,
+    source_id: Uuid,
+    track: &TrackDto,
+    observed_at: DateTime<Utc>,
+) -> Result<(), SourceError> {
+    let id = track.external_id()?;
+    if emitted_tracks.insert(id.clone()) {
+        output.push(SourceSyncItem::Track(map_track(
+            source_id,
+            track,
+            observed_at,
+        )?));
+    }
+    if availability(track) == SourceAvailability::Removed {
+        let identity = EntityIdentity {
+            entity_kind: SourceEntityKind::Track,
+            external_id: id.clone(),
+        };
+        if emitted_removals.insert(identity) {
+            removals.push(SourceRemoval {
+                entity_kind: SourceEntityKind::Track,
+                external_id: id,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn emit_relationship(
+    output: &mut Vec<SourceSyncItem>,
+    current: &mut HashSet<SourceCollectionRelationshipIdentity>,
+    identity: SourceCollectionRelationshipIdentity,
+    observed_at: DateTime<Utc>,
+) {
+    if current.insert(identity.clone()) {
+        output.push(SourceSyncItem::Relationship(
+            SourceCollectionRelationship::new(identity, observed_at),
+        ));
+    }
+}
+
+fn map_account(source_id: Uuid, value: &AccountDto) -> Result<SourceAccount, SourceError> {
+    let external_id = provider_id(value.urn.as_deref(), value.id.as_ref())
+        .ok_or_else(|| invalid_data("SoundCloud account is missing a valid urn or id"))?;
+    let mut account = SourceAccount::new(source_id, external_id);
+    account.username = value.username.clone();
+    account.display_name = value.full_name.clone();
+    account.external_url = value.permalink_url.clone();
+    account.provider_metadata = metadata(value)?;
+    Ok(account)
+}
+
+fn map_track(
+    source_id: Uuid,
+    value: &TrackDto,
+    observed_at: DateTime<Utc>,
+) -> Result<SourceTrackOccurrence, SourceError> {
+    let mut track = SourceTrackOccurrence::new(source_id, value.external_id()?);
+    track.account_external_id = value.user.as_ref().and_then(UserDto::external_id);
+    track.external_url = value.permalink_url.clone();
+    track.provider_metadata = metadata(value)?;
+    track.availability = availability(value);
+    track.last_seen_at = observed_at;
+    Ok(track)
+}
+
+fn map_playlist(
+    source_id: Uuid,
+    value: &PlaylistDto,
+    observed_at: DateTime<Utc>,
+) -> Result<ExternalPlaylist, SourceError> {
+    let mut playlist = ExternalPlaylist::new(
+        source_id,
+        value.external_id()?,
+        value
+            .title
+            .clone()
+            .unwrap_or_else(|| "Untitled SoundCloud playlist".to_string()),
+    );
+    playlist.description = value.description.clone();
+    playlist.account_external_id = value.user.as_ref().and_then(UserDto::external_id);
+    playlist.external_url = value.permalink_url.clone();
+    playlist.snapshot = value
+        .last_modified
+        .clone()
+        .or_else(|| value.created_at.clone());
+    playlist.provider_metadata = metadata(value)?;
+    playlist.last_seen_at = observed_at;
+    Ok(playlist)
+}
+
+fn availability(value: &TrackDto) -> SourceAvailability {
+    match value.state.as_deref() {
+        Some("deleted") | Some("removed") => return SourceAvailability::Removed,
+        Some("failed") | Some("inaccessible") => return SourceAvailability::Inaccessible,
+        _ => {}
+    }
+    match value.access.as_deref() {
+        Some("preview") => SourceAvailability::PreviewOnly,
+        Some("blocked") => SourceAvailability::Blocked,
+        Some("playable") if value.downloadable == Some(true) && value.download_url.is_some() => {
+            SourceAvailability::Obtainable
+        }
+        Some("playable") => SourceAvailability::StreamingOnly,
+        _ => SourceAvailability::MetadataOnly,
+    }
+}
+
+fn metadata<T: Serialize>(value: &T) -> Result<BTreeMap<String, MetadataValue>, SourceError> {
+    let value = serde_json::to_value(value)
+        .map_err(|_| invalid_data("could not preserve SoundCloud provider metadata"))?;
+    Ok(value
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .filter(|(key, _)| !is_sensitive_key(key))
+                .map(|(key, value)| (key.clone(), metadata_value(value)))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn metadata_value(value: &Value) -> MetadataValue {
+    match value {
+        Value::Null => MetadataValue::Null,
+        Value::Bool(value) => MetadataValue::Boolean(*value),
+        Value::String(value) => MetadataValue::Text(value.clone()),
+        Value::Number(value) => value
+            .as_i64()
+            .map(MetadataValue::Integer)
+            .unwrap_or_else(|| MetadataValue::Decimal(value.to_string())),
+        Value::Array(values) => MetadataValue::List(values.iter().map(metadata_value).collect()),
+        Value::Object(values) => MetadataValue::Object(
+            values
+                .iter()
+                .filter(|(key, _)| !is_sensitive_key(key))
+                .map(|(key, value)| (key.clone(), metadata_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("token") || key.contains("secret") || key == "authorization"
+}
+
+fn sorted_relationships(
+    values: HashSet<SourceCollectionRelationshipIdentity>,
+) -> Vec<SourceCollectionRelationshipIdentity> {
+    let mut values: Vec<_> = values.into_iter().collect();
+    sort_relationship_slice(&mut values);
+    values
+}
+
+fn sort_relationship_slice(values: &mut [SourceCollectionRelationshipIdentity]) {
+    values.sort_by_cached_key(|value| serde_json::to_string(value).unwrap_or_default());
+}
+
+fn sorted_strings(values: HashSet<String>) -> Vec<String> {
+    let mut values: Vec<_> = values.into_iter().collect();
+    values.sort();
+    values
+}
+
+fn sorted_entities(values: HashSet<EntityIdentity>) -> Vec<EntityIdentity> {
+    let mut values: Vec<_> = values.into_iter().collect();
+    values.sort_by_key(|value| {
+        (
+            format!("{:?}", value.entity_kind),
+            value.external_id.clone(),
+        )
+    });
+    values
+}
+
+fn invalid_data(message: impl Into<String>) -> SourceError {
+    SourceError::new(SourceErrorKind::InvalidData, message)
+}
+
+fn response_error(response: &SoundCloudHttpResponse) -> SourceError {
+    let body: Option<ApiErrorDto> = serde_json::from_str(&response.body).ok();
+    let detail = body
+        .as_ref()
+        .and_then(|error| error.message.as_deref())
+        .filter(|message| !message.is_empty())
+        .map(|message| format!(": {message}"))
+        .unwrap_or_default();
+    let mut error = SourceError::new(
+        match response.status {
+            401 => SourceErrorKind::AuthenticationRequired,
+            403 => SourceErrorKind::PermissionDenied,
+            404 => SourceErrorKind::NotFound,
+            429 => SourceErrorKind::RateLimited,
+            500..=599 => SourceErrorKind::TemporarilyUnavailable,
+            _ => SourceErrorKind::Permanent,
+        },
+        format!(
+            "SoundCloud request failed with HTTP status {}{detail}",
+            response.status
+        ),
+    );
+    error.provider_code = body
+        .and_then(|error| error.code.map(|code| code.to_string()))
+        .or_else(|| Some(response.status.to_string()));
+    error.retry_after_seconds =
+        header(&response.headers, "retry-after").and_then(|value| value.parse().ok());
+    error
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorDto {
+    #[serde(default)]
+    code: Option<u16>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+fn retry_delay(
+    response: &SoundCloudHttpResponse,
+    retry: u8,
+    policy: SoundCloudRetryPolicy,
+) -> Duration {
+    header(&response.headers, "retry-after")
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| exponential_delay(retry, policy))
+}
+
+fn header<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn exponential_delay(retry: u8, policy: SoundCloudRetryPolicy) -> Duration {
+    let multiplier = 1_u32.checked_shl(retry as u32).unwrap_or(u32::MAX);
+    policy
+        .initial_backoff
+        .saturating_mul(multiplier)
+        .min(policy.max_backoff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_track_maps_all_access_states() {
+        let parse = |json| serde_json::from_value::<TrackDto>(json).unwrap();
+        assert_eq!(
+            availability(&parse(serde_json::json!({"id": 1, "access": "playable"}))),
+            SourceAvailability::StreamingOnly
+        );
+        assert_eq!(
+            availability(&parse(
+                serde_json::json!({"id": 1, "access": "playable", "downloadable": true, "download_url": "x"})
+            )),
+            SourceAvailability::Obtainable
+        );
+        assert_eq!(
+            availability(&parse(serde_json::json!({"id": 1, "access": "preview"}))),
+            SourceAvailability::PreviewOnly
+        );
+        assert_eq!(
+            availability(&parse(serde_json::json!({"id": 1, "access": "blocked"}))),
+            SourceAvailability::Blocked
+        );
+        assert_eq!(
+            availability(&parse(serde_json::json!({"id": 1, "state": "deleted"}))),
+            SourceAvailability::Removed
+        );
+        assert_eq!(
+            availability(&parse(serde_json::json!({"id": 1, "state": "failed"}))),
+            SourceAvailability::Inaccessible
+        );
+    }
+
+    #[test]
+    fn typed_dto_preserves_unknown_metadata_and_redacts_secrets() {
+        let dto: TrackDto = serde_json::from_value(serde_json::json!({
+            "urn": "soundcloud:tracks:1",
+            "title": "Safe",
+            "future_field": {"ok": 1, "access_token": "nope"},
+            "secret_token": "nope"
+        }))
+        .unwrap();
+        let actual = metadata(&dto).unwrap();
+        assert_eq!(
+            actual.get("future_field"),
+            Some(&MetadataValue::Object(BTreeMap::from([(
+                "ok".to_string(),
+                MetadataValue::Integer(1)
+            )])))
+        );
+        assert!(!actual.contains_key("secret_token"));
+    }
+
+    #[test]
+    fn current_urn_and_legacy_numeric_ids_are_supported() {
+        let current: TrackDto = serde_json::from_value(serde_json::json!({
+            "urn": "soundcloud:tracks:123"
+        }))
+        .unwrap();
+        let legacy: TrackDto = serde_json::from_value(serde_json::json!({"id": 123})).unwrap();
+        assert_eq!(current.external_id().unwrap(), "soundcloud:tracks:123");
+        assert_eq!(legacy.external_id().unwrap(), "123");
+    }
+}

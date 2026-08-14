@@ -87,4 +87,3 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
         }
     }
 }
-

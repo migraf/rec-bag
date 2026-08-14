@@ -2,8 +2,8 @@
 
 use dioxus::prelude::*;
 use rec_core::{
-    analyze_track, AudioEngine, Diagnosis, Doctor, Library, MusicSource, Playlist,
-    SearchEngine, SqliteStorage, Track,
+    analyze_track, AudioEngine, Diagnosis, Doctor, Library, MusicSource, Playlist, SearchEngine,
+    SqliteStorage, Track,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -168,34 +168,35 @@ impl AppState {
                         let mut freq_cache = HashMap::new();
                         let mut beat_cache = HashMap::new();
 
-                        let populate_caches = |track: &Track,
-                                                wf: &mut HashMap<Uuid, Vec<f32>>,
-                                                freq: &mut HashMap<Uuid, FreqWaveformData>,
-                                                beat: &mut HashMap<Uuid, BeatGridInfo>| {
-                            if let Some(w) = &track.waveform {
-                                wf.insert(track.id, w.peaks.clone());
-                            }
-                            if let Some(fw) = &track.freq_waveform {
-                                freq.insert(
-                                    track.id,
-                                    FreqWaveformData {
-                                        low: fw.low.clone(),
-                                        mid: fw.mid.clone(),
-                                        high: fw.high.clone(),
-                                    },
-                                );
-                            }
-                            if let Some(bg) = &track.beat_grid {
-                                beat.insert(
-                                    track.id,
-                                    BeatGridInfo {
-                                        first_beat_ms: bg.first_beat_ms,
-                                        beat_interval_ms: bg.beat_interval_ms,
-                                        beats: bg.beats.clone(),
-                                    },
-                                );
-                            }
-                        };
+                        let populate_caches =
+                            |track: &Track,
+                             wf: &mut HashMap<Uuid, Vec<f32>>,
+                             freq: &mut HashMap<Uuid, FreqWaveformData>,
+                             beat: &mut HashMap<Uuid, BeatGridInfo>| {
+                                if let Some(w) = &track.waveform {
+                                    wf.insert(track.id, w.peaks.clone());
+                                }
+                                if let Some(fw) = &track.freq_waveform {
+                                    freq.insert(
+                                        track.id,
+                                        FreqWaveformData {
+                                            low: fw.low.clone(),
+                                            mid: fw.mid.clone(),
+                                            high: fw.high.clone(),
+                                        },
+                                    );
+                                }
+                                if let Some(bg) = &track.beat_grid {
+                                    beat.insert(
+                                        track.id,
+                                        BeatGridInfo {
+                                            first_beat_ms: bg.first_beat_ms,
+                                            beat_interval_ms: bg.beat_interval_ms,
+                                            beats: bg.beats.clone(),
+                                        },
+                                    );
+                                }
+                            };
 
                         for track in &library.loose_tracks {
                             populate_caches(track, &mut wf_cache, &mut freq_cache, &mut beat_cache);
@@ -262,7 +263,7 @@ impl AppState {
                 playlists: self.playlists.read().clone(),
                 loose_tracks: self.library_tracks.read().clone(),
             };
-            
+
             if let Err(e) = storage.save_library_async(&library).await {
                 eprintln!("Failed to save library: {}", e);
             }
@@ -518,7 +519,12 @@ impl AppState {
 
     /// Rescan a specific source for changes.
     pub async fn rescan_source(mut self, source_id: Uuid) {
-        let source = self.sources.read().iter().find(|s| s.id == source_id).cloned();
+        let source = self
+            .sources
+            .read()
+            .iter()
+            .find(|s| s.id == source_id)
+            .cloned();
 
         if let Some(mut source) = source {
             if !source.enabled || !source.is_local() {
@@ -577,7 +583,12 @@ impl AppState {
 
     /// Create a playlist from a source folder.
     pub fn create_playlist_from_source(mut self, source_id: Uuid) -> Option<Uuid> {
-        let source = self.sources.read().iter().find(|s| s.id == source_id).cloned()?;
+        let source = self
+            .sources
+            .read()
+            .iter()
+            .find(|s| s.id == source_id)
+            .cloned()?;
 
         // Get tracks from this source
         let source_path = source.local_path()?;
@@ -783,11 +794,7 @@ impl AppState {
             }
             if !track.has_beat_grid() {
                 if let Some(bg) = beat_grid {
-                    track.set_beat_grid(
-                        bg.first_beat_ms,
-                        bg.beat_interval_ms,
-                        bg.beats.clone(),
-                    );
+                    track.set_beat_grid(bg.first_beat_ms, bg.beat_interval_ms, bg.beats.clone());
                 }
             }
             if !track.has_bpm() {
@@ -924,10 +931,7 @@ impl AppState {
             .map_err(|e| e.to_string())?;
 
         // Re-scan the track to update diagnoses
-        let new_diagnoses: Vec<Diagnosis> = doctor
-            .check_track(&track)
-            .into_iter()
-            .collect();
+        let new_diagnoses: Vec<Diagnosis> = doctor.check_track(&track).into_iter().collect();
 
         // Update the diagnoses state
         let mut all_diagnoses = self.diagnoses.write();
@@ -1342,12 +1346,12 @@ pub fn use_app_state() -> AppState {
 /// Hook to initialize storage and set up auto-save.
 pub fn use_storage_init() {
     let app_state = use_app_state();
-    
+
     // Initialize storage on mount
     use_future(move || async move {
         app_state.init_storage().await;
     });
-    
+
     // Auto-save when changes are pending (debounced)
     use_future(move || async move {
         loop {
@@ -1399,7 +1403,11 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) 
                     result.waveform_peaks.len(),
                     result.bpm.as_ref().map(|b| b.bpm),
                     result.key.as_ref().map(|k| k.key.to_notation()),
-                    result.beat_grid.as_ref().map(|b| b.beats.len()).unwrap_or(0)
+                    result
+                        .beat_grid
+                        .as_ref()
+                        .map(|b| b.beats.len())
+                        .unwrap_or(0)
                 );
 
                 // Convert frequency waveform
@@ -1432,4 +1440,3 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) 
         }
     });
 }
-

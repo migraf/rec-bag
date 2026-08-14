@@ -1,0 +1,7 @@
+{
+  "id": 42,
+  "username": "micha",
+  "full_name": "Micha Example",
+  "permalink_url": "https://soundcloud.com/micha",
+  "secret_token": "must-not-persist"
+}

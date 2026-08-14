@@ -1,0 +1,23 @@
+{
+  "collection": [
+    {
+      "urn": "soundcloud:tracks:10",
+      "title": "Private downloadable upload",
+      "sharing": "private",
+      "access": "playable",
+      "downloadable": true,
+      "download_url": "https://api.soundcloud.com/tracks/soundcloud:tracks:10/download",
+      "permalink_url": "https://soundcloud.com/micha/private-upload",
+      "user": { "urn": "soundcloud:users:42", "username": "micha" },
+      "future_provider_field": { "kept": true },
+      "secret_token": "must-not-persist"
+    },
+    {
+      "urn": "soundcloud:tracks:20",
+      "title": "Preview upload",
+      "access": "preview",
+      "user": { "urn": "soundcloud:users:42" }
+    }
+  ],
+  "next_href": "https://api.soundcloud.com/me/tracks?linked_partitioning=true&limit=2&cursor=uploads-2"
+}

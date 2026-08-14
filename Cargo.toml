@@ -2,6 +2,11 @@
 resolver = "2"
 members = [
     "packages/core",
+    "packages/persistence",
+    "packages/sync",
+    "packages/soundcloud",
+    "packages/music_storage_local",
+    "packages/music_storage_google_drive",
     "packages/export",
     "packages/ui",
     "packages/web",
@@ -20,6 +25,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # workspace
 rec_core = { path = "packages/core" }
+rec_persistence = { path = "packages/persistence" }
 export = { path = "packages/export" }
 ui = { path = "packages/ui" }
 api = { path = "packages/api" }

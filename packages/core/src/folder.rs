@@ -186,4 +186,3 @@ mod tests {
         assert!(!is_audio_extension("jpg"));
     }
 }
-

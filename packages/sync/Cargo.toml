@@ -1,0 +1,16 @@
+[package]
+name = "rec_sync"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic catalog and music-storage reconciliation for rec_bag"
+
+[dependencies]
+rec_core = { path = "../core", default-features = false }
+sha2 = "0.10"
+chrono.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

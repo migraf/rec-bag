@@ -268,4 +268,3 @@ mod tests {
         assert!(energies.low > energies.high);
     }
 }
-

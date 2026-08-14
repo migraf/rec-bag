@@ -191,4 +191,3 @@ pub fn PlaybackBar(props: PlaybackBarProps) -> Element {
         }
     }
 }
-

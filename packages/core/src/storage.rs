@@ -181,7 +181,8 @@ impl SqliteStorage {
             .await?;
 
         // Migration: Add waveform column if it doesn't exist
-        let _ = self.conn
+        let _ = self
+            .conn
             .execute("ALTER TABLE tracks ADD COLUMN waveform_json TEXT", ())
             .await;
 
@@ -292,10 +293,7 @@ impl SqliteStorage {
 
         // Load all tracks into a map for quick lookup
         let mut tracks_map = std::collections::HashMap::new();
-        let mut rows = self
-            .conn
-            .query("SELECT * FROM tracks", ())
-            .await?;
+        let mut rows = self.conn.query("SELECT * FROM tracks", ()).await?;
 
         while let Some(row) = rows.next().await? {
             let track = self.row_to_track(&row)?;
@@ -496,8 +494,7 @@ impl SqliteStorage {
         let waveform_json: Option<String> = row.get(18).ok().flatten();
 
         // Parse waveform from JSON
-        let waveform = waveform_json
-            .and_then(|json| serde_json::from_str(&json).ok());
+        let waveform = waveform_json.and_then(|json| serde_json::from_str(&json).ok());
 
         Ok(Track {
             id: Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::new_v4()),
@@ -588,7 +585,10 @@ impl SqliteStorage {
     pub async fn get_source(&self, id: Uuid) -> Result<Option<MusicSource>, StorageError> {
         let mut rows = self
             .conn
-            .query("SELECT * FROM sources WHERE id = ?1", params![id.to_string()])
+            .query(
+                "SELECT * FROM sources WHERE id = ?1",
+                params![id.to_string()],
+            )
             .await?;
 
         if let Some(row) = rows.next().await? {
@@ -833,4 +833,3 @@ mod tests {
         assert!(library.loose_tracks.is_empty());
     }
 }
-

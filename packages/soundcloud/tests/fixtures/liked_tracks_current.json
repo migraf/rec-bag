@@ -1,0 +1,18 @@
+{
+  "collection": [
+    {
+      "urn": "soundcloud:tracks:10",
+      "title": "Liked upload duplicate",
+      "access": "playable",
+      "user": { "urn": "soundcloud:users:42" }
+    },
+    {
+      "urn": "soundcloud:tracks:60",
+      "title": "Liked streaming track",
+      "access": "playable",
+      "downloadable": false,
+      "user": { "urn": "soundcloud:users:60" }
+    }
+  ],
+  "next_href": null
+}

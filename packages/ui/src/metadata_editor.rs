@@ -170,25 +170,41 @@ pub fn MetadataEditor(props: MetadataEditorProps) -> Element {
                 None
             } else {
                 let t = title();
-                if t.is_empty() { None } else { Some(t) }
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
             },
             artist: if is_batch && !modified_fields().contains("artist") {
                 None
             } else {
                 let a = artist();
-                if a.is_empty() { None } else { Some(a) }
+                if a.is_empty() {
+                    None
+                } else {
+                    Some(a)
+                }
             },
             album: if is_batch && !modified_fields().contains("album") {
                 None
             } else {
                 let a = album();
-                if a.is_empty() { None } else { Some(a) }
+                if a.is_empty() {
+                    None
+                } else {
+                    Some(a)
+                }
             },
             genre: if is_batch && !modified_fields().contains("genre") {
                 None
             } else {
                 let g = genre();
-                if g.is_empty() { None } else { Some(g) }
+                if g.is_empty() {
+                    None
+                } else {
+                    Some(g)
+                }
             },
             bpm: if is_batch && !modified_fields().contains("bpm") {
                 None
@@ -199,7 +215,11 @@ pub fn MetadataEditor(props: MetadataEditorProps) -> Element {
                 None
             } else {
                 let k = key();
-                if k.is_empty() { None } else { Some(k) }
+                if k.is_empty() {
+                    None
+                } else {
+                    Some(k)
+                }
             },
             year: if is_batch && !modified_fields().contains("year") {
                 None
@@ -215,13 +235,21 @@ pub fn MetadataEditor(props: MetadataEditorProps) -> Element {
                 None
             } else {
                 let c = comment();
-                if c.is_empty() { None } else { Some(c) }
+                if c.is_empty() {
+                    None
+                } else {
+                    Some(c)
+                }
             },
             rating: if is_batch && !modified_fields().contains("rating") {
                 None
             } else {
                 let r = rating();
-                if r == 0 { None } else { Some(r) }
+                if r == 0 {
+                    None
+                } else {
+                    Some(r)
+                }
             },
         };
 
@@ -608,4 +636,3 @@ pub fn MetadataEditor(props: MetadataEditorProps) -> Element {
         }
     }
 }
-

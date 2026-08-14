@@ -37,7 +37,11 @@ fn App() -> Element {
 
     let app_state = use_app_state();
     let theme = app_state.get_theme();
-    let theme_class = if theme == "light" { "theme-light" } else { "theme-dark" };
+    let theme_class = if theme == "light" {
+        "theme-light"
+    } else {
+        "theme-dark"
+    };
 
     rsx! {
         // Base theme styles from ui package
@@ -74,7 +78,11 @@ fn DesktopNavbar() -> Element {
 
     // Get current theme for toggle button
     let current_theme = app_state.get_theme();
-    let theme_icon = if current_theme == "dark" { "☀️" } else { "🌙" };
+    let theme_icon = if current_theme == "dark" {
+        "☀️"
+    } else {
+        "🌙"
+    };
 
     // Check if any deck has a track for the playback bar
     // Don't show playback bar on DJ view since it has full deck controls

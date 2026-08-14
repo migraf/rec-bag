@@ -240,10 +240,7 @@ pub fn DjView() -> Element {
     // Load track to deck using shared state
     let load_track_to_deck = move |track_id: Uuid, deck: usize| {
         // Find the track in filtered tracks or playlist tracks
-        let track = filtered_tracks()
-            .iter()
-            .find(|t| t.id == track_id)
-            .cloned();
+        let track = filtered_tracks().iter().find(|t| t.id == track_id).cloned();
 
         if let Some(track) = track {
             app_state.load_track_to_deck(track, deck);

@@ -1,0 +1,19 @@
+{
+  "collection": [
+    {
+      "urn": "soundcloud:playlists:100",
+      "title": "Private ordered set",
+      "description": "Owned fixture playlist",
+      "sharing": "private",
+      "last_modified": "2026-08-13T12:00:00Z",
+      "permalink_url": "https://soundcloud.com/micha/sets/private-ordered-set",
+      "user": { "urn": "soundcloud:users:42" },
+      "tracks": [
+        { "urn": "soundcloud:tracks:50", "title": "Blocked", "access": "blocked", "user": { "urn": "soundcloud:users:9" } },
+        { "urn": "soundcloud:tracks:10", "title": "Cross-collection duplicate", "access": "playable", "user": { "urn": "soundcloud:users:42" } },
+        { "urn": "soundcloud:tracks:50", "title": "Repeated blocked track", "access": "blocked", "user": { "urn": "soundcloud:users:9" } }
+      ]
+    }
+  ],
+  "next_href": null
+}

@@ -1,0 +1,20 @@
+[package]
+name = "music_storage_google_drive"
+version = "0.1.0"
+edition = "2021"
+description = "Google Drive implementation of rec_bag music storage contracts"
+
+[dependencies]
+rec_core = { path = "../core", default-features = false }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+futures-timer = "3"
+uuid = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"

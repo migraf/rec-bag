@@ -1,7 +1,7 @@
 # SoundCloud Sources and Primary Music Storage Plan
 
-**Status:** Stage 1 core contracts implemented and validated; Stage 2 workstreams ready  
-**Updated:** 2026-08-13  
+**Status:** Stages 1 and 2 implemented and validated; Stage 3 integration slices ready  
+**Updated:** 2026-08-14  
 **Primary references:**
 
 - [SoundCloud developer documentation](https://developers.soundcloud.com/docs)
@@ -12,14 +12,14 @@
 ## Implementation progress
 
 - [x] Stage 1: provider-neutral domain, provider, repository, reconciliation, sync, schema, and test-support contracts
-- [ ] Stage 2A: SQLite persistence and migrations
-- [ ] Stage 2B: SoundCloud connector
-- [ ] Stage 2C: SoundCloud OAuth broker
-- [ ] Stage 2D: local music storage
-- [ ] Stage 2E: Google Drive music storage
-- [ ] Stage 2F: reconciliation engine
-- [ ] Stage 2G: backup, retention, and job engine
-- [ ] Stage 2H: provider-independent UI
+- [x] Stage 2A: SQLite persistence and migrations
+- [x] Stage 2B: SoundCloud connector
+- [x] Stage 2C: SoundCloud OAuth broker
+- [x] Stage 2D: local music storage
+- [x] Stage 2E: Google Drive music storage
+- [x] Stage 2F: reconciliation engine
+- [x] Stage 2G: backup, retention, and job engine
+- [x] Stage 2H: provider-independent UI
 
 ## 1. Objective
 

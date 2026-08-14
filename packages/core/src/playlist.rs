@@ -89,10 +89,7 @@ impl Playlist {
 
     /// Get the total duration of the playlist.
     pub fn total_duration(&self) -> std::time::Duration {
-        self.tracks
-            .iter()
-            .filter_map(|t| t.duration)
-            .sum()
+        self.tracks.iter().filter_map(|t| t.duration).sum()
     }
 
     /// Get the number of tracks.
@@ -201,11 +198,7 @@ impl Library {
 
     /// Get the total number of unique tracks.
     pub fn track_count(&self) -> usize {
-        self.playlists
-            .iter()
-            .map(|p| p.tracks.len())
-            .sum::<usize>()
-            + self.loose_tracks.len()
+        self.playlists.iter().map(|p| p.tracks.len()).sum::<usize>() + self.loose_tracks.len()
     }
 
     /// Get the number of playlists.
@@ -213,4 +206,3 @@ impl Library {
         self.playlists.len()
     }
 }
-

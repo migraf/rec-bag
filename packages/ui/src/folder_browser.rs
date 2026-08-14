@@ -141,4 +141,3 @@ fn FolderTreeNode(mut props: FolderTreeNodeProps) -> Element {
         }
     }
 }
-

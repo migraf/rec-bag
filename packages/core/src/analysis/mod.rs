@@ -236,4 +236,3 @@ mod tests {
         assert_eq!(MusicalKey::CMajor.to_camelot(), "8B");
     }
 }
-

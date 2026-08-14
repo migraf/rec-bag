@@ -1,0 +1,17 @@
+{
+  "collection": [
+    {
+      "urn": "soundcloud:playlists:200",
+      "title": "Liked ordered set",
+      "last_modified": "2026-08-14T08:00:00Z",
+      "user": { "urn": "soundcloud:users:200" },
+      "tracks": [
+        { "urn": "soundcloud:tracks:10", "title": "Duplicate upload", "access": "playable", "user": { "urn": "soundcloud:users:42" } },
+        { "urn": "soundcloud:tracks:70", "title": "Liked preview", "access": "preview", "user": { "urn": "soundcloud:users:70" } },
+        { "urn": "soundcloud:tracks:80", "title": "Inaccessible entry", "state": "inaccessible", "user": { "urn": "soundcloud:users:80" } },
+        { "urn": "soundcloud:tracks:90", "title": "Removed entry", "state": "deleted", "user": { "urn": "soundcloud:users:90" } }
+      ]
+    }
+  ],
+  "next_href": null
+}

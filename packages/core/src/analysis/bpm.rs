@@ -222,7 +222,10 @@ impl BpmAnalyzer {
         // Get correlation for a given BPM
         let get_correlation = |target_bpm: f32| -> Option<f32> {
             let lag = (onset_rate * 60.0 / target_bpm) as usize;
-            correlations.iter().find(|(l, _)| *l == lag).map(|(_, c)| *c)
+            correlations
+                .iter()
+                .find(|(l, _)| *l == lag)
+                .map(|(_, c)| *c)
         };
 
         // Perceptual weight: prefer tempos in the 100-150 BPM range (typical for most music)
@@ -235,9 +238,8 @@ impl BpmAnalyzer {
         };
 
         // Score a tempo candidate based on correlation and perceptual preference
-        let score_tempo = |tempo: f32, corr: f32| -> f32 {
-            corr * (1.0 + perceptual_weight(tempo) * 0.5)
-        };
+        let score_tempo =
+            |tempo: f32, corr: f32| -> f32 { corr * (1.0 + perceptual_weight(tempo) * 0.5) };
 
         let original_corr = get_correlation(bpm).unwrap_or(0.0);
         let mut best_score = score_tempo(bpm, original_corr);
@@ -252,7 +254,8 @@ impl BpmAnalyzer {
                 if double_score > best_score * 0.6 {
                     // Additional check: if original is below 90 BPM and double is in sweet spot,
                     // be even more aggressive about doubling
-                    let should_double = if bpm < 90.0 && double_bpm >= 100.0 && double_bpm <= 160.0 {
+                    let should_double = if bpm < 90.0 && double_bpm >= 100.0 && double_bpm <= 160.0
+                    {
                         double_corr > original_corr * 0.4 // Very aggressive for suspiciously low tempos
                     } else {
                         double_score > best_score * 0.6
@@ -341,4 +344,3 @@ mod tests {
         assert!(matches!(result, Err(AnalysisError::InsufficientData)));
     }
 }
-

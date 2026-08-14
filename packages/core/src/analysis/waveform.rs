@@ -75,4 +75,3 @@ impl Analyzer for WaveformAnalyzer {
         Ok(AnalyzerOutput::Waveform { peaks })
     }
 }
-

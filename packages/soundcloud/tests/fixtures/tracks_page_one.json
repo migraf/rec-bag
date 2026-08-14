@@ -1,0 +1,15 @@
+{
+  "collection": [
+    {
+      "id": 101,
+      "title": "Downloadable upload",
+      "access": "playable",
+      "downloadable": true,
+      "download_url": "https://api.soundcloud.com/tracks/101/download",
+      "permalink_url": "https://soundcloud.com/micha/downloadable-upload",
+      "user": { "id": 42 },
+      "secret_token": "must-not-persist"
+    }
+  ],
+  "next_href": "https://api.soundcloud.com/me/tracks?linked_partitioning=true&cursor=next-page"
+}

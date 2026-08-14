@@ -139,10 +139,7 @@ pub fn Library() -> Element {
     // Load track to deck using shared state
     let load_track_to_deck = move |track_id: Uuid, deck: usize| {
         // Find the track
-        let track = filtered_tracks()
-            .iter()
-            .find(|t| t.id == track_id)
-            .cloned();
+        let track = filtered_tracks().iter().find(|t| t.id == track_id).cloned();
 
         if let Some(track) = track {
             app_state.load_track_to_deck(track, deck);
@@ -252,14 +249,12 @@ pub fn Library() -> Element {
         .collect();
 
     // Check if any selected track has fixable issues (for context menu)
-    let selected_have_fixable_issues = context_menu_selected()
-        .iter()
-        .any(|id| {
-            track_issues
-                .get(id)
-                .map(|info| info.fixable_count > 0)
-                .unwrap_or(false)
-        });
+    let selected_have_fixable_issues = context_menu_selected().iter().any(|id| {
+        track_issues
+            .get(id)
+            .map(|info| info.fixable_count > 0)
+            .unwrap_or(false)
+    });
 
     // Get tracks for metadata editor
     let metadata_editor_tracks = app_state.get_tracks_by_ids(&metadata_editor_track_ids());

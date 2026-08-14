@@ -52,7 +52,10 @@ pub fn DoctorView() -> Element {
     check_can_fix.insert("duplicates".to_string(), false);
 
     // Calculate duplicate stats
-    let duplicate_count = diagnoses.iter().filter(|d| d.check_name == "duplicates").count();
+    let duplicate_count = diagnoses
+        .iter()
+        .filter(|d| d.check_name == "duplicates")
+        .count();
     let duplicate_groups = {
         let mut groups: HashMap<String, Vec<&Diagnosis>> = HashMap::new();
         for d in diagnoses.iter().filter(|d| d.check_name == "duplicates") {
@@ -333,10 +336,7 @@ fn group_duplicates_by_key(diagnoses: &[Diagnosis]) -> Vec<DuplicateDisplayGroup
         // by normalizing artist + title from the path, or use the path directly
         // For now, group by the duplicate key extracted from message or use path
         let key = extract_duplicate_key(d);
-        groups
-            .entry(key)
-            .or_default()
-            .push(d.track_path.clone());
+        groups.entry(key).or_default().push(d.track_path.clone());
     }
 
     groups
@@ -389,4 +389,3 @@ fn render_duplicate_groups(diagnoses: &[Diagnosis]) -> Element {
         }
     }
 }
-

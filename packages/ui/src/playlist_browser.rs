@@ -112,4 +112,3 @@ pub fn PlaylistBrowser(props: PlaylistBrowserProps) -> Element {
         }
     }
 }
-

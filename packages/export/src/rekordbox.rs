@@ -3,9 +3,9 @@
 //! Generates XML files compatible with Pioneer Rekordbox.
 
 use crate::{ExportError, PlaylistExporter};
-use rec_core::{Playlist, Track};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::Writer;
+use rec_core::{Playlist, Track};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -226,9 +226,7 @@ mod tests {
         playlist.add_track(track);
 
         let mut output = Vec::new();
-        exporter
-            .export_to_writer(&[playlist], &mut output)
-            .unwrap();
+        exporter.export_to_writer(&[playlist], &mut output).unwrap();
 
         let xml = String::from_utf8(output).unwrap();
         assert!(xml.contains("DJ_PLAYLISTS"));
@@ -237,4 +235,3 @@ mod tests {
         assert!(xml.contains("128.00"));
     }
 }
-

@@ -83,47 +83,52 @@ impl WaveformData {
 /// suitable for rendering waveforms in the UI.
 pub fn extract_waveform(path: impl AsRef<Path>) -> Result<WaveformData, WaveformError> {
     let path = path.as_ref();
-    
+
     // Open the audio file
     let file = std::fs::File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    
+
     // Create a hint for the format
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
-    
+
     // Probe the format
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| WaveformError::Probe(e.to_string()))?;
-    
+
     let mut format = probed.format;
-    
+
     // Find the first audio track
     let track = format
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
         .ok_or(WaveformError::NoTrack)?;
-    
+
     let track_id = track.id;
     let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
     let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
-    
+
     // Calculate samples per peak based on sample rate
     let samples_per_peak = sample_rate as usize / POINTS_PER_SECOND;
-    
+
     // Create a decoder
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| WaveformError::Decoder(e.to_string()))?;
-    
+
     // Collect all samples and compute peaks
     let mut all_samples: Vec<f32> = Vec::new();
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
-    
+
     // Read all packets
     loop {
         let packet = match format.next_packet() {
@@ -135,28 +140,28 @@ pub fn extract_waveform(path: impl AsRef<Path>) -> Result<WaveformData, Waveform
             }
             Err(_) => break,
         };
-        
+
         // Skip packets from other tracks
         if packet.track_id() != track_id {
             continue;
         }
-        
+
         // Decode the packet
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
             Err(_) => continue,
         };
-        
+
         // Get the audio buffer
         if sample_buf.is_none() {
             let spec = *decoded.spec();
             let duration = decoded.capacity() as u64;
             sample_buf = Some(SampleBuffer::new(duration, spec));
         }
-        
+
         if let Some(ref mut buf) = sample_buf {
             buf.copy_interleaved_ref(decoded);
-            
+
             // Mix down to mono by averaging channels
             let samples = buf.samples();
             for chunk in samples.chunks(channels) {
@@ -165,10 +170,10 @@ pub fn extract_waveform(path: impl AsRef<Path>) -> Result<WaveformData, Waveform
             }
         }
     }
-    
+
     // Calculate duration
     let duration_secs = all_samples.len() as f64 / sample_rate as f64;
-    
+
     // Compute peaks
     let mut peaks = Vec::new();
     for chunk in all_samples.chunks(samples_per_peak) {
@@ -180,7 +185,7 @@ pub fn extract_waveform(path: impl AsRef<Path>) -> Result<WaveformData, Waveform
             .unwrap_or(0.0);
         peaks.push(peak);
     }
-    
+
     // Normalize peaks to 0.0-1.0 range
     let max_peak = peaks
         .iter()
@@ -188,11 +193,11 @@ pub fn extract_waveform(path: impl AsRef<Path>) -> Result<WaveformData, Waveform
         .copied()
         .unwrap_or(1.0)
         .max(0.001); // Avoid division by zero
-    
+
     for peak in &mut peaks {
         *peak /= max_peak;
     }
-    
+
     Ok(WaveformData {
         peaks,
         duration_secs,
@@ -218,12 +223,11 @@ mod tests {
             duration_secs: 1.0,
             sample_rate: 44100,
         };
-        
+
         let range = wf.peaks_in_range(0.0, 0.5);
         assert_eq!(range.len(), 5);
-        
+
         let range = wf.peaks_in_range(0.5, 1.0);
         assert_eq!(range.len(), 5);
     }
 }
-

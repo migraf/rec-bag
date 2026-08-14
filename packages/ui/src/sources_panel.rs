@@ -2,7 +2,7 @@
 
 use crate::FolderBrowser;
 use dioxus::prelude::*;
-use rec_core::{build_folder_tree, FolderNode, MusicSource};
+use rec_core::{build_folder_tree, MusicSource};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -48,19 +48,6 @@ pub fn SourcesPanel(props: SourcesPanelProps) -> Element {
     let mut show_add_form = use_signal(|| false);
     let mut new_source_path = use_signal(|| String::new());
     let mut active_source: Signal<Option<Uuid>> = use_signal(|| None);
-
-    // Build folder trees for each source
-    let folder_trees: Vec<(Uuid, Option<FolderNode>)> = props
-        .sources
-        .iter()
-        .map(|s| {
-            let tree = s
-                .local_path()
-                .map(|p| build_folder_tree(std::path::Path::new(p)))
-                .flatten();
-            (s.id, tree)
-        })
-        .collect();
 
     let toggle_collapse = move |_| {
         props.on_toggle_collapse.call(!props.collapsed);
@@ -208,23 +195,21 @@ pub fn SourcesPanel(props: SourcesPanelProps) -> Element {
                                 }
                             }
 
-                            // Folder browser
-                            {
-                                let folder_tree = folder_trees.iter()
-                                    .find(|(id, _)| *id == active_id)
-                                    .and_then(|(_, tree)| tree.clone());
-
-                                rsx! {
-                                    FolderBrowser {
-                                        root: folder_tree,
-                                        selected_path: props.selected_folder.clone(),
-                                        on_select: move |path| {
-                                            if let Some(handler) = &props.on_folder_select {
-                                                handler.call(path);
-                                            }
+                            // Only local sources support folder browsing. Provider-backed
+                            // sources render their own source-kind-specific content instead of
+                            // being coerced into a filesystem tree.
+                            if source.is_local() {
+                                LocalSourceBrowser {
+                                    source: source.clone(),
+                                    selected_path: props.selected_folder.clone(),
+                                    on_select: move |path| {
+                                        if let Some(handler) = &props.on_folder_select {
+                                            handler.call(path);
                                         }
-                                    }
+                                    },
                                 }
+                            } else {
+                                ProviderSourceSummary { source: source.clone() }
                             }
                         }
                     }
@@ -243,6 +228,46 @@ pub fn SourcesPanel(props: SourcesPanelProps) -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Filesystem browsing is mounted only for an active local source. Keeping tree
+/// construction here prevents provider-backed sources from being interpreted as paths.
+#[derive(Props, Clone, PartialEq)]
+struct LocalSourceBrowserProps {
+    source: MusicSource,
+    selected_path: Option<PathBuf>,
+    on_select: EventHandler<PathBuf>,
+}
+
+#[component]
+fn LocalSourceBrowser(props: LocalSourceBrowserProps) -> Element {
+    let folder_tree = props
+        .source
+        .local_path()
+        .and_then(|path| build_folder_tree(std::path::Path::new(path)));
+
+    rsx! {
+        FolderBrowser {
+            root: folder_tree,
+            selected_path: props.selected_path,
+            on_select: move |path| props.on_select.call(path),
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct ProviderSourceSummaryProps {
+    source: MusicSource,
+}
+
+#[component]
+fn ProviderSourceSummary(props: ProviderSourceSummaryProps) -> Element {
+    rsx! {
+        div { class: "sp-provider-source-content",
+            strong { "{props.source.name}" }
+            span { "Provider collections are managed in Music management." }
         }
     }
 }

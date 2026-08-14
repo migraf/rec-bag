@@ -8,7 +8,10 @@ pub enum AnalyzerOutput {
     /// BPM value with confidence.
     Bpm { bpm: f32, confidence: f32 },
     /// Musical key with confidence.
-    Key { key: super::types::MusicalKey, confidence: f32 },
+    Key {
+        key: super::types::MusicalKey,
+        confidence: f32,
+    },
     /// Waveform peaks (simple amplitude-based).
     Waveform { peaks: Vec<f32> },
     /// Frequency-band waveform (low/mid/high).
@@ -43,4 +46,3 @@ pub trait Analyzer: Send + Sync {
     /// The analysis output or an error if analysis failed.
     fn analyze(&self, samples: &[f32], sample_rate: u32) -> Result<AnalyzerOutput, AnalysisError>;
 }
-

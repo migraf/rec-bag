@@ -1,0 +1,18 @@
+[package]
+name = "music_storage_local"
+version = "0.1.0"
+edition = "2021"
+description = "Local filesystem implementation of rec_bag music asset storage"
+
+[dependencies]
+rec_core = { path = "../core", default-features = false }
+chrono.workspace = true
+sha2 = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"
+tokio = { version = "1", features = ["macros", "rt"] }

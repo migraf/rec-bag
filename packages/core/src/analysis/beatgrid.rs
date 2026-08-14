@@ -306,4 +306,3 @@ mod tests {
         assert!(matches!(result, Err(AnalysisError::InsufficientData)));
     }
 }
-

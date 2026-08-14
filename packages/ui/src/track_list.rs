@@ -196,7 +196,7 @@ pub fn TrackList(props: TrackListProps) -> Element {
                                                 let summary = info.summary.clone();
                                                 let has_fix_handler = props.on_fix_issues.is_some();
                                                 let can_fix = info.fixable_count > 0;
-                                                
+
                                                 rsx! {
                                                     span {
                                                         class: "{badge_class}",

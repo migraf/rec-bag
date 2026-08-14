@@ -110,7 +110,7 @@ impl Deck {
             self.sink.set_volume(self.volume);
             self.sink.pause();
         }
-        
+
         // Reload the track if we have one
         if let Some(ref track) = self.loaded_track {
             if let Ok(file) = File::open(&track.path) {
@@ -121,7 +121,7 @@ impl Deck {
                 }
             }
         }
-        
+
         self.state = DeckState::Stopped;
     }
 
@@ -169,7 +169,7 @@ impl Deck {
             .try_seek(position)
             .map_err(|_| AudioError::StreamInit)
     }
-    
+
     /// Check if currently playing (based on sink state, not our state tracking).
     pub fn is_playing(&self) -> bool {
         !self.sink.is_paused() && !self.sink.empty()
