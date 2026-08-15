@@ -1,6 +1,6 @@
 # SoundCloud Sources and Primary Music Storage Plan
 
-**Status:** Stages 1 and 2 implemented and validated; Stage 3 integration slices ready  
+**Status:** Stages 1–4 implemented and validated; external release validation pending  
 **Updated:** 2026-08-14  
 **Primary references:**
 
@@ -20,6 +20,13 @@
 - [x] Stage 2F: reconciliation engine
 - [x] Stage 2G: backup, retention, and job engine
 - [x] Stage 2H: provider-independent UI
+- [x] Stage 3.1: local source to local primary integration
+- [x] Stage 3.2: SoundCloud catalog integration
+- [x] Stage 3.3: Google Drive primary integration
+- [x] Stage 3.4: backup replication integration
+- [x] Stage 3.5: reconciliation review actions
+- [x] Stage 4: system assembly and hardening
+- [ ] External release validation: live provider accounts, deployed broker/WAF, published legal URLs, and physical platform/device drills
 
 ## 1. Objective
 

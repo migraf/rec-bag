@@ -11,8 +11,17 @@ use std::fmt;
 /// A bearer token ready for use with the Drive API.
 ///
 /// Implementations should refresh expired credentials before returning a token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GoogleAccessToken(pub String);
+
+impl fmt::Debug for GoogleAccessToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("GoogleAccessToken")
+            .field(&"[REDACTED]")
+            .finish()
+    }
+}
 
 /// Failure returned by the application's OAuth token service.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,12 +65,25 @@ pub trait GoogleTokenProvider: Send + Sync {
 }
 
 /// Client-neutral HTTP request used by [`DriveHttpTransport`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DriveHttpRequest {
     pub method: String,
     pub url: String,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for DriveHttpRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers = RedactedHeaders(&self.headers);
+        formatter
+            .debug_struct("DriveHttpRequest")
+            .field("method", &self.method)
+            .field("url", &"[REDACTED]")
+            .field("headers", &headers)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl DriveHttpRequest {
@@ -86,11 +108,23 @@ impl DriveHttpRequest {
 }
 
 /// Client-neutral HTTP response used by [`DriveHttpTransport`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DriveHttpResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+}
+
+impl fmt::Debug for DriveHttpResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers = RedactedHeaders(&self.headers);
+        formatter
+            .debug_struct("DriveHttpResponse")
+            .field("status", &self.status)
+            .field("headers", &headers)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl DriveHttpResponse {
@@ -99,6 +133,27 @@ impl DriveHttpResponse {
             name.eq_ignore_ascii_case(expected_name)
                 .then_some(value.as_str())
         })
+    }
+}
+
+struct RedactedHeaders<'a>(&'a BTreeMap<String, String>);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = formatter.debug_map();
+        for (name, value) in self.0 {
+            let sensitive = name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("proxy-authorization")
+                || name.eq_ignore_ascii_case("location")
+                || name.eq_ignore_ascii_case("set-cookie");
+            let displayed = if sensitive {
+                "[REDACTED]"
+            } else {
+                value.as_str()
+            };
+            map.entry(name, &displayed);
+        }
+        map.finish()
     }
 }
 

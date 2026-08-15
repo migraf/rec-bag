@@ -2,8 +2,9 @@
 
 use chrono::{DateTime, Duration, Utc};
 use rec_core::{
-    BoxFuture, SyncCheckpoint, SyncError, SyncErrorKind, SyncIssue, SyncIssueSeverity, SyncJob,
-    SyncJobPayload, SyncProgress, SyncRun, SyncRunKind, SyncStatus,
+    BoxFuture, MusicStorageError, MusicStorageErrorKind, SyncCheckpoint, SyncError, SyncErrorKind,
+    SyncIssue, SyncIssueSeverity, SyncJob, SyncJobPayload, SyncProgress, SyncRun, SyncRunKind,
+    SyncStatus,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -54,7 +55,15 @@ pub trait JobStore: Send + Sync {
         &self,
         run_id: Uuid,
         requested_at: DateTime<Utc>,
-    ) -> BoxFuture<'_, Result<SyncRun, JobStoreError>>;
+    ) -> BoxFuture<'_, Result<CancellationRequest, JobStoreError>>;
+}
+
+/// Result of an idempotent cancellation write. The engine emits the boundary event
+/// only when `newly_requested` is true.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancellationRequest {
+    pub run: SyncRun,
+    pub newly_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -316,10 +325,12 @@ where
         run_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<SyncRun, JobStoreError> {
-        let run = self.store.request_cancellation(run_id, now).await?;
-        let event = JobEvent::for_run(run_id, JobEventKind::CancellationRequested, now);
-        self.store.append_event(event).await?;
-        Ok(run)
+        let request = self.store.request_cancellation(run_id, now).await?;
+        if request.newly_requested {
+            let event = JobEvent::for_run(run_id, JobEventKind::CancellationRequested, now);
+            self.store.append_event(event).await?;
+        }
+        Ok(request.run)
     }
 
     /// Persist a monotonic checkpoint while retaining the active lease.
@@ -545,6 +556,9 @@ fn deterministic_payload_key(payload: &SyncJobPayload) -> String {
 }
 
 fn retry_time(error: &SyncError, now: DateTime<Utc>) -> DateTime<Utc> {
+    if let Some(seconds) = error.retry_after_seconds {
+        return now + Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX));
+    }
     let delay = match error.kind {
         SyncErrorKind::RateLimited => Duration::minutes(5),
         SyncErrorKind::TemporarilyUnavailable | SyncErrorKind::Io => Duration::minutes(1),
@@ -610,6 +624,35 @@ pub fn storage_error_kind(retryable: bool) -> SyncErrorKind {
     } else {
         SyncErrorKind::Provider
     }
+}
+
+/// Preserve provider classification and explicit retry timing in a durable sync error.
+pub fn sync_error_from_storage(error: &MusicStorageError, occurred_at: DateTime<Utc>) -> SyncError {
+    let kind = match error.kind {
+        MusicStorageErrorKind::AuthenticationRequired => SyncErrorKind::Authentication,
+        MusicStorageErrorKind::PermissionDenied => SyncErrorKind::Authorization,
+        MusicStorageErrorKind::RateLimited => SyncErrorKind::RateLimited,
+        MusicStorageErrorKind::TemporarilyUnavailable => SyncErrorKind::TemporarilyUnavailable,
+        MusicStorageErrorKind::NotFound => SyncErrorKind::NotFound,
+        MusicStorageErrorKind::ChecksumMismatch => SyncErrorKind::Integrity,
+        MusicStorageErrorKind::Io => SyncErrorKind::Io,
+        MusicStorageErrorKind::InvalidData => SyncErrorKind::InvalidData,
+        MusicStorageErrorKind::DownloadProhibited
+        | MusicStorageErrorKind::Provider
+        | MusicStorageErrorKind::Permanent => SyncErrorKind::Provider,
+    };
+    let mut sync_error = SyncError::at(
+        kind,
+        error
+            .provider_code
+            .clone()
+            .unwrap_or_else(|| "storage_provider".into()),
+        error.message.clone(),
+        error.is_retryable(),
+        occurred_at,
+    );
+    sync_error.retry_after_seconds = error.retry_after_seconds;
+    sync_error
 }
 
 #[cfg(test)]
@@ -717,7 +760,7 @@ mod tests {
             &self,
             id: Uuid,
             at: DateTime<Utc>,
-        ) -> BoxFuture<'_, Result<SyncRun, JobStoreError>> {
+        ) -> BoxFuture<'_, Result<CancellationRequest, JobStoreError>> {
             let result = self
                 .runs
                 .lock()
@@ -725,11 +768,16 @@ mod tests {
                 .get_mut(&id)
                 .ok_or_else(|| JobStoreError::NotFound(format!("run {id}")))
                 .and_then(|run| {
-                    if !run.status.is_terminal() && run.status != SyncStatus::Cancelling {
+                    let newly_requested =
+                        !run.status.is_terminal() && run.status != SyncStatus::Cancelling;
+                    if newly_requested {
                         run.request_cancellation_at(at)
                             .map_err(|error| JobStoreError::InvalidState(error.to_string()))?;
                     }
-                    Ok(run.clone())
+                    Ok(CancellationRequest {
+                        run: run.clone(),
+                        newly_requested,
+                    })
                 });
             Box::pin(async move { result })
         }
@@ -742,6 +790,8 @@ mod tests {
             source_storage_id: Uuid::new_v4(),
             source_object_id: "source".into(),
             source_object_key: None,
+            source_provider_version: Some("v1".into()),
+            expected_checksum: None,
             destination_storage_id: Uuid::new_v4(),
             destination_object_key: "target".into(),
         }
@@ -889,6 +939,18 @@ mod tests {
         let engine = JobEngine::new(FakeStore::default());
         engine.persist_durable_plan(plan).await.unwrap();
         engine.request_cancellation(run_id, now).await.unwrap();
+        engine.request_cancellation(run_id, now).await.unwrap();
+        assert_eq!(
+            engine
+                .store()
+                .list_events(run_id)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == JobEventKind::CancellationRequested)
+                .count(),
+            1
+        );
         let executor = PerBackupExecutor {
             failing_storage_id: Uuid::nil(),
             calls: Mutex::new(Vec::new()),
@@ -923,6 +985,8 @@ mod tests {
             source_storage_id: Uuid::new_v4(),
             source_object_id: "source".into(),
             source_object_key: None,
+            source_provider_version: Some("v1".into()),
+            expected_checksum: None,
             destination_storage_id,
             destination_object_key: "target".into(),
         };
@@ -956,6 +1020,19 @@ mod tests {
                 .status,
             SyncStatus::Failed
         );
+    }
+
+    #[test]
+    fn provider_retry_after_is_preserved_and_overrides_default_backoff() {
+        let now = Utc::now();
+        let mut provider = MusicStorageError::new(MusicStorageErrorKind::RateLimited, "slow down");
+        provider.provider_code = Some("quota".into());
+        provider.retry_after_seconds = Some(17);
+        let error = sync_error_from_storage(&provider, now);
+        assert_eq!(error.kind, SyncErrorKind::RateLimited);
+        assert_eq!(error.code, "quota");
+        assert_eq!(error.retry_after_seconds, Some(17));
+        assert_eq!(retry_time(&error, now), now + Duration::seconds(17));
     }
 
     #[test]

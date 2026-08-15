@@ -14,13 +14,13 @@ pub mod snapshots;
 pub mod verification;
 
 pub use jobs::{
-    DurableJobPlan, JobCompletion, JobEngine, JobEvent, JobEventKind, JobExecutor, JobPlanner,
-    JobStep, JobStore, JobStoreError,
+    sync_error_from_storage, CancellationRequest, DurableJobPlan, JobCompletion, JobEngine,
+    JobEvent, JobEventKind, JobExecutor, JobPlanner, JobStep, JobStore, JobStoreError,
 };
 pub use replication::{
     BackupAvailability, BackupTarget, ReplicationDecision, ReplicationError, ReplicationExecution,
     ReplicationExecutor, ReplicationJobPlan, ReplicationPlanner, ReplicationRequest,
-    ReplicationStage, ReplicationTrigger, StagedReplicationRequest,
+    ReplicationStage, ReplicationStep, ReplicationTrigger, StagedReplicationRequest,
 };
 pub use retention::{
     evaluate_retention, plan_cleanup, plan_primary_deletion_retention, CleanupApproval,
@@ -34,8 +34,9 @@ pub use verification::{
 use rec_core::{
     AssetLocation, AssetStorageOutcome, AssetStorageStatus, CanonicalPlaylist, CanonicalTrack,
     CatalogSource, MatchCandidate, MatchEvidence, MatchMethod, MusicStorage, OriginalAsset,
-    PlaylistStorageOutcome, ReconciliationAction, ReconciliationOutcome, ReconciliationResult,
-    ReconciliationSummary, SourceAvailability, SourceCopyPolicy, SourceTrackOccurrence,
+    PlaylistStorageOutcome, ReconciliationAction, ReconciliationDecision, ReconciliationOutcome,
+    ReconciliationResolution, ReconciliationResult, ReconciliationSummary,
+    ReconciliationSuppression, SourceAvailability, SourceCopyPolicy, SourceTrackOccurrence,
     StorageObject, StorageVerificationStatus, TrackStorageOutcome, TrackStorageStatus,
 };
 use sha2::{Digest, Sha256};
@@ -158,6 +159,10 @@ pub struct ReconciliationInput {
     /// Strong evidence not representable directly by [`StorageObject`]. Invalid
     /// methods and evidence for unknown objects are ignored conservatively.
     pub external_evidence: Vec<ExternalMatchEvidence>,
+    /// Previously persisted decisions consumed before findings are returned.
+    pub resolutions: Vec<ReconciliationResolution>,
+    /// Active durable suppressions, normally derived atomically from resolutions.
+    pub suppressions: Vec<ReconciliationSuppression>,
 }
 
 /// The complete result of a pure reconciliation pass.
@@ -376,6 +381,12 @@ pub fn reconcile(input: &ReconciliationInput) -> ReconciliationReport {
         }
     }
 
+    apply_resolutions_and_suppressions(
+        &mut candidates,
+        &mut results,
+        &input.resolutions,
+        &input.suppressions,
+    );
     candidates.sort_by(candidate_order);
     verified_matches.sort_by(|left, right| {
         (
@@ -1084,6 +1095,91 @@ fn source_for_copy(
         .min()
 }
 
+fn apply_resolutions_and_suppressions(
+    candidates: &mut Vec<MatchCandidate>,
+    results: &mut Vec<ReconciliationResult>,
+    resolutions: &[ReconciliationResolution],
+    suppressions: &[ReconciliationSuppression],
+) {
+    let ignored_results: HashSet<_> = resolutions
+        .iter()
+        .filter(|resolution| resolution.decision == ReconciliationDecision::IgnoreFinding)
+        .map(|resolution| resolution.result_id)
+        .chain(suppressions.iter().filter_map(|suppression| {
+            (suppression.decision == ReconciliationDecision::IgnoreFinding)
+                .then_some(suppression.result_id)
+        }))
+        .collect();
+    let rejected_candidates: HashSet<_> = resolutions
+        .iter()
+        .filter(|resolution| resolution.decision == ReconciliationDecision::RejectCandidate)
+        .filter_map(|resolution| resolution.candidate_id)
+        .chain(suppressions.iter().filter_map(|suppression| {
+            (suppression.decision == ReconciliationDecision::RejectCandidate)
+                .then_some(suppression.candidate_id)
+                .flatten()
+        }))
+        .collect();
+    let rejected_matches: HashSet<_> = candidates
+        .iter()
+        .filter(|candidate| rejected_candidates.contains(&candidate.id))
+        .map(|candidate| {
+            (
+                candidate.track_id,
+                candidate.asset_id,
+                candidate.storage_id,
+                candidate.storage_object_id.clone(),
+            )
+        })
+        .collect();
+
+    candidates.retain(|candidate| !rejected_candidates.contains(&candidate.id));
+    results.retain_mut(|result| {
+        if ignored_results.contains(&result.id) {
+            return false;
+        }
+        let had_candidates = !result.candidates.is_empty();
+        result
+            .candidates
+            .retain(|candidate| !rejected_candidates.contains(&candidate.id));
+        result.actions.retain(|action| match action {
+            ReconciliationAction::Confirm { candidate_id }
+            | ReconciliationAction::Reject { candidate_id } => {
+                !rejected_candidates.contains(candidate_id)
+            }
+            ReconciliationAction::Associate {
+                track_id,
+                asset_id,
+                storage_id,
+                storage_object_id,
+            }
+            | ReconciliationAction::AssociateUnknownObject {
+                track_id,
+                asset_id,
+                storage_id,
+                storage_object_id,
+                ..
+            } => !rejected_matches.contains(&(
+                *track_id,
+                *asset_id,
+                *storage_id,
+                storage_object_id.clone(),
+            )),
+            _ => true,
+        });
+        !(had_candidates
+            && result.candidates.is_empty()
+            && matches!(
+                result.outcome,
+                ReconciliationOutcome::Asset(
+                    AssetStorageStatus::PossibleMatch | AssetStorageStatus::AmbiguousMatch
+                ) | ReconciliationOutcome::Track(
+                    TrackStorageStatus::PossibleMatch | TrackStorageStatus::AmbiguousMatch
+                )
+            ))
+    });
+}
+
 fn changed_object_result(
     evaluation: &AssetEvaluation<'_>,
     storage_id: Uuid,
@@ -1101,8 +1197,19 @@ fn changed_object_result(
         Some(evaluation.asset.id()),
         Some((storage_id, object_id.to_owned())),
     );
+    result
+        .actions
+        .push(ReconciliationAction::ApproveExternalChange {
+            result_id: result.id,
+            storage_id,
+            storage_object_id: object_id.to_owned(),
+        });
     result.actions.push(ReconciliationAction::Retry {
         result_id: result.id,
+    });
+    result.actions.push(ReconciliationAction::Ignore {
+        result_id: result.id,
+        reason: None,
     });
     result
 }
@@ -1124,16 +1231,26 @@ fn untracked_object_result(
         result.actions.push(ReconciliationAction::Confirm {
             candidate_id: candidate.id,
         });
-        result.actions.push(ReconciliationAction::Associate {
-            track_id: candidate.track_id,
-            asset_id: candidate.asset_id,
-            storage_id: candidate.storage_id,
-            storage_object_id: candidate.storage_object_id.clone(),
-        });
+        result
+            .actions
+            .push(ReconciliationAction::AssociateUnknownObject {
+                result_id: result.id,
+                track_id: candidate.track_id,
+                asset_id: candidate.asset_id,
+                storage_id: candidate.storage_id,
+                storage_object_id: candidate.storage_object_id.clone(),
+            });
         result.actions.push(ReconciliationAction::Reject {
             candidate_id: candidate.id,
         });
     }
+    result
+        .actions
+        .push(ReconciliationAction::ImportUnknownObject {
+            result_id: result.id,
+            storage_id,
+            storage_object_id: object_id.to_owned(),
+        });
     result.actions.push(ReconciliationAction::Ignore {
         result_id: result.id,
         reason: None,
@@ -1633,6 +1750,10 @@ mod tests {
             report.asset_outcomes[0].status,
             AssetStorageStatus::ChangedPendingReview
         );
+        assert!(report.results.iter().any(|result| result
+            .actions
+            .iter()
+            .any(|action| matches!(action, ReconciliationAction::ApproveExternalChange { .. }))));
     }
 
     #[test]
@@ -1877,9 +1998,80 @@ mod tests {
             ..unavailable
         };
         let report = reconcile(&with_unknown);
-        assert!(report
+        let unknown_result = report
             .results
             .iter()
-            .any(|result| result.outcome == ReconciliationOutcome::UntrackedStorageObject));
+            .find(|result| result.outcome == ReconciliationOutcome::UntrackedStorageObject)
+            .expect("unknown object finding");
+        assert!(unknown_result
+            .actions
+            .iter()
+            .any(|action| matches!(action, ReconciliationAction::ImportUnknownObject { .. })));
+    }
+
+    #[test]
+    fn persisted_rejections_and_ignores_do_not_reappear() {
+        let source = source();
+        let storage = primary();
+        let track = track(source.id, "Song");
+        let original =
+            OriginalAsset::new_unverified(track.id, OriginalAssetRole::Master, "unrelated.mp3");
+        let mut observed = object(storage.id, "one", "Song.mp3");
+        observed.hashes.clear();
+        let mut input = ReconciliationInput {
+            primary_storage_id: Some(storage.id),
+            sources: vec![source.clone()],
+            tracks: vec![track.clone()],
+            occurrences: vec![occurrence(
+                source.id,
+                track.id,
+                SourceAvailability::Obtainable,
+            )],
+            originals: vec![original],
+            storages: vec![storage.clone()],
+            inventories: vec![StorageInventory::available(storage.id, vec![observed])],
+            ..Default::default()
+        };
+        let initial = reconcile(&input);
+        let candidate_id = initial.candidates[0].id;
+        let candidate_result_id = initial
+            .results
+            .iter()
+            .find(|result| {
+                matches!(
+                    result.outcome,
+                    ReconciliationOutcome::Asset(AssetStorageStatus::PossibleMatch)
+                )
+            })
+            .unwrap()
+            .id;
+        let unknown_result_id = initial
+            .results
+            .iter()
+            .find(|result| result.outcome == ReconciliationOutcome::UntrackedStorageObject)
+            .unwrap()
+            .id;
+        input.resolutions = vec![
+            ReconciliationResolution::new(
+                candidate_result_id,
+                ReconciliationDecision::RejectCandidate,
+            )
+            .for_candidate(candidate_id),
+            ReconciliationResolution::new(unknown_result_id, ReconciliationDecision::IgnoreFinding),
+        ];
+
+        let reconciled = reconcile(&input);
+        assert!(reconciled
+            .candidates
+            .iter()
+            .all(|candidate| candidate.id != candidate_id));
+        assert!(reconciled.results.iter().all(|result| {
+            result.id != candidate_result_id
+                && result.id != unknown_result_id
+                && result
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.id != candidate_id)
+        }));
     }
 }

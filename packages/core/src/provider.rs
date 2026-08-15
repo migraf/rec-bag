@@ -241,6 +241,15 @@ pub struct CatalogAssetReadResult {
     pub checksum: Option<ContentHash>,
 }
 
+/// Provider-neutral guidance for durable retry scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "seconds")]
+pub enum RetryGuidance {
+    DoNotRetry,
+    RetryWithBackoff,
+    RetryAfterSeconds(u64),
+}
+
 /// Stable classifications for catalog-provider failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -280,12 +289,23 @@ impl SourceError {
     }
 
     pub fn is_retryable(&self) -> bool {
-        matches!(
+        !matches!(self.retry_guidance(), RetryGuidance::DoNotRetry)
+    }
+
+    pub fn retry_guidance(&self) -> RetryGuidance {
+        if let Some(seconds) = self.retry_after_seconds {
+            return RetryGuidance::RetryAfterSeconds(seconds);
+        }
+        if matches!(
             self.kind,
             SourceErrorKind::RateLimited
                 | SourceErrorKind::TemporarilyUnavailable
                 | SourceErrorKind::Provider
-        )
+        ) {
+            RetryGuidance::RetryWithBackoff
+        } else {
+            RetryGuidance::DoNotRetry
+        }
     }
 }
 
@@ -336,13 +356,24 @@ impl MusicStorageError {
     }
 
     pub fn is_retryable(&self) -> bool {
-        matches!(
+        !matches!(self.retry_guidance(), RetryGuidance::DoNotRetry)
+    }
+
+    pub fn retry_guidance(&self) -> RetryGuidance {
+        if let Some(seconds) = self.retry_after_seconds {
+            return RetryGuidance::RetryAfterSeconds(seconds);
+        }
+        if matches!(
             self.kind,
             MusicStorageErrorKind::RateLimited
                 | MusicStorageErrorKind::TemporarilyUnavailable
                 | MusicStorageErrorKind::Io
                 | MusicStorageErrorKind::Provider
-        )
+        ) {
+            RetryGuidance::RetryWithBackoff
+        } else {
+            RetryGuidance::DoNotRetry
+        }
     }
 }
 
@@ -427,6 +458,10 @@ mod tests {
 
         assert_eq!(decoded, error);
         assert!(decoded.is_retryable());
+        assert_eq!(
+            decoded.retry_guidance(),
+            RetryGuidance::RetryAfterSeconds(30)
+        );
     }
 
     #[test]

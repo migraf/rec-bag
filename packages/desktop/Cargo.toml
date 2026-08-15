@@ -5,12 +5,30 @@ edition = "2021"
 
 [dependencies]
 dioxus = { workspace = true, features = ["router", "fullstack"] }
+api = { path = "../api" }
 rec_core = { version = "0.1.0", path = "../core", features = ["audio"] }
-tokio = { version = "1.48.0", features = ["time", "rt"] }
+rec_persistence = { path = "../persistence" }
+rec_sync = { path = "../sync" }
+soundcloud = { path = "../soundcloud" }
+music_storage_local = { path = "../music_storage_local" }
+music_storage_google_drive = { path = "../music_storage_google_drive" }
+tokio = { version = "1.48.0", features = ["time", "rt", "rt-multi-thread", "sync", "fs", "net", "io-util", "macros"] }
 ui = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = "0.22"
+rand = "0.9"
+sha2 = "0.10"
+subtle = "2"
+url = "2.5"
+keyring = { version = "3", optional = true, features = ["apple-native", "windows-native", "linux-native"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"], optional = true }
+webbrowser = { version = "1", optional = true }
 
 [features]
 default = []
-desktop = ["dioxus/desktop"]
+desktop = ["dioxus/desktop", "dep:keyring", "dep:reqwest", "dep:webbrowser"]
 server = ["dioxus/server", "ui/server"]

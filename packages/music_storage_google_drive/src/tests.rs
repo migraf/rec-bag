@@ -78,6 +78,81 @@ fn store(transport: MockTransport) -> GoogleDriveMusicStore<MockTransport, Token
 }
 
 #[test]
+fn debug_output_redacts_tokens_authorization_sessions_and_bodies() {
+    let token = GoogleAccessToken("token-super-secret".to_owned());
+    let request = DriveHttpRequest::new("PUT", "https://upload.example/session-super-secret")
+        .header("Authorization", "Bearer token-super-secret")
+        .body(b"body-super-secret".to_vec());
+    let response = response_with_header(
+        200,
+        "Location",
+        "https://upload.example/response-session-secret",
+        b"response-body-secret",
+    );
+
+    let debug = format!("{token:?} {request:?} {response:?}");
+    for secret in [
+        "token-super-secret",
+        "session-super-secret",
+        "body-super-secret",
+        "response-session-secret",
+        "response-body-secret",
+    ] {
+        assert!(!debug.contains(secret), "Debug leaked {secret}");
+    }
+    assert!(debug.contains("[REDACTED]"));
+    assert!(debug.contains("body_len"));
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_store_enforces_private_unix_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempdir().unwrap();
+    let checkpoint_directory = directory.path().join("checkpoints");
+    let store = FileDriveUploadCheckpointStore::new(&checkpoint_directory).unwrap();
+    let checkpoint = DriveUploadCheckpoint::new(
+        "operation".to_owned(),
+        "source.mp3".to_owned(),
+        3,
+        "a".repeat(64),
+        "https://upload.example/private-session".to_owned(),
+    );
+    block_on(store.save(&checkpoint)).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(&checkpoint_directory)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let checkpoint_file = std::fs::read_dir(&checkpoint_directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        std::fs::metadata(checkpoint_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let real_directory = directory.path().join("real-checkpoints");
+    std::fs::create_dir(&real_directory).unwrap();
+    let linked_directory = directory.path().join("linked-checkpoints");
+    std::os::unix::fs::symlink(&real_directory, &linked_directory).unwrap();
+    let error = FileDriveUploadCheckpointStore::new(linked_directory).unwrap_err();
+    assert_eq!(error.kind, MusicStorageErrorKind::InvalidData);
+}
+
+#[test]
 fn inventory_is_paginated_and_never_lists_outside_the_selected_folder() {
     let transport = MockTransport::new([
         response(
@@ -174,6 +249,59 @@ fn rate_limit_is_retried_with_a_fresh_token_request() {
     let object = block_on(store.stat("file")).unwrap();
     assert_eq!(object.object_id, "file");
     assert_eq!(store.transport.requests().len(), 2);
+}
+
+#[test]
+fn drive_403_rate_limit_reason_is_retried() {
+    let transport = MockTransport::new([
+        response(
+            403,
+            r#"{"error":{"message":"per-user quota","status":"PERMISSION_DENIED","errors":[{"reason":"userRateLimitExceeded"}]}}"#,
+        ),
+        response(200, r#"{"id":"file","name":"file.mp3"}"#),
+    ]);
+    let store = store(transport);
+
+    assert_eq!(block_on(store.stat("file")).unwrap().object_id, "file");
+    assert_eq!(store.transport.requests().len(), 2);
+}
+
+#[test]
+fn both_google_403_rate_limit_reasons_are_classified_as_retryable() {
+    for reason in ["rateLimitExceeded", "userRateLimitExceeded"] {
+        let error = drive_error(&response(
+            403,
+            &format!(
+                r#"{{"error":{{"message":"quota","status":"PERMISSION_DENIED","errors":[{{"reason":"{reason}"}}]}}}}"#
+            ),
+        ));
+        assert_eq!(error.kind, MusicStorageErrorKind::RateLimited);
+        assert_eq!(error.provider_code.as_deref(), Some(reason));
+        assert!(error.is_retryable());
+    }
+}
+
+#[test]
+fn retry_after_is_parsed_but_jittered_delay_never_exceeds_cap() {
+    let response = response_with_header(429, "Retry-After", "3600", b"{}");
+    let requested = response_retry_delay(&response).unwrap();
+    assert_eq!(requested, Duration::from_secs(3600));
+    assert_eq!(
+        jittered_retry_delay(requested, Duration::from_secs(2), 0),
+        Duration::from_secs(2)
+    );
+}
+
+#[test]
+fn oversized_json_response_is_rejected() {
+    let store = store(MockTransport::new([DriveHttpResponse {
+        status: 200,
+        headers: BTreeMap::new(),
+        body: vec![b' '; MAX_JSON_RESPONSE_BYTES + 1],
+    }]));
+    let error = block_on(store.stat("file")).unwrap_err();
+    assert_eq!(error.kind, MusicStorageErrorKind::InvalidData);
+    assert!(error.message.contains("size limit"));
 }
 
 #[test]
@@ -303,6 +431,7 @@ fn resumable_upload_recovers_partial_acknowledgement_and_verifies_hash() {
     let source = directory.path().join("source.mp3");
     std::fs::write(&source, b"abcdef").unwrap();
     let transport = MockTransport::new([
+        response(200, r#"{"files":[]}"#),
         response_with_header(200, "Location", "https://upload/session", b""),
         response_with_header(308, "Range", "bytes=0-1", b""),
         response_with_header(308, "Range", "bytes=0-4", b""),
@@ -331,15 +460,57 @@ fn resumable_upload_recovers_partial_acknowledgement_and_verifies_hash() {
     .unwrap();
     assert_eq!(object.object_id, "uploaded");
     let requests = store.transport.requests();
-    assert_eq!(requests[1].body, b"abc");
-    assert_eq!(requests[2].body, b"cde");
-    assert_eq!(requests[3].body, b"f");
-    assert_eq!(requests[3].headers["Content-Range"], "bytes 5-5/6");
-    let metadata: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(requests[0].url.contains("rec_bag_operation_key"));
+    assert_eq!(requests[2].body, b"abc");
+    assert_eq!(requests[3].body, b"cde");
+    assert_eq!(requests[4].body, b"f");
+    assert_eq!(requests[4].headers["Content-Range"], "bytes 5-5/6");
+    let metadata: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
     assert_eq!(
         metadata["appProperties"]["rec_bag_track_id"],
         Uuid::nil().to_string()
     );
+    assert_eq!(
+        metadata["appProperties"]["rec_bag_asset_id"],
+        Uuid::nil().to_string()
+    );
+    assert_eq!(
+        metadata["appProperties"]["rec_bag_operation_key"],
+        "upload-1"
+    );
+}
+
+#[test]
+fn oversized_app_property_is_rejected_before_network_access() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source.mp3");
+    std::fs::write(&source, b"abc").unwrap();
+    let store = store(MockTransport::new([]));
+    let error = block_on(store.upload(UploadRequest {
+        source_path: source,
+        object_path: "source.mp3".to_owned(),
+        content_type: None,
+        content_length: Some(3),
+        expected_checksum: None,
+        metadata: BTreeMap::new(),
+        idempotency_key: Some("x".repeat(MAX_APP_PROPERTY_BYTES)),
+    }))
+    .unwrap_err();
+
+    assert_eq!(error.kind, MusicStorageErrorKind::InvalidData);
+    assert!(error.message.contains("appProperty"));
+    assert!(store.transport.requests().is_empty());
+}
+
+#[test]
+fn excessive_upload_chunk_size_is_rejected_without_allocating() {
+    let mut config =
+        GoogleDriveStoreConfig::new(Uuid::nil(), GoogleDriveFolder::new("restricted-root"));
+    config.upload_chunk_size = MAX_UPLOAD_CHUNK_SIZE + 1;
+    let error = GoogleDriveMusicStore::new(config, MockTransport::new([]), Tokens)
+        .err()
+        .expect("oversized upload chunk must be rejected");
+    assert_eq!(error.kind, MusicStorageErrorKind::InvalidData);
 }
 
 #[test]
@@ -540,6 +711,7 @@ fn satisfies_shared_music_asset_store_contract() {
     let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     let transport = MockTransport::new([
         response(200, r#"{"user":{"permissionId":"user"}}"#),
+        response(200, r#"{"files":[]}"#),
         response_with_header(200, "Location", "https://upload/session", b""),
         response(
             200,
@@ -609,4 +781,136 @@ fn satisfies_shared_music_asset_store_contract() {
     .unwrap();
     assert!(downloaded.checksum_verified);
     assert_eq!(std::fs::read(destination).unwrap(), b"abc");
+}
+
+#[test]
+fn uncertain_completion_retry_finds_existing_operation_without_new_upload() {
+    let source_directory = tempdir().unwrap();
+    let source = source_directory.path().join("source.mp3");
+    std::fs::write(&source, b"abc").unwrap();
+    let store = store(MockTransport::new([response(
+        200,
+        r#"{"files":[{"id":"already-created","name":"source.mp3","size":"3","appProperties":{"rec_bag_operation_key":"operation-42"}}]}"#,
+    )]));
+
+    let object = block_on(store.upload(UploadRequest {
+        source_path: source,
+        object_path: "source.mp3".to_owned(),
+        content_type: None,
+        content_length: Some(3),
+        expected_checksum: None,
+        metadata: BTreeMap::new(),
+        idempotency_key: Some("operation-42".to_owned()),
+    }))
+    .unwrap();
+
+    assert_eq!(object.object_id, "already-created");
+    let requests = store.transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+    assert!(requests[0].url.contains("rec_bag_operation_key"));
+    assert!(requests[0].url.contains("operation-42"));
+}
+
+#[test]
+fn durable_checkpoint_resumes_across_store_instances_and_is_removed_on_completion() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source.mp3");
+    std::fs::write(&source, b"abcdef").unwrap();
+    let checkpoints =
+        FileDriveUploadCheckpointStore::new(directory.path().join("checkpoints")).unwrap();
+    let request = || UploadRequest {
+        source_path: source.clone(),
+        object_path: "source.mp3".to_owned(),
+        content_type: Some("audio/mpeg".to_owned()),
+        content_length: Some(6),
+        expected_checksum: None,
+        metadata: BTreeMap::new(),
+        idempotency_key: Some("resume-operation".to_owned()),
+    };
+
+    let first_transport = MockTransport::new([
+        response(200, r#"{"files":[]}"#),
+        response_with_header(200, "Location", "https://upload/resume", b""),
+        response_with_header(308, "Range", "bytes=0-2", b""),
+        response(503, r#"{"error":{"message":"offline"}}"#),
+    ]);
+    let mut config =
+        GoogleDriveStoreConfig::new(Uuid::nil(), GoogleDriveFolder::new("restricted-root"));
+    config.upload_chunk_size = 3;
+    config.retry.max_attempts = 1;
+    let first = GoogleDriveMusicStore::new(config.clone(), first_transport, Tokens).unwrap();
+    assert!(block_on(first.upload_with_checkpoints(request(), &checkpoints)).is_err());
+    let saved = block_on(checkpoints.load("resume-operation"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.acknowledged_bytes, 3);
+    assert!(!format!("{saved:?}").contains("https://upload/resume"));
+
+    let second_transport = MockTransport::new([
+        response(200, r#"{"files":[]}"#),
+        response_with_header(308, "Range", "bytes=0-2", b""),
+        response(
+            200,
+            r#"{"id":"uploaded","name":"source.mp3","size":"6","md5Checksum":"e80b5017098950fc58aad83c8c14978e"}"#,
+        ),
+    ]);
+    let second = GoogleDriveMusicStore::new(config, second_transport, Tokens).unwrap();
+    let object = block_on(second.upload_with_checkpoints(request(), &checkpoints)).unwrap();
+    assert_eq!(object.object_id, "uploaded");
+    let requests = second.transport.requests();
+    assert_eq!(requests[1].headers["Content-Range"], "bytes */6");
+    assert_eq!(requests[2].body, b"def");
+    assert!(block_on(checkpoints.load("resume-operation"))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn metadata_reads_legacy_asset_id_and_current_revision_is_identified() {
+    let asset_id = Uuid::new_v4();
+    let store = store(MockTransport::new([
+        response(
+            200,
+            &format!(
+                r#"{{"id":"file","name":"file.mp3","appProperties":{{"asset_id":"{asset_id}"}}}}"#
+            ),
+        ),
+        response(
+            200,
+            r#"{"id":"file","name":"file.mp3","headRevisionId":"revision-2"}"#,
+        ),
+        response(
+            200,
+            r#"{"revisions":[{"id":"revision-1","size":"2"},{"id":"revision-2","size":"3"}]}"#,
+        ),
+    ]));
+
+    assert_eq!(
+        block_on(store.stat("file")).unwrap().embedded_asset_id,
+        Some(asset_id)
+    );
+    let versions = block_on(store.versions_page(rec_core::StorageVersionRequest {
+        object_id: "file".to_owned(),
+        page_cursor: None,
+        page_size: None,
+    }))
+    .unwrap();
+    assert!(!versions.versions[0].is_current);
+    assert!(versions.versions[1].is_current);
+}
+
+#[test]
+fn playback_cache_runtime_is_usable_as_a_registry_trait_object() {
+    let directory = tempdir().unwrap();
+    let mut config =
+        GoogleDriveStoreConfig::new(Uuid::nil(), GoogleDriveFolder::new("restricted-root"));
+    config.cache = Some(CacheConfig {
+        directory: directory.path().join("cache"),
+        max_bytes: 10,
+    });
+    let store = GoogleDriveMusicStore::new(config, MockTransport::new([]), Tokens).unwrap();
+    let runtime: &dyn PlaybackCacheRuntime = &store;
+    assert_eq!(runtime.cached_playback_path("missing").unwrap(), None);
+    runtime.evict_playback_cache().unwrap();
 }

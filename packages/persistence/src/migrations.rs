@@ -9,7 +9,7 @@ use rec_core::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -465,9 +465,9 @@ CREATE TABLE IF NOT EXISTS assets(id TEXT PRIMARY KEY,track_id TEXT NOT NULL,ass
 CREATE TABLE IF NOT EXISTS original_assets(id TEXT PRIMARY KEY,payload TEXT NOT NULL,FOREIGN KEY(id) REFERENCES assets(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS derived_assets(id TEXT PRIMARY KEY,payload TEXT NOT NULL,source_asset_id TEXT NOT NULL,FOREIGN KEY(id) REFERENCES assets(id) ON DELETE CASCADE,FOREIGN KEY(source_asset_id) REFERENCES original_assets(id));
 CREATE TABLE IF NOT EXISTS sync_runs(id TEXT PRIMARY KEY,payload TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS sync_jobs(id TEXT PRIMARY KEY,run_id TEXT NOT NULL,status TEXT NOT NULL,next_attempt_at TEXT,lease_expires_at TEXT,created_at TEXT NOT NULL,payload TEXT NOT NULL,FOREIGN KEY(run_id) REFERENCES sync_runs(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS sync_jobs(id TEXT PRIMARY KEY,run_id TEXT NOT NULL,kind TEXT NOT NULL DEFAULT '',status TEXT NOT NULL,next_attempt_at TEXT,lease_expires_at TEXT,created_at TEXT NOT NULL,idempotency_key TEXT NOT NULL,payload TEXT NOT NULL,FOREIGN KEY(run_id) REFERENCES sync_runs(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS sync_issues(id TEXT PRIMARY KEY,run_id TEXT NOT NULL,job_id TEXT,payload TEXT NOT NULL,FOREIGN KEY(run_id) REFERENCES sync_runs(id) ON DELETE CASCADE,FOREIGN KEY(job_id) REFERENCES sync_jobs(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS sync_job_events(id TEXT PRIMARY KEY,run_id TEXT NOT NULL,job_id TEXT,at TEXT NOT NULL,payload TEXT NOT NULL,FOREIGN KEY(run_id) REFERENCES sync_runs(id) ON DELETE CASCADE,FOREIGN KEY(job_id) REFERENCES sync_jobs(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS sync_job_events(id TEXT PRIMARY KEY,run_id TEXT NOT NULL,job_id TEXT,kind TEXT NOT NULL DEFAULT '',semantic_key TEXT,payload TEXT NOT NULL,at TEXT NOT NULL,FOREIGN KEY(run_id) REFERENCES sync_runs(id) ON DELETE CASCADE,FOREIGN KEY(job_id) REFERENCES sync_jobs(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS inventory_generations(id TEXT PRIMARY KEY,storage_id TEXT NOT NULL,run_id TEXT NOT NULL,kind TEXT NOT NULL,status TEXT NOT NULL,started_at TEXT NOT NULL,finished_at TEXT,payload TEXT NOT NULL,FOREIGN KEY(storage_id) REFERENCES music_storages(id),FOREIGN KEY(run_id) REFERENCES sync_runs(id));
 CREATE TABLE IF NOT EXISTS storage_objects(storage_id TEXT NOT NULL,object_id TEXT NOT NULL,generation_id TEXT,payload TEXT NOT NULL,is_current INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(storage_id,object_id),FOREIGN KEY(storage_id) REFERENCES music_storages(id),FOREIGN KEY(generation_id) REFERENCES inventory_generations(id));
 CREATE TABLE IF NOT EXISTS inventory_staged_objects(generation_id TEXT NOT NULL,storage_id TEXT NOT NULL,object_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(generation_id,storage_id,object_id),FOREIGN KEY(generation_id) REFERENCES inventory_generations(id) ON DELETE CASCADE);
@@ -476,8 +476,14 @@ CREATE TABLE IF NOT EXISTS inventory_staged_tombstones(generation_id TEXT NOT NU
 CREATE TABLE IF NOT EXISTS asset_locations(id TEXT PRIMARY KEY,asset_id TEXT NOT NULL,storage_id TEXT NOT NULL,object_id TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(storage_id,object_id),FOREIGN KEY(asset_id) REFERENCES assets(id),FOREIGN KEY(storage_id,object_id) REFERENCES storage_objects(storage_id,object_id));
 CREATE TABLE IF NOT EXISTS match_candidates(id TEXT PRIMARY KEY,track_id TEXT NOT NULL,asset_id TEXT,storage_id TEXT NOT NULL,confidence TEXT NOT NULL,review_required INTEGER NOT NULL,payload TEXT NOT NULL,FOREIGN KEY(track_id) REFERENCES tracks(id),FOREIGN KEY(asset_id) REFERENCES assets(id),FOREIGN KEY(storage_id) REFERENCES music_storages(id));
 CREATE TABLE IF NOT EXISTS reconciliation_results(id TEXT PRIMARY KEY,track_id TEXT,asset_id TEXT,storage_id TEXT,storage_object_id TEXT,outcome TEXT NOT NULL,review_required INTEGER NOT NULL,payload TEXT NOT NULL,FOREIGN KEY(track_id) REFERENCES tracks(id),FOREIGN KEY(asset_id) REFERENCES assets(id),FOREIGN KEY(storage_id) REFERENCES music_storages(id));
+CREATE TABLE IF NOT EXISTS reconciliation_result_candidates(result_id TEXT NOT NULL,candidate_id TEXT NOT NULL,PRIMARY KEY(result_id,candidate_id),FOREIGN KEY(result_id) REFERENCES reconciliation_results(id) ON DELETE CASCADE,FOREIGN KEY(candidate_id) REFERENCES match_candidates(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS reconciliation_resolutions(id TEXT PRIMARY KEY,result_id TEXT NOT NULL,candidate_id TEXT,decision TEXT NOT NULL,decided_at TEXT NOT NULL,payload TEXT NOT NULL,FOREIGN KEY(result_id) REFERENCES reconciliation_results(id) ON DELETE CASCADE,FOREIGN KEY(candidate_id) REFERENCES match_candidates(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS reconciliation_suppressions(id TEXT PRIMARY KEY,resolution_id TEXT NOT NULL UNIQUE,result_id TEXT NOT NULL,candidate_id TEXT,decision TEXT NOT NULL,expires_at TEXT,payload TEXT NOT NULL,FOREIGN KEY(resolution_id) REFERENCES reconciliation_resolutions(id) ON DELETE CASCADE,FOREIGN KEY(result_id) REFERENCES reconciliation_results(id) ON DELETE CASCADE,FOREIGN KEY(candidate_id) REFERENCES match_candidates(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS transfer_results(idempotency_key TEXT PRIMARY KEY,job_id TEXT NOT NULL UNIQUE,asset_id TEXT NOT NULL,storage_id TEXT,object_id TEXT,completed_at TEXT NOT NULL,payload TEXT NOT NULL,FOREIGN KEY(job_id) REFERENCES sync_jobs(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS snapshot_triggers(id TEXT PRIMARY KEY,source_run_id TEXT,requested_at TEXT NOT NULL,completed_snapshot_id TEXT,payload TEXT NOT NULL,FOREIGN KEY(source_run_id) REFERENCES sync_runs(id),FOREIGN KEY(completed_snapshot_id) REFERENCES catalog_snapshots(id));
+CREATE TABLE IF NOT EXISTS cleanup_approvals(id TEXT PRIMARY KEY,storage_id TEXT NOT NULL,object_id TEXT NOT NULL,approved_at TEXT NOT NULL,expires_at TEXT,consumed_at TEXT,payload TEXT NOT NULL,UNIQUE(storage_id,object_id),FOREIGN KEY(storage_id) REFERENCES music_storages(id));
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,payload TEXT NOT NULL,updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS catalog_snapshots(id TEXT PRIMARY KEY,content_hash TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL,payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS catalog_snapshots(id TEXT PRIMARY KEY,content_hash TEXT NOT NULL UNIQUE,logical_fingerprint TEXT,created_at TEXT NOT NULL,payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS legacy_track_analysis(track_id TEXT PRIMARY KEY,waveform_json TEXT NOT NULL,FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS idx_tracks_updated ON tracks(updated_at,id);
 CREATE INDEX IF NOT EXISTS idx_playlist_memberships_track ON canonical_playlist_memberships(track_id);
@@ -504,10 +510,19 @@ INSERT INTO catalog_schema_version(singleton,version,updated_at) VALUES(1,3,'197
         ("external_playlists", "snapshot", "snapshot TEXT"),
         ("derived_assets", "source_asset_id", "source_asset_id TEXT"),
         ("sync_runs", "updated_at", "updated_at TEXT"),
+        ("sync_jobs", "kind", "kind TEXT NOT NULL DEFAULT ''"),
         ("sync_jobs", "status", "status TEXT"),
         ("sync_jobs", "next_attempt_at", "next_attempt_at TEXT"),
         ("sync_jobs", "lease_expires_at", "lease_expires_at TEXT"),
         ("sync_jobs", "created_at", "created_at TEXT"),
+        ("sync_jobs", "idempotency_key", "idempotency_key TEXT"),
+        ("sync_job_events", "kind", "kind TEXT NOT NULL DEFAULT ''"),
+        ("sync_job_events", "semantic_key", "semantic_key TEXT"),
+        (
+            "catalog_snapshots",
+            "logical_fingerprint",
+            "logical_fingerprint TEXT",
+        ),
         ("inventory_generations", "run_id", "run_id TEXT"),
         ("inventory_generations", "kind", "kind TEXT"),
         ("inventory_generations", "started_at", "started_at TEXT"),
@@ -531,13 +546,69 @@ INSERT INTO catalog_schema_version(singleton,version,updated_at) VALUES(1,3,'197
     ] {
         ensure_column(connection, table, column, definition).await?;
     }
+    backfill_sync_job_indexes(connection).await?;
     connection.execute_batch(r#"
 CREATE INDEX IF NOT EXISTS idx_storage_objects_current ON storage_objects(storage_id,is_current,object_id);
 CREATE INDEX IF NOT EXISTS idx_candidates_filter ON match_candidates(track_id,asset_id,storage_id,confidence,review_required,id);
 CREATE INDEX IF NOT EXISTS idx_results_filter ON reconciliation_results(track_id,asset_id,storage_id,outcome,review_required,id);
 CREATE INDEX IF NOT EXISTS idx_sync_jobs_due ON sync_jobs(status,next_attempt_at,lease_expires_at,id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_jobs_active_idempotency ON sync_jobs(idempotency_key) WHERE status IN ('pending','running','paused','cancelling');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_job_events_semantic ON sync_job_events(semantic_key) WHERE semantic_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_result_candidates_candidate ON reconciliation_result_candidates(candidate_id,result_id);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_resolutions_filter ON reconciliation_resolutions(result_id,candidate_id,decision,id);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_suppressions_filter ON reconciliation_suppressions(result_id,candidate_id,decision,id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_logical_fingerprint ON catalog_snapshots(logical_fingerprint,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_inventory_latest ON inventory_generations(storage_id,status,finished_at DESC);
 "#).await?;
+    Ok(())
+}
+
+async fn backfill_sync_job_indexes(connection: &Connection) -> Result<(), MigrationError> {
+    let mut rows = connection
+        .query("SELECT id,payload FROM sync_jobs", ())
+        .await?;
+    let mut updates = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let id: String = row.get(0)?;
+        let payload: String = row.get(1)?;
+        match serde_json::from_str::<rec_core::SyncJob>(&payload) {
+            Ok(job) => updates.push((
+                id,
+                json(&job.kind)?.trim_matches('"').to_owned(),
+                json(&job.status)?.trim_matches('"').to_owned(),
+                job.idempotency_key,
+            )),
+            // Preserve readable legacy rows even if a future payload cannot be decoded by
+            // this binary. Its unique ID remains a safe conservative idempotency key.
+            Err(_) => updates.push((id.clone(), String::new(), String::new(), id)),
+        }
+    }
+    drop(rows);
+    let mut active_keys = BTreeSet::new();
+    for (id, _, status, idempotency_key) in &mut updates {
+        if matches!(
+            status.as_str(),
+            "pending" | "running" | "paused" | "cancelling"
+        ) && !active_keys.insert(idempotency_key.clone())
+        {
+            *idempotency_key = format!("{idempotency_key}:legacy-duplicate:{id}");
+        }
+    }
+    for (id, kind, status, idempotency_key) in updates {
+        if kind.is_empty() {
+            connection.execute(
+                "UPDATE sync_jobs SET idempotency_key=?2 WHERE id=?1 AND (idempotency_key IS NULL OR idempotency_key='')",
+                (id, idempotency_key),
+            ).await?;
+        } else {
+            connection
+                .execute(
+                    "UPDATE sync_jobs SET kind=?2,status=?3,idempotency_key=?4 WHERE id=?1",
+                    (id, kind, status, idempotency_key),
+                )
+                .await?;
+        }
+    }
     Ok(())
 }
 

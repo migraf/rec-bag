@@ -37,11 +37,12 @@ pub fn DjView() -> Element {
     let mut context_menu_y = use_signal(|| 0i32);
     let mut context_menu_selected: Signal<HashSet<Uuid>> = use_signal(|| HashSet::new());
 
-    // Get tracks for currently selected playlist with search filtering
-    let playlist_tracks = use_memo(move || app_state.selected_playlist_tracks());
+    // Browse the selected playlist, or the live library/catalog projection when no
+    // playlist is selected.
+    let browser_tracks = use_memo(move || app_state.dj_tracks());
     let filtered_tracks = use_memo(move || {
         let query = search_query();
-        let tracks = playlist_tracks();
+        let tracks = browser_tracks();
         if query.is_empty() {
             tracks
         } else {
@@ -330,6 +331,11 @@ pub fn DjView() -> Element {
 
     let track_count = filtered_tracks().len();
     let has_playlist_selected = app_state.selected_playlist_id.read().is_some();
+    let browser_title = if has_playlist_selected {
+        "Tracks"
+    } else {
+        "Library"
+    };
 
     // Read deck tracks from shared state
     let deck1_track_value = app_state.deck1_track.read().clone();
@@ -377,37 +383,29 @@ pub fn DjView() -> Element {
 
                 div { class: "track-panel",
                     // Track panel header with search
-                    if has_playlist_selected {
-                        div { class: "track-panel-header",
-                            div { class: "track-panel-title",
-                                "Tracks"
-                                span { class: "track-panel-count", "({track_count})" }
-                            }
-                            SearchBar {
-                                value: search_query(),
-                                placeholder: "Search playlist...".to_string(),
-                                on_change: move |q| search_query.set(q),
-                                result_count: if search_query().is_empty() { None } else { Some(track_count) },
-                                compact: true
-                            }
+                    div { class: "track-panel-header",
+                        div { class: "track-panel-title",
+                            "{browser_title}"
+                            span { class: "track-panel-count", "({track_count})" }
+                        }
+                        SearchBar {
+                            value: search_query(),
+                            placeholder: if has_playlist_selected { "Search playlist...".to_string() } else { "Search library...".to_string() },
+                            on_change: move |q| search_query.set(q),
+                            result_count: if search_query().is_empty() { None } else { Some(track_count) },
+                            compact: true
                         }
                     }
 
-                    if has_playlist_selected {
-                        TrackList {
-                            tracks: filtered_tracks(),
-                            selected_ids: selected_track_ids(),
-                            on_select: on_select,
-                            on_load: on_load_track,
-                            on_remove: on_remove_track,
-                            on_context_menu: on_context_menu,
-                            deck_count: 2,
-                            show_playlist_badges: false
-                        }
-                    } else {
-                        div { class: "empty-state",
-                            "Select a playlist to view tracks"
-                        }
+                    TrackList {
+                        tracks: filtered_tracks(),
+                        selected_ids: selected_track_ids(),
+                        on_select: on_select,
+                        on_load: on_load_track,
+                        on_remove: on_remove_track,
+                        on_context_menu: on_context_menu,
+                        deck_count: 2,
+                        show_playlist_badges: false
                     }
                 }
             }

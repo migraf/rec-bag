@@ -1,5 +1,6 @@
 //! Persistent, provider-independent synchronization run and job contracts.
 
+use crate::asset::ContentHash;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf};
@@ -118,6 +119,12 @@ pub enum SyncJobPayload {
         source_storage_id: Uuid,
         source_object_id: String,
         source_object_key: Option<String>,
+        /// Immutable source generation captured when the job is planned.
+        #[serde(default)]
+        source_provider_version: Option<String>,
+        /// Immutable canonical content identity captured when the job is planned.
+        #[serde(default)]
+        expected_checksum: Option<ContentHash>,
         destination_storage_id: Uuid,
         destination_object_key: String,
     },
@@ -209,6 +216,80 @@ impl SyncCursor {
     }
 }
 
+/// Durable stage of a portable asset transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferStage {
+    PendingDownload,
+    DownloadVerified,
+    Uploaded,
+    DestinationVerified,
+}
+
+/// Immutable transfer identity plus the latest durable stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferCheckpoint {
+    pub stage: TransferStage,
+    pub expected_checksum: ContentHash,
+    #[serde(default)]
+    pub source_provider_version: Option<String>,
+    #[serde(default)]
+    pub destination_object_id: Option<String>,
+}
+
+impl TransferCheckpoint {
+    pub fn new(expected_checksum: ContentHash, source_provider_version: Option<String>) -> Self {
+        Self {
+            stage: TransferStage::PendingDownload,
+            expected_checksum,
+            source_provider_version,
+            destination_object_id: None,
+        }
+    }
+
+    /// Advance without permitting a retry to substitute a different source identity.
+    pub fn advance(
+        &self,
+        stage: TransferStage,
+        expected_checksum: &ContentHash,
+        source_provider_version: Option<&str>,
+        destination_object_id: Option<String>,
+    ) -> Result<Self, TransferCheckpointError> {
+        if &self.expected_checksum != expected_checksum
+            || self.source_provider_version.as_deref() != source_provider_version
+        {
+            return Err(TransferCheckpointError::SourceIdentityChanged);
+        }
+        if stage < self.stage {
+            return Err(TransferCheckpointError::StageRegression);
+        }
+        Ok(Self {
+            stage,
+            expected_checksum: self.expected_checksum.clone(),
+            source_provider_version: self.source_provider_version.clone(),
+            destination_object_id: destination_object_id
+                .or_else(|| self.destination_object_id.clone()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferCheckpointError {
+    SourceIdentityChanged,
+    StageRegression,
+}
+
+impl fmt::Display for TransferCheckpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceIdentityChanged => formatter.write_str("transfer source identity changed"),
+            Self::StageRegression => formatter.write_str("transfer stage cannot move backwards"),
+        }
+    }
+}
+
+impl std::error::Error for TransferCheckpointError {}
+
 /// Durable state from which interrupted work can continue.
 ///
 /// `sync_cursor` is the authoritative high-water mark and must only advance
@@ -222,6 +303,9 @@ pub struct SyncCheckpoint {
     pub last_item_id: Option<String>,
     pub processed_items: u64,
     pub created_at: DateTime<Utc>,
+    /// Present for staged asset-copy jobs; absent in legacy and non-transfer checkpoints.
+    #[serde(default)]
+    pub transfer: Option<TransferCheckpoint>,
 }
 
 impl SyncCheckpoint {
@@ -236,6 +320,7 @@ impl SyncCheckpoint {
             last_item_id: None,
             processed_items,
             created_at,
+            transfer: None,
         }
     }
 
@@ -261,6 +346,11 @@ impl SyncCheckpoint {
 
     pub fn with_last_item(mut self, item_id: impl Into<String>) -> Self {
         self.last_item_id = Some(item_id.into());
+        self
+    }
+
+    pub fn with_transfer(mut self, transfer: TransferCheckpoint) -> Self {
+        self.transfer = Some(transfer);
         self
     }
 }
@@ -430,6 +520,9 @@ pub struct SyncError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+    /// Provider-supplied minimum retry delay, when available.
+    #[serde(default)]
+    pub retry_after_seconds: Option<u64>,
     pub occurred_at: DateTime<Utc>,
 }
 
@@ -455,8 +548,14 @@ impl SyncError {
             code: code.into(),
             message: message.into(),
             retryable,
+            retry_after_seconds: None,
             occurred_at,
         }
+    }
+
+    pub fn with_retry_after_seconds(mut self, seconds: u64) -> Self {
+        self.retry_after_seconds = Some(seconds);
+        self
     }
 }
 
@@ -1108,6 +1207,8 @@ mod tests {
                     source_storage_id,
                     source_object_id: "replication-source".to_owned(),
                     source_object_key: Some("primary/asset".to_owned()),
+                    source_provider_version: Some("v1".to_owned()),
+                    expected_checksum: None,
                     destination_storage_id,
                     destination_object_key: "backup/asset".to_owned(),
                 },
@@ -1174,6 +1275,62 @@ mod tests {
         assert_eq!(job.attempt_count, 2);
         assert!(job.attempts_exhausted());
         assert!(!job.schedule_retry_at(time(6), time(5)));
+    }
+
+    #[test]
+    fn legacy_payload_checkpoint_and_error_json_remain_readable() {
+        let asset_id = Uuid::new_v4();
+        let source_storage_id = Uuid::new_v4();
+        let destination_storage_id = Uuid::new_v4();
+        let payload_json = format!(
+            r#"{{"kind":"replicate_asset","version":1,"asset_id":"{asset_id}","source_storage_id":"{source_storage_id}","source_object_id":"source","source_object_key":null,"destination_storage_id":"{destination_storage_id}","destination_object_key":"target"}}"#
+        );
+        let payload: SyncJobPayload = serde_json::from_str(&payload_json).unwrap();
+        assert!(matches!(
+            payload,
+            SyncJobPayload::ReplicateAsset {
+                source_provider_version: None,
+                expected_checksum: None,
+                ..
+            }
+        ));
+
+        let checkpoint_json = format!(
+            r#"{{"sync_cursor":null,"page_cursor":null,"last_item_id":null,"processed_items":0,"created_at":"{}"}}"#,
+            time(0).to_rfc3339()
+        );
+        let checkpoint: SyncCheckpoint = serde_json::from_str(&checkpoint_json).unwrap();
+        assert_eq!(checkpoint.transfer, None);
+
+        let error_json = format!(
+            r#"{{"kind":"provider","code":"old","message":"legacy","retryable":true,"occurred_at":"{}"}}"#,
+            time(0).to_rfc3339()
+        );
+        let error: SyncError = serde_json::from_str(&error_json).unwrap();
+        assert_eq!(error.retry_after_seconds, None);
+    }
+
+    #[test]
+    fn transfer_checkpoint_rejects_source_changes_and_stage_regression() {
+        let hash = ContentHash::sha256("a".repeat(64)).unwrap();
+        let pending = TransferCheckpoint::new(hash.clone(), Some("v1".into()));
+        let downloaded = pending
+            .advance(TransferStage::DownloadVerified, &hash, Some("v1"), None)
+            .unwrap();
+        assert_eq!(downloaded.stage, TransferStage::DownloadVerified);
+        assert_eq!(
+            downloaded.advance(TransferStage::PendingDownload, &hash, Some("v1"), None),
+            Err(TransferCheckpointError::StageRegression)
+        );
+        assert_eq!(
+            downloaded.advance(
+                TransferStage::Uploaded,
+                &ContentHash::sha256("b".repeat(64)).unwrap(),
+                Some("v1"),
+                Some("object".into()),
+            ),
+            Err(TransferCheckpointError::SourceIdentityChanged)
+        );
     }
 
     #[test]

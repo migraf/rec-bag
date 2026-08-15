@@ -17,8 +17,12 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::Arc,
-    time::Duration,
+    fmt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use url::Url;
 use uuid::Uuid;
@@ -26,6 +30,7 @@ use uuid::Uuid;
 const DEFAULT_PAGE_SIZE: u32 = 50;
 const MAX_PAGE_SIZE: u32 = 200;
 const DEFAULT_API_URL: &str = "https://api.soundcloud.com/";
+pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 const CURSOR_VERSION: u8 = 1;
 
 /// A non-secret access token provider. Implementations must atomically replace persisted refresh
@@ -43,40 +48,117 @@ pub trait SoundCloudHttpTransport: Send + Sync {
     ) -> BoxFuture<'_, Result<SoundCloudHttpResponse, SoundCloudTransportError>>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SoundCloudHttpRequest {
     pub url: String,
     pub headers: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for SoundCloudHttpRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SoundCloudHttpRequest")
+            .field("url", &sanitized_url(&self.url))
+            .field("headers", &sanitized_headers(&self.headers))
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct SoundCloudHttpResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
     pub body: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for SoundCloudHttpResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SoundCloudHttpResponse")
+            .field("status", &self.status)
+            .field("headers", &sanitized_headers(&self.headers))
+            .field("body", &"[redacted]")
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundCloudTransportErrorKind {
+    Network,
+    ResponseTooLarge,
+    InvalidResponse,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct SoundCloudTransportError {
-    pub message: String,
+    pub kind: SoundCloudTransportErrorKind,
+}
+
+impl fmt::Debug for SoundCloudTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SoundCloudTransportError")
+            .field("kind", &self.kind)
+            .field("message", &"[redacted]")
+            .finish()
+    }
 }
 
 impl SoundCloudTransportError {
-    pub fn new(message: impl Into<String>) -> Self {
+    pub fn new(_message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            kind: SoundCloudTransportErrorKind::Network,
+        }
+    }
+
+    fn response_too_large() -> Self {
+        Self {
+            kind: SoundCloudTransportErrorKind::ResponseTooLarge,
+        }
+    }
+
+    fn invalid_response(_message: impl Into<String>) -> Self {
+        Self {
+            kind: SoundCloudTransportErrorKind::InvalidResponse,
         }
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ReqwestSoundCloudTransport {
     client: reqwest::Client,
+    max_response_body_bytes: usize,
+}
+
+impl Default for ReqwestSoundCloudTransport {
+    fn default() -> Self {
+        Self::new(reqwest::Client::new())
+    }
+}
+
+impl fmt::Debug for ReqwestSoundCloudTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReqwestSoundCloudTransport")
+            .field("max_response_body_bytes", &self.max_response_body_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReqwestSoundCloudTransport {
     pub fn new(client: reqwest::Client) -> Self {
-        Self { client }
+        Self::with_max_response_body_bytes(client, DEFAULT_MAX_RESPONSE_BODY_BYTES)
+    }
+
+    pub fn with_max_response_body_bytes(
+        client: reqwest::Client,
+        max_response_body_bytes: usize,
+    ) -> Self {
+        Self {
+            client,
+            max_response_body_bytes: max_response_body_bytes.max(1),
+        }
     }
 }
 
@@ -86,15 +168,22 @@ impl SoundCloudHttpTransport for ReqwestSoundCloudTransport {
         request: SoundCloudHttpRequest,
     ) -> BoxFuture<'_, Result<SoundCloudHttpResponse, SoundCloudTransportError>> {
         let client = self.client.clone();
+        let max_response_body_bytes = self.max_response_body_bytes;
         Box::pin(async move {
             let mut builder = client.get(request.url);
             for (name, value) in request.headers {
                 builder = builder.header(name, value);
             }
-            let response = builder
+            let mut response = builder
                 .send()
                 .await
                 .map_err(|error| SoundCloudTransportError::new(error.to_string()))?;
+            if response
+                .content_length()
+                .is_some_and(|length| length > max_response_body_bytes as u64)
+            {
+                return Err(SoundCloudTransportError::response_too_large());
+            }
             let status = response.status().as_u16();
             let headers = response
                 .headers()
@@ -106,10 +195,22 @@ impl SoundCloudHttpTransport for ReqwestSoundCloudTransport {
                         .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
                 })
                 .collect();
-            let body = response
-                .text()
+            let mut body = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
                 .await
-                .map_err(|error| SoundCloudTransportError::new(error.to_string()))?;
+                .map_err(|error| SoundCloudTransportError::new(error.to_string()))?
+            {
+                if body.len().saturating_add(chunk.len()) > max_response_body_bytes {
+                    return Err(SoundCloudTransportError::response_too_large());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let body = String::from_utf8(body).map_err(|_| {
+                SoundCloudTransportError::invalid_response(
+                    "SoundCloud response body was not valid UTF-8",
+                )
+            })?;
             Ok(SoundCloudHttpResponse {
                 status,
                 headers,
@@ -132,11 +233,71 @@ impl SoundCloudSleeper for TokioSoundCloudSleeper {
     }
 }
 
+/// Supplies full-jitter delays. Production uses a process-local pseudo-random source; tests can
+/// inject a deterministic implementation without sleeping.
+pub trait SoundCloudJitterSource: Send + Sync {
+    /// Return a duration in the inclusive range `0..=upper_bound`. Callers clamp the result.
+    fn jitter(&self, upper_bound: Duration) -> Duration;
+}
+
+pub struct SystemSoundCloudJitter {
+    state: AtomicU64,
+}
+
+impl Default for SystemSoundCloudJitter {
+    fn default() -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Self {
+            state: AtomicU64::new(seed.max(1)),
+        }
+    }
+}
+
+impl fmt::Debug for SystemSoundCloudJitter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SystemSoundCloudJitter")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SoundCloudJitterSource for SystemSoundCloudJitter {
+    fn jitter(&self, upper_bound: Duration) -> Duration {
+        let mut current = self.state.load(Ordering::Relaxed);
+        let random = loop {
+            let mut next = current;
+            next ^= next << 13;
+            next ^= next >> 7;
+            next ^= next << 17;
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break next,
+                Err(observed) => current = observed,
+            }
+        };
+        let upper_nanos = upper_bound.as_nanos().min(u64::MAX as u128) as u64;
+        let nanos = if upper_nanos == u64::MAX {
+            random
+        } else {
+            random % (upper_nanos + 1)
+        };
+        Duration::from_nanos(nanos)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoundCloudRetryPolicy {
     pub max_retries: u8,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    pub max_retry_after: Duration,
 }
 
 impl Default for SoundCloudRetryPolicy {
@@ -145,6 +306,7 @@ impl Default for SoundCloudRetryPolicy {
             max_retries: 3,
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
+            max_retry_after: Duration::from_secs(60),
         }
     }
 }
@@ -154,7 +316,9 @@ pub struct SoundCloudClient {
     transport: Arc<dyn SoundCloudHttpTransport>,
     tokens: Arc<dyn SoundCloudTokenProvider>,
     sleeper: Arc<dyn SoundCloudSleeper>,
+    jitter: Arc<dyn SoundCloudJitterSource>,
     retry_policy: SoundCloudRetryPolicy,
+    max_response_body_bytes: usize,
     api_url: Url,
 }
 
@@ -179,6 +343,28 @@ impl SoundCloudClient {
         retry_policy: SoundCloudRetryPolicy,
         api_url: &str,
     ) -> Result<Self, SourceError> {
+        Self::with_runtime_options(
+            transport,
+            tokens,
+            sleeper,
+            Arc::new(SystemSoundCloudJitter::default()),
+            retry_policy,
+            api_url,
+            DEFAULT_MAX_RESPONSE_BODY_BYTES,
+        )
+    }
+
+    /// Configures injectable timing and response limits. This is primarily useful for deterministic
+    /// tests and hosts that require a lower memory ceiling than the default transport limit.
+    pub fn with_runtime_options(
+        transport: Arc<dyn SoundCloudHttpTransport>,
+        tokens: Arc<dyn SoundCloudTokenProvider>,
+        sleeper: Arc<dyn SoundCloudSleeper>,
+        jitter: Arc<dyn SoundCloudJitterSource>,
+        retry_policy: SoundCloudRetryPolicy,
+        api_url: &str,
+        max_response_body_bytes: usize,
+    ) -> Result<Self, SourceError> {
         let api_url =
             Url::parse(api_url).map_err(|_| invalid_data("invalid SoundCloud API URL"))?;
         if api_url.scheme().is_empty() || api_url.host_str().is_none() {
@@ -186,11 +372,18 @@ impl SoundCloudClient {
                 "SoundCloud API URL must include a scheme and host",
             ));
         }
+        if max_response_body_bytes == 0 {
+            return Err(invalid_data(
+                "SoundCloud response body limit must be greater than zero",
+            ));
+        }
         Ok(Self {
             transport,
             tokens,
             sleeper,
+            jitter,
             retry_policy,
+            max_response_body_bytes,
             api_url,
         })
     }
@@ -275,7 +468,11 @@ impl SoundCloudClient {
     }
 
     async fn get<T: DeserializeOwned>(&self, url: Url) -> Result<T, SourceError> {
-        let mut token = self.tokens.access_token().await?;
+        let mut token = self
+            .tokens
+            .access_token()
+            .await
+            .map_err(sanitize_token_provider_error)?;
         let mut refreshed = false;
         let mut retries = 0_u8;
         loop {
@@ -293,6 +490,11 @@ impl SoundCloudClient {
                 })
                 .await;
             match response {
+                Ok(response) if response.body.len() > self.max_response_body_bytes => {
+                    return Err(invalid_data(
+                        "SoundCloud response exceeded the configured body limit",
+                    ));
+                }
                 Ok(response) if (200..300).contains(&response.status) => {
                     return serde_json::from_str(&response.body).map_err(|error| {
                         invalid_data(format!(
@@ -301,31 +503,52 @@ impl SoundCloudClient {
                     });
                 }
                 Ok(response) if response.status == 401 && !refreshed => {
-                    token = self.tokens.refresh_access_token().await?;
+                    token = self
+                        .tokens
+                        .refresh_access_token()
+                        .await
+                        .map_err(sanitize_token_provider_error)?;
                     refreshed = true;
                 }
                 Ok(response) => {
-                    let error = response_error(&response);
+                    let error = response_error(&response, self.retry_policy.max_retry_after);
                     if error.is_retryable() && retries < self.retry_policy.max_retries {
-                        let delay = retry_delay(&response, retries, self.retry_policy);
+                        let delay = retry_delay(
+                            &response,
+                            retries,
+                            self.retry_policy,
+                            self.jitter.as_ref(),
+                        );
                         retries += 1;
                         self.sleeper.sleep(delay).await;
                     } else {
                         return Err(error);
                     }
                 }
+                Err(error)
+                    if matches!(
+                        error.kind,
+                        SoundCloudTransportErrorKind::ResponseTooLarge
+                            | SoundCloudTransportErrorKind::InvalidResponse
+                    ) =>
+                {
+                    return Err(invalid_data(
+                        "SoundCloud transport returned an invalid bounded response",
+                    ));
+                }
                 Err(_error) if retries < self.retry_policy.max_retries => {
-                    let delay = exponential_delay(retries, self.retry_policy);
+                    let delay = jittered_exponential_delay(
+                        retries,
+                        self.retry_policy,
+                        self.jitter.as_ref(),
+                    );
                     retries += 1;
                     self.sleeper.sleep(delay).await;
                 }
-                Err(error) => {
+                Err(_error) => {
                     return Err(SourceError::new(
                         SourceErrorKind::TemporarilyUnavailable,
-                        format!(
-                            "SoundCloud request could not be completed: {}",
-                            error.message
-                        ),
+                        "SoundCloud transport request failed",
                     ));
                 }
             }
@@ -1053,7 +1276,44 @@ fn metadata_value(value: &Value) -> MetadataValue {
 
 fn is_sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    key.contains("token") || key.contains("secret") || key == "authorization"
+    key.contains("token")
+        || key.contains("secret")
+        || key.contains("api-key")
+        || matches!(key.as_str(), "authorization" | "cookie" | "set-cookie")
+}
+
+fn sanitized_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let value = if is_sensitive_key(name) {
+                "[redacted]".to_string()
+            } else {
+                value.clone()
+            };
+            (name.clone(), value)
+        })
+        .collect()
+}
+
+fn sanitized_url(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return "[redacted invalid URL]".to_string();
+    };
+    let query_names: Vec<String> = url
+        .query_pairs()
+        .map(|(name, _)| name.into_owned())
+        .collect();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    if !query_names.is_empty() {
+        let mut query = url.query_pairs_mut();
+        for name in query_names {
+            query.append_pair(&name, "[redacted]");
+        }
+    }
+    url.to_string()
 }
 
 fn sorted_relationships(
@@ -1089,14 +1349,12 @@ fn invalid_data(message: impl Into<String>) -> SourceError {
     SourceError::new(SourceErrorKind::InvalidData, message)
 }
 
-fn response_error(response: &SoundCloudHttpResponse) -> SourceError {
+fn sanitize_token_provider_error(error: SourceError) -> SourceError {
+    SourceError::new(error.kind, "SoundCloud token provider failed")
+}
+
+fn response_error(response: &SoundCloudHttpResponse, max_retry_after: Duration) -> SourceError {
     let body: Option<ApiErrorDto> = serde_json::from_str(&response.body).ok();
-    let detail = body
-        .as_ref()
-        .and_then(|error| error.message.as_deref())
-        .filter(|message| !message.is_empty())
-        .map(|message| format!(": {message}"))
-        .unwrap_or_default();
     let mut error = SourceError::new(
         match response.status {
             401 => SourceErrorKind::AuthenticationRequired,
@@ -1107,15 +1365,16 @@ fn response_error(response: &SoundCloudHttpResponse) -> SourceError {
             _ => SourceErrorKind::Permanent,
         },
         format!(
-            "SoundCloud request failed with HTTP status {}{detail}",
+            "SoundCloud request failed with HTTP status {}",
             response.status
         ),
     );
     error.provider_code = body
         .and_then(|error| error.code.map(|code| code.to_string()))
         .or_else(|| Some(response.status.to_string()));
-    error.retry_after_seconds =
-        header(&response.headers, "retry-after").and_then(|value| value.parse().ok());
+    error.retry_after_seconds = header(&response.headers, "retry-after")
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| seconds.min(max_retry_after.as_secs()));
     error
 }
 
@@ -1123,19 +1382,19 @@ fn response_error(response: &SoundCloudHttpResponse) -> SourceError {
 struct ApiErrorDto {
     #[serde(default)]
     code: Option<u16>,
-    #[serde(default)]
-    message: Option<String>,
 }
 
 fn retry_delay(
     response: &SoundCloudHttpResponse,
     retry: u8,
     policy: SoundCloudRetryPolicy,
+    jitter: &dyn SoundCloudJitterSource,
 ) -> Duration {
     header(&response.headers, "retry-after")
-        .and_then(|value| value.parse().ok())
+        .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_secs)
-        .unwrap_or_else(|| exponential_delay(retry, policy))
+        .map(|delay| delay.min(policy.max_retry_after))
+        .unwrap_or_else(|| jittered_exponential_delay(retry, policy, jitter))
 }
 
 fn header<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {
@@ -1151,6 +1410,15 @@ fn exponential_delay(retry: u8, policy: SoundCloudRetryPolicy) -> Duration {
         .initial_backoff
         .saturating_mul(multiplier)
         .min(policy.max_backoff)
+}
+
+fn jittered_exponential_delay(
+    retry: u8,
+    policy: SoundCloudRetryPolicy,
+    jitter: &dyn SoundCloudJitterSource,
+) -> Duration {
+    let upper_bound = exponential_delay(retry, policy);
+    jitter.jitter(upper_bound).min(upper_bound)
 }
 
 #[cfg(test)]

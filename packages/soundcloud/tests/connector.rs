@@ -5,8 +5,8 @@ use rec_core::{
 };
 use soundcloud::{
     ReqwestSoundCloudTransport, SoundCloudClient, SoundCloudConnector, SoundCloudHttpRequest,
-    SoundCloudHttpResponse, SoundCloudHttpTransport, SoundCloudRetryPolicy, SoundCloudSleeper,
-    SoundCloudTokenProvider, SoundCloudTransportError,
+    SoundCloudHttpResponse, SoundCloudHttpTransport, SoundCloudJitterSource, SoundCloudRetryPolicy,
+    SoundCloudSleeper, SoundCloudTokenProvider, SoundCloudTransportError,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -26,8 +26,14 @@ struct MockTransport {
 
 impl MockTransport {
     fn with_responses(responses: impl IntoIterator<Item = SoundCloudHttpResponse>) -> Self {
+        Self::with_results(responses.into_iter().map(Ok))
+    }
+
+    fn with_results(
+        responses: impl IntoIterator<Item = Result<SoundCloudHttpResponse, SoundCloudTransportError>>,
+    ) -> Self {
         Self {
-            responses: Mutex::new(responses.into_iter().map(Ok).collect()),
+            responses: Mutex::new(responses.into_iter().collect()),
             requests: Mutex::new(Vec::new()),
         }
     }
@@ -99,6 +105,25 @@ impl SoundCloudSleeper for RecordingSleeper {
     fn sleep(&self, duration: Duration) -> BoxFuture<'_, ()> {
         self.0.lock().unwrap().push(duration);
         Box::pin(async {})
+    }
+}
+
+struct SequenceJitter(Mutex<VecDeque<Duration>>);
+
+impl SequenceJitter {
+    fn new(values: impl IntoIterator<Item = Duration>) -> Self {
+        Self(Mutex::new(values.into_iter().collect()))
+    }
+}
+
+impl SoundCloudJitterSource for SequenceJitter {
+    fn jitter(&self, upper_bound: Duration) -> Duration {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected jitter request")
+            .min(upper_bound)
     }
 }
 
@@ -639,30 +664,34 @@ async fn repeated_401_never_reuses_the_single_use_refresh_callback() {
 }
 
 #[tokio::test]
-async fn rate_limits_honor_retry_after_and_5xx_retries_are_bounded() {
+async fn retry_after_is_capped_and_5xx_full_jitter_is_bounded_and_deterministic() {
     let mut limited = response(429, "{\"code\":429,\"message\":\"slow down\"}");
     limited
         .headers
-        .insert("retry-after".to_string(), "7".to_string());
+        .insert("retry-after".to_string(), "700".to_string());
     let transport = Arc::new(MockTransport::with_responses([
         limited,
         response(200, include_str!("fixtures/me_current.json")),
     ]));
     let sleeper = Arc::new(RecordingSleeper::default());
-    let client = SoundCloudClient::with_options(
+    let policy = SoundCloudRetryPolicy {
+        max_retries: 2,
+        initial_backoff: Duration::from_secs(1),
+        max_backoff: Duration::from_secs(10),
+        max_retry_after: Duration::from_secs(5),
+    };
+    let client = SoundCloudClient::with_runtime_options(
         transport,
         Arc::new(MockTokens::new("access", "rotated")),
         sleeper.clone(),
-        SoundCloudRetryPolicy {
-            max_retries: 2,
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(10),
-        },
+        Arc::new(SequenceJitter::new([])),
+        policy,
         API_URL,
+        1024 * 1024,
     )
     .unwrap();
     assert!(client.account(SOURCE_ID).await.is_ok());
-    assert_eq!(sleeper.delays(), vec![Duration::from_secs(7)]);
+    assert_eq!(sleeper.delays(), vec![Duration::from_secs(5)]);
 
     let transport = Arc::new(MockTransport::with_responses([
         response(503, "{}"),
@@ -670,16 +699,17 @@ async fn rate_limits_honor_retry_after_and_5xx_retries_are_bounded() {
         response(503, "{}"),
     ]));
     let sleeper = Arc::new(RecordingSleeper::default());
-    let client = SoundCloudClient::with_options(
+    let client = SoundCloudClient::with_runtime_options(
         transport.clone(),
         Arc::new(MockTokens::new("access", "rotated")),
         sleeper.clone(),
-        SoundCloudRetryPolicy {
-            max_retries: 2,
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(10),
-        },
+        Arc::new(SequenceJitter::new([
+            Duration::from_millis(250),
+            Duration::from_millis(1_500),
+        ])),
+        policy,
         API_URL,
+        1024 * 1024,
     )
     .unwrap();
     let error = client.account(SOURCE_ID).await.unwrap_err();
@@ -687,7 +717,108 @@ async fn rate_limits_honor_retry_after_and_5xx_retries_are_bounded() {
     assert_eq!(transport.requests().len(), 3);
     assert_eq!(
         sleeper.delays(),
-        vec![Duration::from_secs(1), Duration::from_secs(2)]
+        vec![Duration::from_millis(250), Duration::from_millis(1_500)]
+    );
+}
+
+#[test]
+fn debug_output_redacts_request_response_and_transport_secrets() {
+    let request = SoundCloudHttpRequest {
+        url: "https://api.soundcloud.com/me?secret_token=url-secret&cursor=opaque-secret"
+            .to_string(),
+        headers: BTreeMap::from([
+            (
+                "authorization".to_string(),
+                "OAuth header-secret".to_string(),
+            ),
+            ("accept".to_string(), "application/json".to_string()),
+        ]),
+    };
+    let response = SoundCloudHttpResponse {
+        status: 401,
+        headers: BTreeMap::from([(
+            "set-cookie".to_string(),
+            "session=response-header-secret".to_string(),
+        )]),
+        body: "response-body-secret".to_string(),
+    };
+    let transport_error = SoundCloudTransportError::new("transport-secret");
+
+    let debug = format!("{request:?} {response:?} {transport_error:?}");
+    for secret in [
+        "url-secret",
+        "opaque-secret",
+        "header-secret",
+        "response-header-secret",
+        "response-body-secret",
+        "transport-secret",
+    ] {
+        assert!(!debug.contains(secret), "Debug leaked {secret}");
+    }
+    assert!(debug.contains("[redacted]"));
+}
+
+#[tokio::test]
+async fn response_body_limit_is_enforced_before_parsing_without_retry() {
+    let transport = Arc::new(MockTransport::with_responses([response(
+        200,
+        &format!("{{\"padding\":\"{}\"}}", "x".repeat(128)),
+    )]));
+    let client = SoundCloudClient::with_runtime_options(
+        transport.clone(),
+        Arc::new(MockTokens::new("access", "rotated")),
+        Arc::new(RecordingSleeper::default()),
+        Arc::new(SequenceJitter::new([])),
+        SoundCloudRetryPolicy::default(),
+        API_URL,
+        32,
+    )
+    .unwrap();
+
+    let error = client.account(SOURCE_ID).await.unwrap_err();
+    assert_eq!(error.kind, SourceErrorKind::InvalidData);
+    assert!(error.message.contains("body limit"));
+    assert_eq!(transport.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn provider_and_transport_errors_never_surface_raw_secrets() {
+    let provider_secret = "provider-error-secret";
+    let client = SoundCloudClient::with_options(
+        Arc::new(MockTransport::with_responses([response(
+            400,
+            &format!("{{\"code\":400,\"message\":\"bad token {provider_secret}\"}}"),
+        )])),
+        Arc::new(MockTokens::new("access", "rotated")),
+        Arc::new(RecordingSleeper::default()),
+        SoundCloudRetryPolicy::default(),
+        API_URL,
+    )
+    .unwrap();
+    let provider_error = client.account(SOURCE_ID).await.unwrap_err();
+    assert!(!format!("{provider_error:?} {provider_error}").contains(provider_secret));
+
+    let transport_secret = "transport-error-secret";
+    let client = SoundCloudClient::with_runtime_options(
+        Arc::new(MockTransport::with_results([Err(
+            SoundCloudTransportError::new(transport_secret),
+        )])),
+        Arc::new(MockTokens::new("access", "rotated")),
+        Arc::new(RecordingSleeper::default()),
+        Arc::new(SequenceJitter::new([])),
+        SoundCloudRetryPolicy {
+            max_retries: 0,
+            ..SoundCloudRetryPolicy::default()
+        },
+        API_URL,
+        1024,
+    )
+    .unwrap();
+    let transport_error = client.account(SOURCE_ID).await.unwrap_err();
+    assert!(!format!("{transport_error:?} {transport_error}").contains(transport_secret));
+    assert_eq!(
+        transport_error.message,
+        "SoundCloud transport request failed"
     );
 }
 

@@ -6,9 +6,13 @@
 //! shared-drive support.
 
 mod cache;
+mod checkpoint;
 mod http;
 
 pub use cache::CacheConfig;
+pub use checkpoint::{
+    DriveUploadCheckpoint, DriveUploadCheckpointStore, FileDriveUploadCheckpointStore,
+};
 pub use http::{
     DriveHttpRequest, DriveHttpResponse, DriveHttpTransport, DriveTransportError,
     GoogleAccessToken, GoogleTokenError, GoogleTokenProvider,
@@ -28,15 +32,25 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const DRIVE_V3: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD_V3: &str = "https://www.googleapis.com/upload/drive/v3";
 const FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 const DEFAULT_UPLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+const APP_PROPERTY_TRACK_ID: &str = "rec_bag_track_id";
+const APP_PROPERTY_ASSET_ID: &str = "rec_bag_asset_id";
+const APP_PROPERTY_OPERATION_KEY: &str = "rec_bag_operation_key";
+const MAX_APP_PROPERTIES: usize = 100;
+const MAX_APP_PROPERTY_BYTES: usize = 124;
+const MAX_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ERROR_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_UPLOAD_METADATA_BYTES: usize = 64 * 1024;
+const MAX_UPLOAD_CHUNK_SIZE: usize = 64 * 1024 * 1024;
+const MAX_SESSION_URI_BYTES: usize = 8 * 1024;
 
 /// Selects the dedicated folder in a user's My Drive that rec_bag may manage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +125,21 @@ pub struct GoogleDriveMusicStore<T, P> {
     cache: Option<PlaybackCache>,
 }
 
+/// Runtime cache operations exposed for provider registries without requiring a
+/// concrete Google Drive store type.
+pub trait PlaybackCacheRuntime: Send + Sync {
+    fn cached_playback_path(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<std::path::PathBuf>, MusicStorageError>;
+    fn cache_for_playback<'a>(
+        &'a self,
+        object_id: &'a str,
+    ) -> BoxFuture<'a, Result<std::path::PathBuf, MusicStorageError>>;
+    fn set_offline_pinned(&self, object_id: &str, pinned: bool) -> Result<(), MusicStorageError>;
+    fn evict_playback_cache(&self) -> Result<(), MusicStorageError>;
+}
+
 impl<T, P> GoogleDriveMusicStore<T, P> {
     pub fn new(
         config: GoogleDriveStoreConfig,
@@ -123,10 +152,10 @@ impl<T, P> GoogleDriveMusicStore<T, P> {
                 "Google Drive folder ID cannot be empty",
             ));
         }
-        if config.upload_chunk_size == 0 {
+        if config.upload_chunk_size == 0 || config.upload_chunk_size > MAX_UPLOAD_CHUNK_SIZE {
             return Err(MusicStorageError::new(
                 MusicStorageErrorKind::InvalidData,
-                "upload chunk size cannot be zero",
+                format!("upload chunk size must be between 1 and {MAX_UPLOAD_CHUNK_SIZE} bytes"),
             ));
         }
         let cache = config.cache.clone().map(PlaybackCache::new).transpose()?;
@@ -213,8 +242,13 @@ impl<T: DriveHttpTransport, P: GoogleTokenProvider> GoogleDriveMusicStore<T, P> 
                         continue;
                     }
                     if error.is_retryable() && can_retry {
-                        futures_timer::Delay::new(response_retry_delay(&response).unwrap_or(delay))
-                            .await;
+                        let requested_delay = response_retry_delay(&response).unwrap_or(delay);
+                        futures_timer::Delay::new(jittered_retry_delay(
+                            requested_delay,
+                            self.config.retry.max_backoff,
+                            attempt,
+                        ))
+                        .await;
                         delay = delay.saturating_mul(2).min(self.config.retry.max_backoff);
                         continue;
                     }
@@ -223,7 +257,12 @@ impl<T: DriveHttpTransport, P: GoogleTokenProvider> GoogleDriveMusicStore<T, P> 
                 Ok(response) => return Ok(response),
                 Err(error) => {
                     if error.retryable && attempt + 1 < self.config.retry.max_attempts.max(1) {
-                        futures_timer::Delay::new(delay).await;
+                        futures_timer::Delay::new(jittered_retry_delay(
+                            delay,
+                            self.config.retry.max_backoff,
+                            attempt,
+                        ))
+                        .await;
                         delay = delay.saturating_mul(2).min(self.config.retry.max_backoff);
                         continue;
                     }
@@ -249,6 +288,33 @@ impl<T: DriveHttpTransport, P: GoogleTokenProvider> GoogleDriveMusicStore<T, P> 
             url_encode(FILE_FIELDS)
         );
         parse_json(self.execute(DriveHttpRequest::new("GET", url)).await?)
+    }
+
+    async fn find_by_operation_key(
+        &self,
+        operation_key: &str,
+    ) -> Result<Option<DriveFile>, MusicStorageError> {
+        let query = format!(
+            "'{}' in parents and trashed = false and appProperties has {{ key='{}' and value='{}' }}",
+            escape_drive_query(&self.config.folder.id),
+            APP_PROPERTY_OPERATION_KEY,
+            escape_drive_query(operation_key),
+        );
+        let url = format!(
+            "{}/files?corpora=user&spaces=drive&supportsAllDrives=false&includeItemsFromAllDrives=false&pageSize=2&q={}&fields={}",
+            self.config.api_base_url,
+            url_encode(&query),
+            url_encode(&format!("files({FILE_FIELDS})")),
+        );
+        let mut files: DriveFileList =
+            parse_json(self.execute(DriveHttpRequest::new("GET", url)).await?)?;
+        if files.files.len() > 1 {
+            return Err(MusicStorageError::new(
+                MusicStorageErrorKind::InvalidData,
+                "multiple Drive files share the same rec_bag operation key",
+            ));
+        }
+        Ok(files.files.pop())
     }
 
     async fn list_parent(
@@ -473,8 +539,17 @@ impl<T: DriveHttpTransport, P: GoogleTokenProvider> GoogleDriveMusicStore<T, P> 
     async fn upload_inner(
         &self,
         request: UploadRequest,
+        checkpoints: Option<&dyn DriveUploadCheckpointStore>,
     ) -> Result<StorageObject, MusicStorageError> {
         let source_size = fs::metadata(&request.source_path).map_err(io_error)?.len();
+        if request.idempotency_key.as_deref() == Some("") {
+            return Err(MusicStorageError::new(
+                MusicStorageErrorKind::InvalidData,
+                "upload idempotency key must not be empty",
+            ));
+        }
+        let upload_app_properties =
+            app_properties(&request.metadata, request.idempotency_key.as_deref())?;
         let expected_source_hash = request
             .expected_checksum
             .as_ref()
@@ -499,42 +574,132 @@ impl<T: DriveHttpTransport, P: GoogleTokenProvider> GoogleDriveMusicStore<T, P> 
                 ));
             }
         }
-        let name = file_name_from_path(&request.object_path)?;
-        let metadata = serde_json::json!({
-            "name": name,
-            "parents": [self.config.folder.id],
-            "mimeType": request.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_owned()),
-            "appProperties": app_properties(&request.metadata),
-        });
-        let init = DriveHttpRequest::new(
-            "POST",
-            format!(
-                "{}/files?uploadType=resumable&supportsAllDrives=false",
-                self.config.upload_base_url
-            ),
-        )
-        .header("Content-Type", "application/json")
-        .header("X-Upload-Content-Length", source_size.to_string())
-        .header(
-            "X-Upload-Content-Type",
-            request
-                .content_type
-                .clone()
-                .unwrap_or_else(|| "application/octet-stream".to_owned()),
-        )
-        .body(serde_json::to_vec(&metadata).expect("JSON metadata serializes"));
-        let init = self.execute(init).await?;
-        let session = init
-            .header("Location")
-            .ok_or_else(|| {
-                MusicStorageError::new(
-                    MusicStorageErrorKind::Provider,
-                    "resumable upload response omitted Location",
+        let source_sha256 = hash_file_as(&request.source_path, &HashAlgorithm::Sha256)?;
+        if let Some(operation_key) = request.idempotency_key.as_deref() {
+            if let Some(existing) = self.find_by_operation_key(operation_key).await? {
+                if let Some(checkpoints) = checkpoints {
+                    checkpoints.remove(operation_key).await?;
+                }
+                return Ok(self.storage_object(existing));
+            }
+        } else if checkpoints.is_some() {
+            return Err(MusicStorageError::new(
+                MusicStorageErrorKind::InvalidData,
+                "durable resumable upload requires an idempotency key",
+            ));
+        }
+
+        let operation_key = request.idempotency_key.as_deref();
+        let source_sha256_value = source_sha256.value().to_owned();
+        let mut checkpoint =
+            if let (Some(store), Some(operation_key)) = (checkpoints, operation_key) {
+                store.load(operation_key).await?
+            } else {
+                None
+            };
+        if let Some(saved) = checkpoint.as_ref() {
+            validate_session_uri(saved.session_uri())?;
+            if saved.operation_key != operation_key.expect("checkpoint requires operation key")
+                || saved.object_path != request.object_path
+                || saved.source_size != source_size
+                || saved.source_sha256 != source_sha256_value
+                || saved.acknowledged_bytes > source_size
+            {
+                return Err(MusicStorageError::new(
+                    MusicStorageErrorKind::InvalidData,
+                    "Drive upload checkpoint does not match the upload request",
+                ));
+            }
+        }
+
+        if let Some(saved) = checkpoint.as_mut() {
+            let response = self
+                .execute(
+                    DriveHttpRequest::new("PUT", saved.session_uri().to_owned())
+                        .header("Content-Length", "0")
+                        .header("Content-Range", format!("bytes */{source_size}")),
                 )
-            })?
-            .to_owned();
+                .await?;
+            if response.status == 308 {
+                saved.acknowledged_bytes = acknowledged_offset(&response, source_size)?;
+                checkpoints
+                    .expect("checkpoint store is present")
+                    .save(saved)
+                    .await?;
+            } else {
+                let object = self.finish_upload(&request, response)?;
+                checkpoints
+                    .expect("checkpoint store is present")
+                    .remove(operation_key.expect("checkpoint requires operation key"))
+                    .await?;
+                return Ok(object);
+            }
+        }
+
+        if checkpoint.is_none() {
+            let name = file_name_from_path(&request.object_path)?;
+            let metadata = serde_json::json!({
+                "name": name,
+                "parents": [self.config.folder.id],
+                "mimeType": request.content_type.clone().unwrap_or_else(|| "application/octet-stream".to_owned()),
+                "appProperties": upload_app_properties,
+            });
+            let init = DriveHttpRequest::new(
+                "POST",
+                format!(
+                    "{}/files?uploadType=resumable&supportsAllDrives=false",
+                    self.config.upload_base_url
+                ),
+            )
+            .header("Content-Type", "application/json")
+            .header("X-Upload-Content-Length", source_size.to_string())
+            .header(
+                "X-Upload-Content-Type",
+                request
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_owned()),
+            );
+            let metadata_body = serde_json::to_vec(&metadata).map_err(|error| {
+                MusicStorageError::new(MusicStorageErrorKind::InvalidData, error.to_string())
+            })?;
+            if metadata_body.len() > MAX_UPLOAD_METADATA_BYTES {
+                return Err(MusicStorageError::new(
+                    MusicStorageErrorKind::InvalidData,
+                    "Drive upload metadata exceeds the size limit",
+                ));
+            }
+            let init = init.body(metadata_body);
+            let init = self.execute(init).await?;
+            let session = init
+                .header("Location")
+                .ok_or_else(|| {
+                    MusicStorageError::new(
+                        MusicStorageErrorKind::Provider,
+                        "resumable upload response omitted Location",
+                    )
+                })?
+                .to_owned();
+            validate_session_uri(&session)?;
+            checkpoint = Some(DriveUploadCheckpoint::new(
+                operation_key.unwrap_or_default().to_owned(),
+                request.object_path.clone(),
+                source_size,
+                source_sha256_value,
+                session,
+            ));
+            if let Some(store) = checkpoints {
+                store
+                    .save(checkpoint.as_ref().expect("checkpoint was created"))
+                    .await?;
+            }
+        }
+
+        let checkpoint = checkpoint.expect("upload session checkpoint was created");
+        let session = checkpoint.session_uri().to_owned();
+        let mut offset = checkpoint.acknowledged_bytes;
         let mut file = File::open(&request.source_path).map_err(io_error)?;
-        let mut offset = 0_u64;
+        file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
         let mut buffer = vec![0_u8; self.config.upload_chunk_size];
         loop {
             let read = file.read(&mut buffer).map_err(io_error)?;
@@ -556,32 +721,18 @@ impl<T: DriveHttpTransport, P: GoogleTokenProvider> GoogleDriveMusicStore<T, P> 
                 )
                 .await?;
             if response.status == 308 {
-                let acknowledged = response
-                    .header("Range")
-                    .and_then(range_end)
-                    .map(|end| end + 1)
-                    .unwrap_or(0);
-                if acknowledged < offset || acknowledged > source_size {
-                    return Err(MusicStorageError::new(
-                        MusicStorageErrorKind::Provider,
-                        "Drive returned invalid resumable upload range",
-                    ));
+                offset = acknowledged_offset(&response, source_size)?;
+                file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+                if let Some(store) = checkpoints {
+                    let mut saved = checkpoint.clone();
+                    saved.acknowledged_bytes = offset;
+                    store.save(&saved).await?;
                 }
-                offset = acknowledged;
-                file = File::open(&request.source_path).map_err(io_error)?;
-                skip_file(&mut file, offset)?;
                 continue;
             }
-            let uploaded: DriveFile = parse_json(response)?;
-            let object = self.storage_object(uploaded);
-            for remote_hash in &object.hashes {
-                let source_hash = hash_file_as(&request.source_path, remote_hash.algorithm())?;
-                if &source_hash != remote_hash {
-                    return Err(MusicStorageError::new(
-                        MusicStorageErrorKind::ChecksumMismatch,
-                        "Drive reported a hash that does not match the uploaded source",
-                    ));
-                }
+            let object = self.finish_upload(&request, response)?;
+            if let (Some(store), Some(operation_key)) = (checkpoints, operation_key) {
+                store.remove(operation_key).await?;
             }
             return Ok(object);
         }
@@ -589,6 +740,35 @@ impl<T: DriveHttpTransport, P: GoogleTokenProvider> GoogleDriveMusicStore<T, P> 
             MusicStorageErrorKind::Provider,
             "resumable upload ended before Drive confirmed completion",
         ))
+    }
+
+    fn finish_upload(
+        &self,
+        request: &UploadRequest,
+        response: DriveHttpResponse,
+    ) -> Result<StorageObject, MusicStorageError> {
+        let uploaded: DriveFile = parse_json(response)?;
+        let object = self.storage_object(uploaded);
+        for remote_hash in &object.hashes {
+            let source_hash = hash_file_as(&request.source_path, remote_hash.algorithm())?;
+            if &source_hash != remote_hash {
+                return Err(MusicStorageError::new(
+                    MusicStorageErrorKind::ChecksumMismatch,
+                    "Drive reported a hash that does not match the uploaded source",
+                ));
+            }
+        }
+        Ok(object)
+    }
+
+    /// Uploads with durable resumable-session persistence. An idempotency key is
+    /// required so completed uploads can be reconciled safely after uncertain errors.
+    pub async fn upload_with_checkpoints(
+        &self,
+        request: UploadRequest,
+        checkpoints: &dyn DriveUploadCheckpointStore,
+    ) -> Result<StorageObject, MusicStorageError> {
+        self.upload_inner(request, Some(checkpoints)).await
     }
 
     async fn download_inner(
@@ -760,6 +940,32 @@ impl<T: DriveHttpTransport, P: GoogleTokenProvider> GoogleDriveMusicStore<T, P> 
     }
 }
 
+impl<T: DriveHttpTransport + Send + Sync, P: GoogleTokenProvider + Send + Sync> PlaybackCacheRuntime
+    for GoogleDriveMusicStore<T, P>
+{
+    fn cached_playback_path(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<std::path::PathBuf>, MusicStorageError> {
+        GoogleDriveMusicStore::cached_playback_path(self, object_id)
+    }
+
+    fn cache_for_playback<'a>(
+        &'a self,
+        object_id: &'a str,
+    ) -> BoxFuture<'a, Result<std::path::PathBuf, MusicStorageError>> {
+        Box::pin(async move { GoogleDriveMusicStore::cache_for_playback(self, object_id).await })
+    }
+
+    fn set_offline_pinned(&self, object_id: &str, pinned: bool) -> Result<(), MusicStorageError> {
+        GoogleDriveMusicStore::set_offline_pinned(self, object_id, pinned)
+    }
+
+    fn evict_playback_cache(&self) -> Result<(), MusicStorageError> {
+        GoogleDriveMusicStore::evict_playback_cache(self)
+    }
+}
+
 impl<T: DriveHttpTransport + Send + Sync, P: GoogleTokenProvider + Send + Sync> MusicAssetStore
     for GoogleDriveMusicStore<T, P>
 {
@@ -820,6 +1026,7 @@ impl<T: DriveHttpTransport + Send + Sync, P: GoogleTokenProvider + Send + Sync> 
         request: StorageVersionRequest,
     ) -> BoxFuture<'_, Result<StorageVersionPage, MusicStorageError>> {
         Box::pin(async move {
+            let current_revision_id = self.file(&request.object_id).await?.head_revision_id;
             let mut url = format!("{}/files/{}/revisions?pageSize={}&fields={}", self.config.api_base_url, url_encode(&request.object_id), request.page_size.unwrap_or(100).clamp(1, 1000), url_encode("nextPageToken,revisions(id,modifiedTime,size,md5Checksum,sha1Checksum,sha256Checksum,keepForever)"));
             if let Some(cursor) = request.page_cursor {
                 url.push_str("&pageToken=");
@@ -832,13 +1039,14 @@ impl<T: DriveHttpTransport + Send + Sync, P: GoogleTokenProvider + Send + Sync> 
                 .into_iter()
                 .map(|revision| {
                     let hashes = revision.hashes();
+                    let is_current = current_revision_id.as_deref() == Some(revision.id.as_str());
                     StorageObjectVersion {
                         object_id: request.object_id.clone(),
                         version_id: revision.id,
                         modified_at: revision.modified_time,
                         size_bytes: revision.size,
                         hashes,
-                        is_current: false,
+                        is_current,
                     }
                 })
                 .collect();
@@ -853,7 +1061,7 @@ impl<T: DriveHttpTransport + Send + Sync, P: GoogleTokenProvider + Send + Sync> 
         &self,
         request: UploadRequest,
     ) -> BoxFuture<'_, Result<StorageObject, MusicStorageError>> {
-        Box::pin(async move { self.upload_inner(request).await })
+        Box::pin(async move { self.upload_inner(request, None).await })
     }
     fn download(
         &self,
@@ -881,7 +1089,7 @@ fn drive_capabilities() -> StorageCapabilities {
     }
 }
 
-const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,version,etag,md5Checksum,sha1Checksum,sha256Checksum,trashed,appProperties,capabilities(canDownload),parents";
+const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,version,headRevisionId,etag,md5Checksum,sha1Checksum,sha256Checksum,trashed,appProperties,capabilities(canDownload),parents";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -918,6 +1126,7 @@ struct DriveFile {
     size: Option<u64>,
     modified_time: Option<DateTime<Utc>>,
     version: Option<String>,
+    head_revision_id: Option<String>,
     etag: Option<String>,
     md5_checksum: Option<String>,
     sha1_checksum: Option<String>,
@@ -989,6 +1198,7 @@ struct DriveFileCursor {
     size: Option<u64>,
     modified_time: Option<DateTime<Utc>>,
     version: Option<String>,
+    head_revision_id: Option<String>,
     etag: Option<String>,
     md5_checksum: Option<String>,
     sha1_checksum: Option<String>,
@@ -1019,6 +1229,7 @@ impl From<DriveFile> for DriveFileCursor {
             size: file.size,
             modified_time: file.modified_time,
             version: file.version,
+            head_revision_id: file.head_revision_id,
             etag: file.etag,
             md5_checksum: file.md5_checksum,
             sha1_checksum: file.sha1_checksum,
@@ -1039,6 +1250,7 @@ impl From<DriveFileCursor> for DriveFile {
             size: file.size,
             modified_time: file.modified_time,
             version: file.version,
+            head_revision_id: file.head_revision_id,
             etag: file.etag,
             md5_checksum: file.md5_checksum,
             sha1_checksum: file.sha1_checksum,
@@ -1070,6 +1282,12 @@ where
 fn parse_json<T: for<'de> Deserialize<'de>>(
     response: DriveHttpResponse,
 ) -> Result<T, MusicStorageError> {
+    if response.body.len() > MAX_JSON_RESPONSE_BYTES {
+        return Err(MusicStorageError::new(
+            MusicStorageErrorKind::InvalidData,
+            "Drive JSON response exceeds the size limit",
+        ));
+    }
     serde_json::from_slice(&response.body).map_err(|error| {
         MusicStorageError::new(
             MusicStorageErrorKind::InvalidData,
@@ -1077,13 +1295,16 @@ fn parse_json<T: for<'de> Deserialize<'de>>(
         )
     })
 }
-fn app_properties(metadata: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+fn app_properties(
+    metadata: &BTreeMap<String, String>,
+    operation_key: Option<&str>,
+) -> Result<BTreeMap<String, String>, MusicStorageError> {
     let mut values = BTreeMap::new();
     for (key, target) in [
-        ("rec_bag_track_id", "rec_bag_track_id"),
-        ("track_id", "rec_bag_track_id"),
-        ("rec_bag_asset_id", "rec_bag_asset_id"),
-        ("asset_id", "rec_bag_asset_id"),
+        (APP_PROPERTY_TRACK_ID, APP_PROPERTY_TRACK_ID),
+        ("track_id", APP_PROPERTY_TRACK_ID),
+        (APP_PROPERTY_ASSET_ID, APP_PROPERTY_ASSET_ID),
+        ("asset_id", APP_PROPERTY_ASSET_ID),
     ] {
         if let Some(value) = metadata.get(key) {
             values
@@ -1091,7 +1312,27 @@ fn app_properties(metadata: &BTreeMap<String, String>) -> BTreeMap<String, Strin
                 .or_insert_with(|| value.clone());
         }
     }
-    values
+    if let Some(operation_key) = operation_key {
+        values.insert(
+            APP_PROPERTY_OPERATION_KEY.to_owned(),
+            operation_key.to_owned(),
+        );
+    }
+    if values.len() > MAX_APP_PROPERTIES {
+        return Err(MusicStorageError::new(
+            MusicStorageErrorKind::InvalidData,
+            "Drive appProperties exceed the property-count limit",
+        ));
+    }
+    for (key, value) in &values {
+        if key.len().saturating_add(value.len()) > MAX_APP_PROPERTY_BYTES {
+            return Err(MusicStorageError::new(
+                MusicStorageErrorKind::InvalidData,
+                format!("Drive appProperty {key} exceeds the {MAX_APP_PROPERTY_BYTES}-byte limit"),
+            ));
+        }
+    }
+    Ok(values)
 }
 fn file_name_from_path(path: &str) -> Result<String, MusicStorageError> {
     let path = path.replace('\\', "/");
@@ -1129,13 +1370,10 @@ fn preferred_hash(object: &StorageObject) -> Option<&ContentHash> {
         })
 }
 fn hash_file_as(path: &Path, algorithm: &HashAlgorithm) -> Result<ContentHash, MusicStorageError> {
-    let mut file = File::open(path).map_err(io_error)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(io_error)?;
     let value = match algorithm {
-        HashAlgorithm::Sha256 => format!("{:x}", Sha256::digest(&bytes)),
-        HashAlgorithm::Sha1 => format!("{:x}", Sha1::digest(&bytes)),
-        HashAlgorithm::Md5 => format!("{:x}", Md5::digest(&bytes)),
+        HashAlgorithm::Sha256 => digest_file::<Sha256>(path)?,
+        HashAlgorithm::Sha1 => digest_file::<Sha1>(path)?,
+        HashAlgorithm::Md5 => digest_file::<Md5>(path)?,
         HashAlgorithm::Other(name) => {
             return Err(MusicStorageError::new(
                 MusicStorageErrorKind::InvalidData,
@@ -1147,6 +1385,23 @@ fn hash_file_as(path: &Path, algorithm: &HashAlgorithm) -> Result<ContentHash, M
         MusicStorageError::new(MusicStorageErrorKind::InvalidData, error.to_string())
     })
 }
+
+fn digest_file<D: Digest + Default>(path: &Path) -> Result<String, MusicStorageError> {
+    let file = File::open(path).map_err(io_error)?;
+    let mut reader = BufReader::new(file);
+    let mut digest = D::default();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let output = digest.finalize();
+    Ok(output.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 fn token_error(error: GoogleTokenError) -> MusicStorageError {
     MusicStorageError::new(
         if error.retryable {
@@ -1164,23 +1419,7 @@ fn sync_directory(path: &Path) -> Result<(), MusicStorageError> {
         .map_err(io_error)?;
     Ok(())
 }
-fn skip_file(file: &mut File, mut bytes: u64) -> Result<(), MusicStorageError> {
-    let mut buffer = [0_u8; 8192];
-    while bytes > 0 {
-        let buffer_length = buffer.len() as u64;
-        let read = file
-            .read(&mut buffer[..bytes.min(buffer_length) as usize])
-            .map_err(io_error)?;
-        if read == 0 {
-            return Err(MusicStorageError::new(
-                MusicStorageErrorKind::Io,
-                "could not resume upload beyond source length",
-            ));
-        }
-        bytes -= read as u64;
-    }
-    Ok(())
-}
+
 fn io_error(error: std::io::Error) -> MusicStorageError {
     MusicStorageError::new(MusicStorageErrorKind::Io, error.to_string())
 }
@@ -1199,13 +1438,73 @@ fn url_encode(value: &str) -> String {
 fn range_end(value: &str) -> Option<u64> {
     value.rsplit('-').next()?.parse().ok()
 }
-fn response_retry_delay(response: &DriveHttpResponse) -> Option<Duration> {
-    response
-        .header("Retry-After")?
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+
+fn acknowledged_offset(
+    response: &DriveHttpResponse,
+    source_size: u64,
+) -> Result<u64, MusicStorageError> {
+    let acknowledged = response
+        .header("Range")
+        .and_then(range_end)
+        .map(|end| end + 1)
+        .unwrap_or(0);
+    if acknowledged > source_size {
+        return Err(MusicStorageError::new(
+            MusicStorageErrorKind::Provider,
+            "Drive returned invalid resumable upload range",
+        ));
+    }
+    Ok(acknowledged)
 }
+
+fn escape_drive_query(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+fn response_retry_delay(response: &DriveHttpResponse) -> Option<Duration> {
+    let value = response.header("Retry-After")?;
+    if value.len() > 128 {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let retry_at = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    (retry_at > Utc::now()).then(|| (retry_at - Utc::now()).to_std().unwrap_or_default())
+}
+
+fn jittered_retry_delay(requested: Duration, cap: Duration, attempt: u8) -> Duration {
+    let bounded = requested.min(cap);
+    if bounded.is_zero() || bounded >= cap {
+        return bounded;
+    }
+    let window = bounded / 4;
+    let window_nanos = window.as_nanos().min(u128::from(u64::MAX)) as u64;
+    if window_nanos == 0 {
+        return bounded;
+    }
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        ^ u64::from(attempt).wrapping_mul(0x9E37_79B9);
+    let jitter_divisor = window_nanos.saturating_add(1);
+    bounded
+        .saturating_add(Duration::from_nanos(seed % jitter_divisor))
+        .min(cap)
+}
+
+fn validate_session_uri(session: &str) -> Result<(), MusicStorageError> {
+    if !session.starts_with("https://") || session.len() > MAX_SESSION_URI_BYTES {
+        return Err(MusicStorageError::new(
+            MusicStorageErrorKind::InvalidData,
+            "Drive returned an invalid resumable session URI",
+        ));
+    }
+    Ok(())
+}
+
 fn drive_error(response: &DriveHttpResponse) -> MusicStorageError {
     #[derive(Deserialize)]
     struct Envelope {
@@ -1215,15 +1514,32 @@ fn drive_error(response: &DriveHttpResponse) -> MusicStorageError {
     struct DriveError {
         message: Option<String>,
         status: Option<String>,
+        #[serde(default)]
+        errors: Vec<DriveErrorDetail>,
     }
-    let parsed: Option<Envelope> = serde_json::from_slice(&response.body).ok();
+    #[derive(Deserialize)]
+    struct DriveErrorDetail {
+        reason: Option<String>,
+    }
+    let parsed: Option<Envelope> = (response.body.len() <= MAX_ERROR_RESPONSE_BYTES)
+        .then(|| serde_json::from_slice(&response.body).ok())
+        .flatten();
     let message = parsed
         .as_ref()
         .and_then(|value| value.error.as_ref())
         .and_then(|value| value.message.clone())
         .unwrap_or_else(|| format!("Google Drive returned HTTP {}", response.status));
+    let reason = parsed
+        .as_ref()
+        .and_then(|value| value.error.as_ref())
+        .and_then(|error| error.errors.iter().find_map(|detail| detail.reason.clone()));
+    let rate_limited = matches!(
+        reason.as_deref(),
+        Some("rateLimitExceeded" | "userRateLimitExceeded")
+    );
     let kind = match response.status {
         401 => MusicStorageErrorKind::AuthenticationRequired,
+        403 if rate_limited => MusicStorageErrorKind::RateLimited,
         403 => MusicStorageErrorKind::PermissionDenied,
         404 => MusicStorageErrorKind::NotFound,
         429 => MusicStorageErrorKind::RateLimited,
@@ -1231,7 +1547,8 @@ fn drive_error(response: &DriveHttpResponse) -> MusicStorageError {
         _ => MusicStorageErrorKind::Provider,
     };
     let mut error = MusicStorageError::new(kind, message);
-    error.provider_code = parsed.and_then(|value| value.error.and_then(|value| value.status));
+    error.provider_code =
+        reason.or_else(|| parsed.and_then(|value| value.error.and_then(|value| value.status)));
     error.retry_after_seconds = response_retry_delay(response).map(|delay| delay.as_secs());
     error
 }

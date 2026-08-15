@@ -1,10 +1,18 @@
 use dioxus::prelude::*;
+
+#[cfg(feature = "desktop")]
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use state::{use_app_state, use_app_state_provider, use_storage_init};
+#[cfg(feature = "desktop")]
+use services::integration::{DesktopIntegration, DesktopStartup};
+#[cfg(feature = "desktop")]
+use state::integration::IntegrationError;
+use state::{integration::use_integration_state_provider, use_app_state, use_app_state_provider};
 use ui::{BeatGrid, DeckInfo, FrequencyWaveform, PlaybackBar, BASE_CSS};
-use views::{DjView, DoctorView, Library};
+use views::{DjView, DoctorView, Library, MusicManagement};
 
+mod services;
 mod state;
 mod views;
 
@@ -18,22 +26,65 @@ enum Route {
         Library {},
         #[route("/doctor")]
         DoctorView {},
+        #[route("/music-management")]
+        MusicManagement {},
         #[route("/:..segments")]
         NotFound { segments: Vec<String> },
 }
 
 const MAIN_CSS: Asset = asset!("/assets/main.css");
 
+#[cfg(feature = "desktop")]
+static INTEGRATION_STARTUP: OnceLock<Result<DesktopStartup, IntegrationError>> = OnceLock::new();
+
+/// The desktop process is the only runtime permitted to acquire and mutate the local profile.
+/// `dx serve --platform desktop` also starts a fullstack server sidecar for server functions;
+/// letting that sidecar acquire the lease first would make the native UI block itself.
+#[cfg(feature = "desktop")]
+fn main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create the startup runtime");
+    let startup = runtime.block_on(DesktopIntegration::open());
+    let _ = INTEGRATION_STARTUP.set(startup);
+    dioxus::launch(App);
+    if let Some(Ok(DesktopStartup::Ready(integration))) = INTEGRATION_STARTUP.get() {
+        let _ = runtime.block_on(integration.shutdown());
+    }
+}
+
+/// The fullstack server only hosts server functions and assets. It must never own a desktop
+/// profile, because the companion native process is the sole catalog manager.
+#[cfg(not(feature = "desktop"))]
 fn main() {
     dioxus::launch(App);
 }
 
 #[component]
 fn App() -> Element {
-    // Provide global app state to all components
     use_app_state_provider();
-    // Initialize SQLite storage and auto-save
-    use_storage_init();
+    #[cfg(feature = "desktop")]
+    let startup = Some(INTEGRATION_STARTUP.get().cloned().unwrap_or_else(|| {
+        Err(IntegrationError {
+            request_id: None,
+            slice: None,
+            message: "The desktop integration runtime was not initialized".into(),
+            retryable: false,
+        })
+    }));
+    #[cfg(not(feature = "desktop"))]
+    let startup = None;
+    use_integration_state_provider(startup);
+    let integration = state::integration::use_integration_state();
+    use_drop(move || {
+        if let Some(runtime) = integration.runtime() {
+            runtime.begin_shutdown();
+            spawn(async move {
+                let _ = runtime.shutdown().await;
+            });
+        }
+    });
 
     let app_state = use_app_state();
     let theme = app_state.get_theme();
@@ -66,6 +117,7 @@ fn DesktopNavbar() -> Element {
     let is_dj = matches!(route, Route::DjView {});
     let is_library = matches!(route, Route::Library {});
     let is_doctor = matches!(route, Route::DoctorView {});
+    let is_music_management = matches!(route, Route::MusicManagement {});
 
     // Get issue count for doctor badge
     let issue_count = app_state.diagnoses.read().len();
@@ -120,6 +172,12 @@ fn DesktopNavbar() -> Element {
                     } else if issue_count > 0 {
                         span { class: "nav-tab-badge info", "{issue_count}" }
                     }
+                }
+                Link {
+                    to: Route::MusicManagement {},
+                    class: if is_music_management { "nav-tab active" } else { "nav-tab" },
+                    span { class: "nav-tab-icon", "☁️" }
+                    span { class: "nav-tab-label", "Music management" }
                 }
             }
             div { class: "nav-spacer" }

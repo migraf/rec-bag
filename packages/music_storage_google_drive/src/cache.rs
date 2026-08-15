@@ -5,7 +5,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -236,13 +236,10 @@ fn cache_key(object_id: &str) -> String {
 }
 
 fn hash_file(path: &Path, algorithm: &HashAlgorithm) -> Result<ContentHash, MusicStorageError> {
-    let mut file = File::open(path).map_err(io_error)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(io_error)?;
     let value = match algorithm {
-        HashAlgorithm::Sha256 => format!("{:x}", Sha256::digest(&bytes)),
-        HashAlgorithm::Sha1 => format!("{:x}", Sha1::digest(&bytes)),
-        HashAlgorithm::Md5 => format!("{:x}", Md5::digest(&bytes)),
+        HashAlgorithm::Sha256 => digest_file::<Sha256>(path)?,
+        HashAlgorithm::Sha1 => digest_file::<Sha1>(path)?,
+        HashAlgorithm::Md5 => digest_file::<Md5>(path)?,
         HashAlgorithm::Other(name) => {
             return Err(MusicStorageError::new(
                 MusicStorageErrorKind::InvalidData,
@@ -253,6 +250,22 @@ fn hash_file(path: &Path, algorithm: &HashAlgorithm) -> Result<ContentHash, Musi
     ContentHash::new(algorithm.clone(), value).map_err(|error| {
         MusicStorageError::new(MusicStorageErrorKind::InvalidData, error.to_string())
     })
+}
+
+fn digest_file<D: Digest + Default>(path: &Path) -> Result<String, MusicStorageError> {
+    let file = File::open(path).map_err(io_error)?;
+    let mut reader = BufReader::new(file);
+    let mut digest = D::default();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let output = digest.finalize();
+    Ok(output.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn sync_directory(path: &Path) -> Result<(), MusicStorageError> {

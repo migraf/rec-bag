@@ -1,75 +1,74 @@
-# Development
+# rec_bag
 
-Your new workspace contains a member crate for each of the web, desktop and mobile platforms, a `ui` crate for shared components and a `api` crate for shared backend logic:
+rec_bag is a Dioxus 0.7 desktop music-catalog and storage manager. It combines local folders and a SoundCloud catalog with one authoritative local or Google Drive primary and optional local/Drive backups.
 
-```
-your_project/
-├─ README.md
-├─ Cargo.toml
-└─ packages/
-   ├─ web/
-   │  └─ ... # Web specific UI/logic
-   ├─ desktop/
-   │  └─ ... # Desktop specific UI/logic
-   ├─ mobile/
-   │  └─ ... # Mobile specific UI/logic
-   ├─ api/
-   │  └─ ... # All shared server logic
-   └─  ui/
-      └─ ... # Component shared between multiple platforms
-```
+## Current production status
 
-## Platform crates
+Stage 4 runtime assembly is present:
 
-Each platform crate contains the entry point for the platform, and any assets, components and dependencies that are specific to that platform. For example, the desktop crate in the workspace looks something like this:
+- startup acquires a one-active-manager lease before opening or migrating the catalog;
+- a 10-second ownership heartbeat and the background scheduler start with the desktop runtime;
+- durable jobs, SoundCloud sync, backup planning, verification, inventories, and recovery snapshots run on configured cadences;
+- recovery supports snapshot discovery, integrity/secret checks, dry-run validation, exact transactional replacement, exact pre-restore rollback, and interrupted-restore reconciliation;
+- a live owner blocks a second manager unless the user explicitly confirms takeover, and portable catalog authority requires an explicit confirmed handoff.
 
-```
-desktop/ # The desktop crate contains all platform specific UI, logic and dependencies for the desktop app
-├─ assets/ # Assets used by the desktop app - Any platform specific assets should go in this folder
-├─ src/
-│  ├─ main.rs # The entrypoint for the desktop app. It also defines the routes for the desktop platform
-│  ├─ views/ # The views each route will render in the desktop version of the app
-│  │  ├─ mod.rs # Defines the module for the views route and re-exports the components for each route
-│  │  ├─ blog.rs # The component that will render at the /blog/:id route
-│  │  ├─ home.rs # The component that will render at the / route
-├─ Cargo.toml # The desktop crate's Cargo.toml - This should include all desktop specific dependencies
+SoundCloud and Google live credential checks have **not** been run or claimed by this documentation. Keep an independent copy of the catalog and music assets; concurrent multi-device writers remain unsupported.
+
+## Build and test
+
+Requirements: stable Rust, Dioxus CLI 0.7.10-compatible tooling, desktop WebView dependencies, audio development libraries, and an available OS credential service.
+
+```sh
+cargo check --workspace
+cargo test --workspace
+dx build --release --desktop -p desktop --features desktop --locked
 ```
 
-When you start developing with the workspace setup each of the platform crates will look almost identical. The UI starts out exactly the same on all platforms. However, as you continue developing your application, this setup makes it easy to let the views for each platform change independently.
+Build the fullstack server that hosts the SoundCloud broker endpoints:
 
-## Shared UI crate
-
-The workspace contains a `ui` crate with components that are shared between multiple platforms. You should put any UI elements you want to use in multiple platforms in this crate. You can also put some shared client side logic in this crate, but be careful to not pull in platform specific dependencies. The `ui` crate starts out something like this:
-
-```
-ui/
-├─ src/
-│  ├─ lib.rs # The entrypoint for the ui crate
-│  ├─ hero.rs # The Hero component that will be used in every platform
-│  ├─ echo.rs # The shared echo component that communicates with the server
-│  ├─ navbar.rs # The Navbar component that will be used in the layout of every platform's router
+```sh
+dx build --release --server -p web --features server --locked
 ```
 
-## Shared backend logic
+The `api` crate is a library of Dioxus server functions, not a standalone binary. Deploy it through a fullstack host such as the `web` package. The repository does not contain a complete production reverse-proxy or service manifest.
 
-The workspace contains a `api` crate with shared backend logic. This crate defines all of the shared server functions for all platforms. Server functions are async functions that expose a public API on the server. They can be called like a normal async function from the client. When you run `dx serve`, all of the server functions will be collected in the server build and hosted on a public API for the client to call. The `api` crate starts out something like this:
+## Configuration overview
 
-```
-api/
-├─ src/
-│  ├─ lib.rs # Exports a server function that echos the input string
-```
+Desktop:
 
-### Serving Your App
-
-Navigate to the platform crate of your choice:
-```bash
-cd web
+```dotenv
+REC_BAG_DATA_DIR=/absolute/writable/profile-directory
+REC_BAG_SOUNDCLOUD_CLIENT_ID=public-client-id
+REC_BAG_SOUNDCLOUD_REDIRECT_URI=http://127.0.0.1:17841/oauth/soundcloud
+REC_BAG_GOOGLE_CLIENT_ID=installed-app-client-id
+REC_BAG_GOOGLE_REDIRECT_URI=http://127.0.0.1:17842/oauth/google
 ```
 
-and serve:
+SoundCloud broker:
 
-```bash
-dx serve
+```dotenv
+SOUNDCLOUD_CLIENT_ID=server-side-client-id
+SOUNDCLOUD_KEY=server-side-client-secret
+SOUNDCLOUD_ALLOWED_REDIRECT_URIS=http://127.0.0.1:17841/oauth/soundcloud
 ```
 
+Use a secret manager for server credentials. Provider user tokens belong in the desktop OS keyring, never in `.env`, SQLite, logs, support bundles, or snapshots. Google setup creates a dedicated My Drive folder named `rec_bag Music` under the `drive.file` grant.
+
+## Documentation
+
+- [Production setup](docs/production-setup.md) — desktop/server builds, broker environment, redirects, proxy/WAF, Google OAuth, keyring, and release checks.
+- [Storage and operations](docs/storage-and-operations.md) — local/Drive primary and backups, migration, schedules, snapshots, recovery, and ownership takeover.
+- [Troubleshooting, data, and privacy](docs/troubleshooting-and-privacy.md) — failure diagnosis, data locations, network flows, retention, and privacy implications.
+- [Provider compliance](docs/provider-compliance.md) — SoundCloud and Google policy checklists, offline validation, publication gates, and clearly marked live tests.
+- Public-page templates: [Privacy Policy](docs/privacy-policy.md), [Terms of Service](docs/terms-of-service.md), [Data Deletion](docs/data-deletion.md), and [Support](docs/support.md). These contain required placeholders and are not claimed as deployed or legally approved.
+
+## Safety invariants
+
+- SoundCloud is a catalog source; rec_bag does not archive SoundCloud playback transcodes.
+- Exactly zero or one storage is active primary. Backups never become authoritative automatically.
+- A primary change must inventory, copy, verify, snapshot, confirm, and atomically switch roles. The old primary remains a backup by default.
+- External primary changes wait for review before replication. Primary deletion does not delete backup copies.
+- Google Drive access uses `drive.file`, My Drive only, and a dedicated app-created `rec_bag Music` folder subtree.
+- SHA-256 is the canonical content checksum. Filename/title similarity alone never verifies a match.
+- Forgetting provider data deletes current provider-derived source/storage rows and current snapshot records while preserving canonical owned assets and never deleting remote provider files.
+- Cleanup requires explicit approval; defaults retain 30 days and at least three recent versions.

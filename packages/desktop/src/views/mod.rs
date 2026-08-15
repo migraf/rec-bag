@@ -8,3 +8,6 @@ pub use doctor::DoctorView;
 
 mod library;
 pub use library::Library;
+
+mod music_management;
+pub use music_management::MusicManagement;

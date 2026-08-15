@@ -24,6 +24,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const HISTORY_DIRECTORY: &str = ".rec_bag_history";
+const OPERATIONS_DIRECTORY: &str = ".rec_bag_operations";
 const TEMPORARY_PREFIX: &str = ".rec_bag-tmp-";
 const COPY_BUFFER_SIZE: usize = 128 * 1024;
 const LOCAL_CHANGE_CURSOR_VERSION: u8 = 1;
@@ -471,6 +472,15 @@ impl LocalMusicStorage {
             .operation_lock
             .lock()
             .expect("local storage operation lock poisoned");
+        self.copy_to_destination_locked(source, destination, retain_previous)
+    }
+
+    fn copy_to_destination_locked(
+        &self,
+        source: &Path,
+        destination: &Path,
+        retain_previous: bool,
+    ) -> Result<(), MusicStorageError> {
         self.ensure_root_for_write()?;
         let parent = destination.parent().ok_or_else(|| {
             storage_error(
@@ -494,6 +504,82 @@ impl LocalMusicStorage {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+
+    fn upload_idempotently(
+        &self,
+        request: &UploadRequest,
+        destination: &Path,
+        idempotency_key: &str,
+    ) -> Result<StorageObject, MusicStorageError> {
+        if idempotency_key.is_empty() {
+            return Err(storage_error(
+                MusicStorageErrorKind::InvalidData,
+                "upload idempotency key must not be empty",
+            ));
+        }
+        let _guard = self
+            .operation_lock
+            .lock()
+            .expect("local storage operation lock poisoned");
+        self.ensure_root_for_write()?;
+        let source_hash = sha256_file(&request.source_path)?;
+        let source_size = fs::metadata(&request.source_path)
+            .map_err(map_io_error)?
+            .len();
+        let operation_path = self.operation_path(idempotency_key)?;
+        if let Some(mut operation) = read_local_operation(&operation_path)? {
+            if operation.object_path != request.object_path
+                || operation.source_size != source_size
+                || operation.source_hash != source_hash
+            {
+                return Err(storage_error(
+                    MusicStorageErrorKind::InvalidData,
+                    "upload idempotency key was reused for different content or destination",
+                ));
+            }
+            if let Some(result) = operation.result {
+                return Ok(result);
+            }
+            if destination.is_file() && sha256_file(destination)? == source_hash {
+                let result = self.storage_object(&request.object_path, true)?;
+                operation.result = Some(result.clone());
+                write_local_operation(&operation_path, &operation)?;
+                return Ok(result);
+            }
+        } else {
+            write_local_operation(
+                &operation_path,
+                &LocalUploadOperation {
+                    version: 1,
+                    object_path: request.object_path.clone(),
+                    source_size,
+                    source_hash: source_hash.clone(),
+                    result: None,
+                },
+            )?;
+        }
+
+        self.copy_to_destination_locked(&request.source_path, destination, true)?;
+        let result = self.storage_object(&request.object_path, true)?;
+        write_local_operation(
+            &operation_path,
+            &LocalUploadOperation {
+                version: 1,
+                object_path: request.object_path.clone(),
+                source_size,
+                source_hash,
+                result: Some(result.clone()),
+            },
+        )?;
+        Ok(result)
+    }
+
+    fn operation_path(&self, idempotency_key: &str) -> Result<PathBuf, MusicStorageError> {
+        let directory = self.root.join(OPERATIONS_DIRECTORY);
+        fs::create_dir_all(&directory).map_err(map_io_error)?;
+        let digest = Sha256::digest(idempotency_key.as_bytes());
+        Ok(directory.join(format!("{digest:x}.json")))
     }
 
     fn retain_previous(&self, destination: &Path) -> Result<(), MusicStorageError> {
@@ -531,7 +617,7 @@ impl LocalMusicStorage {
                     "inventory path escaped storage root",
                 )
             })?;
-            if relative.starts_with(HISTORY_DIRECTORY) || !is_recognized_audio_path(&path) {
+            if is_provider_internal_path(relative) || !is_recognized_audio_path(&path) {
                 continue;
             }
             if let Some(prefix) = &prefix {
@@ -792,8 +878,12 @@ impl MusicAssetStore for LocalMusicStorage {
                 }
             }
             let destination = self.object_path(&request.object_path)?;
-            self.copy_to_destination(&request.source_path, &destination, true)?;
-            self.storage_object(&request.object_path, true)
+            if let Some(idempotency_key) = request.idempotency_key.as_deref() {
+                self.upload_idempotently(&request, &destination, idempotency_key)
+            } else {
+                self.copy_to_destination(&request.source_path, &destination, true)?;
+                self.storage_object(&request.object_path, true)
+            }
         })
     }
 
@@ -890,6 +980,7 @@ fn validate_object_id(object_id: &str) -> Result<PathBuf, MusicStorageError> {
         ));
     }
     if path.starts_with(HISTORY_DIRECTORY)
+        || path.starts_with(OPERATIONS_DIRECTORY)
         || path.components().any(|component| {
             component
                 .as_os_str()
@@ -944,7 +1035,7 @@ fn snapshot_versions(root: &Path) -> Result<BTreeMap<String, String>, LocalStora
         let relative = path
             .strip_prefix(root)
             .expect("walk path must be under root");
-        if relative.starts_with(HISTORY_DIRECTORY) || !is_recognized_audio_path(&path) {
+        if is_provider_internal_path(relative) || !is_recognized_audio_path(&path) {
             continue;
         }
         let object_id = path_to_object_id(relative)
@@ -952,6 +1043,68 @@ fn snapshot_versions(root: &Path) -> Result<BTreeMap<String, String>, LocalStora
         versions.insert(object_id, provider_version(&fs::metadata(path)?)?);
     }
     Ok(versions)
+}
+
+fn is_provider_internal_path(path: &Path) -> bool {
+    path.starts_with(HISTORY_DIRECTORY) || path.starts_with(OPERATIONS_DIRECTORY)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LocalUploadOperation {
+    version: u8,
+    object_path: String,
+    source_size: u64,
+    source_hash: ContentHash,
+    result: Option<StorageObject>,
+}
+
+fn read_local_operation(path: &Path) -> Result<Option<LocalUploadOperation>, MusicStorageError> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let operation: LocalUploadOperation = serde_json::from_slice(&bytes).map_err(|_| {
+                storage_error(
+                    MusicStorageErrorKind::InvalidData,
+                    "local upload operation record is corrupt",
+                )
+            })?;
+            if operation.version != 1 {
+                return Err(storage_error(
+                    MusicStorageErrorKind::InvalidData,
+                    "unsupported local upload operation record version",
+                ));
+            }
+            Ok(Some(operation))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(map_io_error(error)),
+    }
+}
+
+fn write_local_operation(
+    path: &Path,
+    operation: &LocalUploadOperation,
+) -> Result<(), MusicStorageError> {
+    let parent = path.parent().expect("operation path has a parent");
+    fs::create_dir_all(parent).map_err(map_io_error)?;
+    let temporary = parent.join(format!("{TEMPORARY_PREFIX}{}", Uuid::new_v4()));
+    let result = (|| {
+        let bytes = serde_json::to_vec(operation).map_err(|error| {
+            storage_error(MusicStorageErrorKind::InvalidData, error.to_string())
+        })?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(map_io_error)?;
+        file.write_all(&bytes).map_err(map_io_error)?;
+        file.sync_all().map_err(map_io_error)?;
+        fs::rename(&temporary, path).map_err(map_io_error)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 fn provider_version(metadata: &fs::Metadata) -> io::Result<String> {
@@ -1392,6 +1545,47 @@ mod tests {
         assert_eq!(versions.versions.len(), 2);
         assert!(versions.versions[0].is_current);
         assert!(!versions.versions[1].is_current);
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_deduplicates_retries_without_creating_history() {
+        let root = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let source = staging.path().join("track.mp3");
+        fs::write(&source, b"same upload").unwrap();
+        let request = || UploadRequest {
+            source_path: source.clone(),
+            object_path: "track.mp3".to_owned(),
+            content_type: Some("audio/mpeg".to_owned()),
+            content_length: Some(11),
+            expected_checksum: None,
+            metadata: BTreeMap::new(),
+            idempotency_key: Some("operation-1".to_owned()),
+        };
+
+        let first = storage(&root).upload(request()).await.unwrap();
+        let second = storage(&root).upload(request()).await.unwrap();
+
+        assert_eq!(first, second);
+        let versions = storage(&root)
+            .versions_page(StorageVersionRequest {
+                object_id: "track.mp3".to_owned(),
+                page_cursor: None,
+                page_size: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(versions.versions.len(), 1);
+        assert!(root.path().join(OPERATIONS_DIRECTORY).is_dir());
+        assert_eq!(
+            storage(&root)
+                .inventory_page(inventory_request(false))
+                .await
+                .unwrap()
+                .objects
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

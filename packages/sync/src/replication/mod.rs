@@ -6,6 +6,7 @@ use rec_core::{
     MusicStorageError, StorageObject, StorageRole, StorageVerificationStatus, SyncJob,
     SyncJobPayload, UploadRequest, SYNC_JOB_PAYLOAD_VERSION,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -204,6 +205,8 @@ fn replication_job_plan(
             source_storage_id: request.source_storage.id,
             source_object_id: request.source_object.object_id.clone(),
             source_object_key: request.source_object.display_path.clone(),
+            source_provider_version: request.source_object.provider_version.clone(),
+            expected_checksum: request.source_object.canonical_hash().cloned(),
             destination_storage_id: storage.id,
             destination_object_key: request.destination_object_key.clone(),
         },
@@ -212,19 +215,17 @@ fn replication_job_plan(
 }
 
 fn mode_allows(mode: rec_core::ReplicationMode, trigger: ReplicationTrigger) -> bool {
-    matches!(
-        (mode, trigger),
-        (
-            rec_core::ReplicationMode::Automatic,
-            ReplicationTrigger::VerifiedPrimaryWrite
-        ) | (
-            rec_core::ReplicationMode::Scheduled,
-            ReplicationTrigger::Schedule
-        ) | (
-            rec_core::ReplicationMode::Manual,
-            ReplicationTrigger::Manual
+    matches!(trigger, ReplicationTrigger::Manual)
+        || matches!(
+            (mode, trigger),
+            (
+                rec_core::ReplicationMode::Automatic,
+                ReplicationTrigger::VerifiedPrimaryWrite
+            ) | (
+                rec_core::ReplicationMode::Scheduled,
+                ReplicationTrigger::Schedule
+            )
         )
-    )
 }
 
 fn verified_source_hash(request: &ReplicationRequest) -> Option<&ContentHash> {
@@ -257,16 +258,33 @@ pub struct StagedReplicationRequest {
     pub destination_object_key: String,
     pub staging_path: PathBuf,
     pub expected_checksum: ContentHash,
+    /// Immutable provider generation captured by the durable job payload.
+    pub expected_source_version: Option<String>,
     pub idempotency_key: String,
     pub content_type: Option<String>,
     pub content_length: Option<u64>,
 }
 
 /// Durable stage reached by a staged replication worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReplicationStage {
     PendingDownload,
     DownloadVerified,
+    Uploaded,
+    DestinationVerified,
+}
+
+/// One bounded transfer operation. Checkpoints must be persisted before invoking
+/// the next stage, including the destination object ID returned by upload.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplicationStep {
+    Checkpoint {
+        stage: ReplicationStage,
+        destination_object_id: Option<String>,
+        bytes_transferred: u64,
+    },
+    Complete(ReplicationExecution),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,6 +306,10 @@ pub enum ReplicationError {
     },
     #[error("backup verification failed: {0}")]
     Verification(String),
+    #[error("{0} checkpoint requires a destination object ID")]
+    MissingDestinationObject(&'static str),
+    #[error("replication source version changed from the planned immutable version")]
+    SourceVersionChanged,
 }
 
 /// Executes the only portable copy sequence supported by `MusicAssetStore`:
@@ -316,100 +338,142 @@ impl<'a> ReplicationExecutor<'a> {
             .object)
     }
 
-    /// Resume after a durable, checksum-verified staging download. Upload retries
-    /// reuse the staging file and stable provider idempotency key.
+    /// Compatibility helper that drives all bounded stages in-process. Durable workers
+    /// should call [`Self::execute_step`] and persist every returned checkpoint.
     pub async fn replicate_from(
         &self,
         request: &StagedReplicationRequest,
         stage: ReplicationStage,
     ) -> Result<ReplicationExecution, ReplicationError> {
-        let bytes_downloaded = if stage == ReplicationStage::PendingDownload {
-            let download = self
-                .source
-                .download(DownloadRequest {
-                    object_id: request.source_object_id.clone(),
-                    destination_path: request.staging_path.clone(),
-                    range: None,
-                    expected_checksum: Some(request.expected_checksum.clone()),
-                    overwrite: true,
-                })
-                .await
-                .map_err(|source| ReplicationError::Storage {
-                    stage: "download",
-                    source,
-                })?;
-            validate_download(&download, &request.expected_checksum)?;
-            download.bytes_written
-        } else {
-            0
-        };
-
-        let mut metadata = BTreeMap::new();
-        metadata.insert("rec_bag.asset_id".into(), request.asset_id.to_string());
-        metadata.insert(
-            "rec_bag.operation_key".into(),
-            request.idempotency_key.clone(),
-        );
-        let uploaded = self
-            .destination
-            .upload(UploadRequest {
-                source_path: request.staging_path.clone(),
-                object_path: request.destination_object_key.clone(),
-                content_type: request.content_type.clone(),
-                content_length: request
-                    .content_length
-                    .or((bytes_downloaded > 0).then_some(bytes_downloaded)),
-                expected_checksum: Some(request.expected_checksum.clone()),
-                metadata,
-                idempotency_key: Some(request.idempotency_key.clone()),
-            })
-            .await
-            .map_err(|source| ReplicationError::Storage {
-                stage: "upload",
-                source,
-            })?;
-
-        let stated = self
-            .destination
-            .stat(&uploaded.object_id)
-            .await
-            .map_err(|source| ReplicationError::Storage {
-                stage: "post-copy stat",
-                source,
-            })?;
-        if stated.canonical_hash() == Some(&request.expected_checksum) {
-            return Ok(ReplicationExecution {
-                object: stated,
-                bytes_downloaded,
-                resumed_from: stage,
-            });
+        let resumed_from = stage;
+        let mut stage = stage;
+        let mut destination_object_id = None;
+        let mut bytes_downloaded: u64 = 0;
+        loop {
+            match self
+                .execute_step(request, stage, destination_object_id.clone())
+                .await?
+            {
+                ReplicationStep::Checkpoint {
+                    stage: next,
+                    destination_object_id: object_id,
+                    bytes_transferred,
+                } => {
+                    stage = next;
+                    destination_object_id = object_id;
+                    bytes_downloaded = bytes_downloaded.saturating_add(bytes_transferred);
+                }
+                ReplicationStep::Complete(mut execution) => {
+                    execution.bytes_downloaded = bytes_downloaded;
+                    execution.resumed_from = resumed_from;
+                    return Ok(execution);
+                }
+            }
         }
+    }
 
-        // Providers without hash-bearing stat results must prove the byte stream.
-        let verification_path = request.staging_path.with_extension(format!(
-            "verify-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let verification = self
-            .destination
-            .download(DownloadRequest {
-                object_id: uploaded.object_id.clone(),
-                destination_path: verification_path,
-                range: None,
-                expected_checksum: Some(request.expected_checksum.clone()),
-                overwrite: true,
-            })
-            .await
-            .map_err(|source| ReplicationError::Storage {
-                stage: "post-copy download",
-                source,
-            })?;
-        validate_download(&verification, &request.expected_checksum)?;
-        Ok(ReplicationExecution {
-            object: stated,
-            bytes_downloaded,
-            resumed_from: stage,
-        })
+    /// Execute exactly one externally checkpointable transfer stage.
+    pub async fn execute_step(
+        &self,
+        request: &StagedReplicationRequest,
+        stage: ReplicationStage,
+        destination_object_id: Option<String>,
+    ) -> Result<ReplicationStep, ReplicationError> {
+        match stage {
+            ReplicationStage::PendingDownload => {
+                let download = self
+                    .source
+                    .download(DownloadRequest {
+                        object_id: request.source_object_id.clone(),
+                        destination_path: request.staging_path.clone(),
+                        range: None,
+                        expected_checksum: Some(request.expected_checksum.clone()),
+                        overwrite: true,
+                    })
+                    .await
+                    .map_err(|source| ReplicationError::Storage {
+                        stage: "download",
+                        source,
+                    })?;
+                validate_download(&download, &request.expected_checksum)?;
+                if request.expected_source_version.as_deref()
+                    != download.object.provider_version.as_deref()
+                {
+                    return Err(ReplicationError::SourceVersionChanged);
+                }
+                Ok(ReplicationStep::Checkpoint {
+                    stage: ReplicationStage::DownloadVerified,
+                    destination_object_id: None,
+                    bytes_transferred: download.bytes_written,
+                })
+            }
+            ReplicationStage::DownloadVerified => {
+                let mut metadata = BTreeMap::new();
+                metadata.insert("rec_bag.asset_id".into(), request.asset_id.to_string());
+                metadata.insert(
+                    "rec_bag.operation_key".into(),
+                    request.idempotency_key.clone(),
+                );
+                let uploaded = self
+                    .destination
+                    .upload(UploadRequest {
+                        source_path: request.staging_path.clone(),
+                        object_path: request.destination_object_key.clone(),
+                        content_type: request.content_type.clone(),
+                        content_length: request.content_length,
+                        expected_checksum: Some(request.expected_checksum.clone()),
+                        metadata,
+                        idempotency_key: Some(request.idempotency_key.clone()),
+                    })
+                    .await
+                    .map_err(|source| ReplicationError::Storage {
+                        stage: "upload",
+                        source,
+                    })?;
+                Ok(ReplicationStep::Checkpoint {
+                    stage: ReplicationStage::Uploaded,
+                    destination_object_id: Some(uploaded.object_id),
+                    bytes_transferred: 0,
+                })
+            }
+            ReplicationStage::Uploaded | ReplicationStage::DestinationVerified => {
+                let object_id = destination_object_id
+                    .ok_or(ReplicationError::MissingDestinationObject("uploaded"))?;
+                let stated = self.destination.stat(&object_id).await.map_err(|source| {
+                    ReplicationError::Storage {
+                        stage: "post-copy stat",
+                        source,
+                    }
+                })?;
+                if stated.canonical_hash() != Some(&request.expected_checksum) {
+                    // Providers without hash-bearing stat results must prove the byte stream.
+                    let verification_path = request.staging_path.with_extension(format!(
+                        "verify-{}",
+                        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                    ));
+                    let verification = self
+                        .destination
+                        .download(DownloadRequest {
+                            object_id,
+                            destination_path: verification_path,
+                            range: None,
+                            expected_checksum: Some(request.expected_checksum.clone()),
+                            overwrite: true,
+                        })
+                        .await
+                        .map_err(|source| ReplicationError::Storage {
+                            stage: "post-copy download",
+                            source,
+                        })?;
+                    validate_download(&verification, &request.expected_checksum)?;
+                }
+                Ok(ReplicationStep::Complete(ReplicationExecution {
+                    object: stated,
+                    bytes_downloaded: 0,
+                    resumed_from: stage,
+                }))
+            }
+        }
     }
 }
 
@@ -580,6 +644,27 @@ mod tests {
         assert!(first.idempotency_key.contains("primary-object:v1"));
     }
 
+    #[test]
+    fn manual_now_overrides_each_enabled_backup_schedule_mode() {
+        for mode in [
+            ReplicationMode::Automatic,
+            ReplicationMode::Scheduled,
+            ReplicationMode::Manual,
+        ] {
+            let backup = storage(StorageRole::Backup, mode);
+            let mut request = request(vec![BackupTarget {
+                storage: backup,
+                availability: BackupAvailability::Available,
+                existing_location: None,
+            }]);
+            request.trigger = ReplicationTrigger::Manual;
+            assert!(matches!(
+                ReplicationPlanner::plan(&request).as_slice(),
+                [ReplicationDecision::Enqueue(_)]
+            ));
+        }
+    }
+
     struct FakeAssetStore {
         object: StorageObject,
         downloads: Mutex<u32>,
@@ -666,6 +751,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executor_exposes_download_and_upload_as_separate_durable_steps() {
+        let storage_id = Uuid::new_v4();
+        let checksum = hash();
+        let object = StorageObject {
+            storage_id,
+            object_id: "object".into(),
+            name: "track.flac".into(),
+            display_path: None,
+            size_bytes: 10,
+            media_type: None,
+            modified_at: None,
+            provider_version: Some("v1".into()),
+            hashes: vec![checksum.clone()],
+            embedded_asset_id: None,
+            is_trashed: false,
+        };
+        let source = FakeAssetStore::new(object.clone());
+        let destination = FakeAssetStore::new(object);
+        let executor = ReplicationExecutor::new(&source, &destination);
+        let request = StagedReplicationRequest {
+            asset_id: Uuid::new_v4(),
+            source_object_id: "source".into(),
+            destination_object_key: "backup/track.flac".into(),
+            staging_path: PathBuf::from("staging/track.flac"),
+            expected_checksum: checksum,
+            expected_source_version: Some("v1".into()),
+            idempotency_key: "stable-key".into(),
+            content_type: None,
+            content_length: Some(10),
+        };
+
+        let first = executor
+            .execute_step(&request, ReplicationStage::PendingDownload, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            ReplicationStep::Checkpoint {
+                stage: ReplicationStage::DownloadVerified,
+                bytes_transferred: 10,
+                ..
+            }
+        ));
+        assert_eq!(*source.downloads.lock().unwrap(), 1);
+        assert_eq!(*destination.uploads.lock().unwrap(), 0);
+
+        let second = executor
+            .execute_step(&request, ReplicationStage::DownloadVerified, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            second,
+            ReplicationStep::Checkpoint {
+                stage: ReplicationStage::Uploaded,
+                destination_object_id: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(*destination.uploads.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn executor_resumes_after_verified_download_without_repeating_it() {
         let storage_id = Uuid::new_v4();
         let checksum = hash();
@@ -693,6 +840,7 @@ mod tests {
                     destination_object_key: "backup/track.flac".into(),
                     staging_path: PathBuf::from("staging/track.flac"),
                     expected_checksum: checksum,
+                    expected_source_version: Some("v1".into()),
                     idempotency_key: "stable-key".into(),
                     content_type: None,
                     content_length: Some(10),

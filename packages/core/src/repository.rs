@@ -14,9 +14,10 @@ use crate::catalog::{
 };
 use crate::provider::BoxFuture;
 use crate::reconciliation::{
-    MatchCandidate, MatchConfidence, ReconciliationOutcome, ReconciliationResult,
+    MatchCandidate, MatchConfidence, ReconciliationDecision, ReconciliationOutcome,
+    ReconciliationResolution, ReconciliationResult, ReconciliationSuppression,
 };
-use crate::sync::{SyncJob, SyncRun};
+use crate::sync::{SyncJob, SyncRun, SyncRunKind, SyncStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -277,6 +278,51 @@ pub struct ReconciliationResultFilter {
     pub review_required: Option<bool>,
 }
 
+/// Filters source occurrences without requiring callers to load a complete source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SourceOccurrenceFilter {
+    pub source_id: Option<Uuid>,
+    pub canonical_track_id: Option<Uuid>,
+    pub account_external_id: Option<String>,
+}
+
+/// Filters original assets for bounded reconciliation input assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OriginalAssetFilter {
+    pub track_id: Option<Uuid>,
+}
+
+/// Filters asset locations for bounded verification and reconciliation input assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AssetLocationFilter {
+    pub asset_id: Option<Uuid>,
+    pub storage_id: Option<Uuid>,
+}
+
+/// Filters external playlists within a source namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ExternalPlaylistFilter {
+    pub source_id: Option<Uuid>,
+    pub owner_external_id: Option<String>,
+}
+
+/// Filters durable decisions and suppressions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReconciliationResolutionFilter {
+    pub result_id: Option<Uuid>,
+    pub candidate_id: Option<Uuid>,
+    pub decision: Option<ReconciliationDecision>,
+}
+
+/// Filters sync-run history and latest-run lookups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SyncRunFilter {
+    pub kind: Option<SyncRunKind>,
+    pub status: Option<SyncStatus>,
+    pub source_id: Option<Uuid>,
+    pub storage_id: Option<Uuid>,
+}
+
 /// Persistence operations for canonical tracks.
 pub trait TrackRepository: Send + Sync {
     fn get(&self, id: Uuid) -> BoxFuture<'_, RepositoryResult<Option<CanonicalTrack>>>;
@@ -307,6 +353,19 @@ pub trait PlaylistRepository: Send + Sync {
     ) -> BoxFuture<'_, RepositoryResult<Option<ExternalPlaylist>>>;
 
     fn upsert_external(&self, playlist: ExternalPlaylist) -> BoxFuture<'_, RepositoryResult<()>>;
+
+    fn list_external(
+        &self,
+        filter: ExternalPlaylistFilter,
+        page: RepositoryPageRequest,
+    ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<ExternalPlaylist>>>;
+
+    fn list_external_entries(
+        &self,
+        source_id: Uuid,
+        external_id: String,
+        page: RepositoryPageRequest,
+    ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<ExternalPlaylistEntry>>>;
 
     /// Atomically replaces ordering for one external playlist when all entries are
     /// already available in memory.
@@ -391,6 +450,12 @@ pub trait SourceRepository: Send + Sync {
         external_id: String,
     ) -> BoxFuture<'_, RepositoryResult<Option<SourceTrackOccurrence>>>;
 
+    fn list_occurrences(
+        &self,
+        filter: SourceOccurrenceFilter,
+        page: RepositoryPageRequest,
+    ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<SourceTrackOccurrence>>>;
+
     /// Batch upsert is the idempotent persistence primitive for source pages.
     fn upsert_occurrences(
         &self,
@@ -406,6 +471,12 @@ pub trait AssetRepository: Send + Sync {
         &self,
         track_id: Uuid,
     ) -> BoxFuture<'_, RepositoryResult<Vec<OriginalAsset>>>;
+
+    fn list_originals(
+        &self,
+        filter: OriginalAssetFilter,
+        page: RepositoryPageRequest,
+    ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<OriginalAsset>>>;
 
     fn upsert_original(&self, asset: OriginalAsset) -> BoxFuture<'_, RepositoryResult<()>>;
 
@@ -435,6 +506,12 @@ pub trait AssetRepository: Send + Sync {
         &self,
         asset_id: Uuid,
     ) -> BoxFuture<'_, RepositoryResult<Vec<AssetLocation>>>;
+
+    fn list_locations(
+        &self,
+        filter: AssetLocationFilter,
+        page: RepositoryPageRequest,
+    ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<AssetLocation>>>;
 
     fn upsert_location(&self, location: AssetLocation) -> BoxFuture<'_, RepositoryResult<()>>;
 
@@ -500,6 +577,12 @@ pub trait ReconciliationRepository: Send + Sync {
     fn get_result(&self, id: Uuid)
         -> BoxFuture<'_, RepositoryResult<Option<ReconciliationResult>>>;
 
+    /// Finds the persisted finding that owns a candidate without scanning result blobs.
+    fn get_result_by_candidate(
+        &self,
+        candidate_id: Uuid,
+    ) -> BoxFuture<'_, RepositoryResult<Option<ReconciliationResult>>>;
+
     fn list_results(
         &self,
         filter: ReconciliationResultFilter,
@@ -507,6 +590,32 @@ pub trait ReconciliationRepository: Send + Sync {
     ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<ReconciliationResult>>>;
 
     fn upsert_result(&self, result: ReconciliationResult) -> BoxFuture<'_, RepositoryResult<()>>;
+
+    fn get_resolution(
+        &self,
+        id: Uuid,
+    ) -> BoxFuture<'_, RepositoryResult<Option<ReconciliationResolution>>>;
+
+    fn list_resolutions(
+        &self,
+        filter: ReconciliationResolutionFilter,
+        page: RepositoryPageRequest,
+    ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<ReconciliationResolution>>>;
+
+    /// Persists a decision and any derived suppression atomically.
+    fn record_resolution(
+        &self,
+        resolution: ReconciliationResolution,
+        suppression: Option<ReconciliationSuppression>,
+    ) -> BoxFuture<'_, RepositoryResult<()>>;
+
+    fn list_suppressions(
+        &self,
+        filter: ReconciliationResolutionFilter,
+        page: RepositoryPageRequest,
+    ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<ReconciliationSuppression>>>;
+
+    fn remove_suppression(&self, id: Uuid) -> BoxFuture<'_, RepositoryResult<()>>;
 }
 
 /// Persistence operations for configured primary and backup music storages.
@@ -545,6 +654,15 @@ pub trait SyncRunRepository: Send + Sync {
         &self,
         page: RepositoryPageRequest,
     ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<SyncRun>>>;
+
+    fn list_filtered(
+        &self,
+        filter: SyncRunFilter,
+        page: RepositoryPageRequest,
+    ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<SyncRun>>>;
+
+    /// Returns the most recently created run matching the complete filter.
+    fn latest(&self, filter: SyncRunFilter) -> BoxFuture<'_, RepositoryResult<Option<SyncRun>>>;
 
     /// Inserts or updates a run, including its cursor, progress, and terminal state.
     fn upsert(&self, run: SyncRun) -> BoxFuture<'_, RepositoryResult<()>>;

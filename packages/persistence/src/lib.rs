@@ -7,7 +7,10 @@ mod migrations;
 mod repositories;
 
 pub use migrations::{migrate, MigrationError, MigrationOutcome};
-pub use repositories::{RefreshTokenMetadata, SNAPSHOT_CONTENT_TYPE, SNAPSHOT_FORMAT_VERSION};
+pub use repositories::{
+    CleanupApproval, DurableTransferResult, RefreshTokenMetadata, SnapshotTrigger,
+    SNAPSHOT_CONTENT_TYPE, SNAPSHOT_FORMAT_VERSION,
+};
 
 use rec_core::{
     AssetRepository, CatalogSnapshotRepository, MusicStorageRepository, PlaylistRepository,

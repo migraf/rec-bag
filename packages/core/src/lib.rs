@@ -64,26 +64,28 @@ pub use provider::{
     BoxFuture, ByteRange, CatalogAssetReadRequest, CatalogAssetReadResult, CatalogAssetReader,
     CatalogSourceConnector, DownloadRequest, DownloadResult, HealthStatus, InventoryMode,
     InventoryPage, InventoryRequest, MusicAssetStore, MusicStorageError, MusicStorageErrorKind,
-    SourceError, SourceErrorKind, SourceHealth, SourceRemoval, SourceSyncItem, SourceSyncMode,
-    SourceSyncPage, SourceSyncRequest, StorageHealth, StorageObjectRemoval, StorageObjectVersion,
-    StorageVersionPage, StorageVersionRequest, UploadRequest,
+    RetryGuidance, SourceError, SourceErrorKind, SourceHealth, SourceRemoval, SourceSyncItem,
+    SourceSyncMode, SourceSyncPage, SourceSyncRequest, StorageHealth, StorageObjectRemoval,
+    StorageObjectVersion, StorageVersionPage, StorageVersionRequest, UploadRequest,
 };
 pub use reconciliation::{
     AssetStorageOutcome, AssetStorageStatus, ConflictingAssetSummaryOutcome, MatchCandidate,
     MatchConfidence, MatchEvidence, MatchMethod, PlaylistStorageOutcome, ReconciliationAction,
-    ReconciliationOutcome, ReconciliationResult, ReconciliationSummary, ReconciliationSummaryError,
-    ReconciliationSummaryScope, TrackStorageOutcome, TrackStorageStatus,
+    ReconciliationDecision, ReconciliationOutcome, ReconciliationResolution, ReconciliationResult,
+    ReconciliationSummary, ReconciliationSummaryError, ReconciliationSummaryScope,
+    ReconciliationSuppression, TrackStorageOutcome, TrackStorageStatus,
 };
 pub use repository::{
-    AssetRepository, CatalogSnapshot, CatalogSnapshotRepository, ExternalPlaylistEntryStagingScope,
-    InventoryGeneration, InventoryGenerationAbort, InventoryGenerationAbortKind,
-    InventoryGenerationKind, InventoryGenerationStart, InventoryGenerationStatus,
-    InventoryStagingPage, MatchCandidateFilter, MusicStorageRepository, PlaylistRepository,
-    ReconciliationRepository, ReconciliationResultFilter, RepositoryCursor, RepositoryError,
-    RepositoryErrorKind, RepositoryPage, RepositoryPageRequest, RepositoryResult,
-    RepositoryTransaction, Setting, SettingsRepository, SourceCollectionRelationshipFilter,
-    SourceRepository, StorageObjectTombstone, SyncRunRepository, TrackRepository,
-    TransactionManager,
+    AssetLocationFilter, AssetRepository, CatalogSnapshot, CatalogSnapshotRepository,
+    ExternalPlaylistEntryStagingScope, ExternalPlaylistFilter, InventoryGeneration,
+    InventoryGenerationAbort, InventoryGenerationAbortKind, InventoryGenerationKind,
+    InventoryGenerationStart, InventoryGenerationStatus, InventoryStagingPage,
+    MatchCandidateFilter, MusicStorageRepository, OriginalAssetFilter, PlaylistRepository,
+    ReconciliationRepository, ReconciliationResolutionFilter, ReconciliationResultFilter,
+    RepositoryCursor, RepositoryError, RepositoryErrorKind, RepositoryPage, RepositoryPageRequest,
+    RepositoryResult, RepositoryTransaction, Setting, SettingsRepository,
+    SourceCollectionRelationshipFilter, SourceOccurrenceFilter, SourceRepository,
+    StorageObjectTombstone, SyncRunFilter, SyncRunRepository, TrackRepository, TransactionManager,
 };
 pub use schema::{
     CatalogSchemaVersion, CatalogSchemaVersionError, MigrationPlan, MigrationPlanError,
@@ -98,7 +100,8 @@ pub use storage::{LocalStorage, SqliteStorage, StorageBackend, StorageError};
 pub use sync::{
     SyncCheckpoint, SyncCursor, SyncError, SyncErrorKind, SyncIssue, SyncIssueSeverity, SyncJob,
     SyncJobKind, SyncJobKindMismatch, SyncJobPayload, SyncProgress, SyncRun, SyncRunKind,
-    SyncStatus, SyncTransitionError, DEFAULT_SYNC_JOB_MAX_ATTEMPTS, SYNC_JOB_PAYLOAD_VERSION,
+    SyncStatus, SyncTransitionError, TransferCheckpoint, TransferCheckpointError, TransferStage,
+    DEFAULT_SYNC_JOB_MAX_ATTEMPTS, SYNC_JOB_PAYLOAD_VERSION,
 };
 pub use track::{BeatGridData, FrequencyWaveformData, MetadataError, Track, WaveformPeaks};
 #[cfg(feature = "audio")]

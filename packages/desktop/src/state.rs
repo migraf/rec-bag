@@ -1,9 +1,15 @@
 //! Shared application state using Dioxus Context API.
+//!
+//! Existing application behavior remains behind [`AppState`]. New Stage 3
+//! integration work belongs in the focused [`integration`] boundary.
 
+pub mod integration;
+
+use crate::services::playback_bridge::resolve_track_path;
 use dioxus::prelude::*;
 use rec_core::{
-    analyze_track, AudioEngine, Diagnosis, Doctor, Library, MusicSource, Playlist, SearchEngine,
-    SqliteStorage, Track,
+    analyze_track, AudioEngine, CanonicalTrack, Diagnosis, Doctor, Library, MetadataField,
+    MetadataValue, MusicSource, Playlist, SearchEngine, SqliteStorage, Track,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -78,8 +84,11 @@ pub struct AppState {
     pub storage: Signal<Option<Arc<SqliteStorage>>>,
     /// All playlists
     pub playlists: Signal<Vec<Playlist>>,
-    /// Scanned library tracks (from all sources)
+    /// Scanned legacy tracks plus the live canonical catalog projection.
     pub library_tracks: Signal<Vec<Track>>,
+    /// IDs supplied by the authoritative canonical catalog. These are never written to
+    /// legacy SQLite storage.
+    canonical_track_ids: Signal<HashSet<Uuid>>,
     /// Music sources (folders to watch for music files)
     pub sources: Signal<Vec<MusicSource>>,
     /// Currently selected playlist ID
@@ -131,6 +140,7 @@ impl AppState {
             storage: Signal::new(None),
             playlists: Signal::new(Vec::new()),
             library_tracks: Signal::new(Vec::new()),
+            canonical_track_ids: Signal::new(HashSet::new()),
             sources: Signal::new(Vec::new()),
             selected_playlist_id: Signal::new(None),
             search_query: Signal::new(String::new()),
@@ -259,9 +269,22 @@ impl AppState {
     /// Save the current library state to storage.
     pub async fn save_to_storage(self) {
         if let Some(storage) = self.storage.read().as_ref() {
+            let canonical_ids = self.canonical_track_ids.read();
+            let mut playlists = self.playlists.read().clone();
+            for playlist in &mut playlists {
+                playlist
+                    .tracks
+                    .retain(|track| !canonical_ids.contains(&track.id));
+            }
             let library = Library {
-                playlists: self.playlists.read().clone(),
-                loose_tracks: self.library_tracks.read().clone(),
+                playlists,
+                loose_tracks: self
+                    .library_tracks
+                    .read()
+                    .iter()
+                    .filter(|track| !canonical_ids.contains(&track.id))
+                    .cloned()
+                    .collect(),
             };
 
             if let Err(e) = storage.save_library_async(&library).await {
@@ -449,6 +472,49 @@ impl AppState {
         } else {
             Vec::new()
         }
+    }
+
+    /// Tracks available to the DJ browser. With no playlist selected, browse the live
+    /// library projection so canonical local and remote tracks remain selectable.
+    pub fn dj_tracks(&self) -> Vec<Track> {
+        if self.selected_playlist_id.read().is_some() {
+            self.selected_playlist_tracks()
+        } else {
+            self.library_tracks.read().clone()
+        }
+    }
+
+    /// Replace the transient canonical portion of the library from the live Turso catalog.
+    /// Legacy-only tracks remain available, while an ID present in the catalog occurs once
+    /// and receives canonical display metadata. No resolved provider/cache path is stored.
+    pub fn project_canonical_tracks(mut self, canonical_tracks: Vec<CanonicalTrack>) {
+        let canonical_ids: HashSet<_> = canonical_tracks.iter().map(|track| track.id).collect();
+        let projected = merge_canonical_tracks(
+            std::mem::take(&mut *self.library_tracks.write()),
+            &canonical_tracks,
+        );
+        let projected_by_id: HashMap<_, _> = projected
+            .iter()
+            .filter(|track| canonical_ids.contains(&track.id))
+            .map(|track| (track.id, track.clone()))
+            .collect();
+
+        for playlist in self.playlists.write().iter_mut() {
+            for track in &mut playlist.tracks {
+                if let Some(canonical) = projected_by_id.get(&track.id) {
+                    let waveform = track.waveform.clone();
+                    let freq_waveform = track.freq_waveform.clone();
+                    let beat_grid = track.beat_grid.clone();
+                    *track = canonical.clone();
+                    track.waveform = waveform;
+                    track.freq_waveform = freq_waveform;
+                    track.beat_grid = beat_grid;
+                }
+            }
+        }
+
+        self.library_tracks.set(projected);
+        self.canonical_track_ids.set(canonical_ids);
     }
 
     // ==================== Source Management ====================
@@ -713,56 +779,67 @@ impl AppState {
 
     // ==================== Deck Operations ====================
 
-    /// Load a track to a deck (1 or 2). Updates both the audio engine and shared state.
-    /// Returns true if successful.
+    /// Queue a track for loading to deck 1 or 2.
+    ///
+    /// Canonical/provider assets are first materialized as verified local files. The
+    /// resolved path is applied only to the clone sent to the audio engine; shared state
+    /// retains the stable track identity and never persists a Drive cache path.
     pub fn load_track_to_deck(mut self, mut track: Track, deck: usize) -> bool {
-        let track_id = track.id;
-        let track_path = track.path.clone();
+        if !matches!(deck, 1 | 2) {
+            return false;
+        }
 
-        // Check if waveform is in cache
+        let track_id = track.id;
+
         if !track.has_waveform() {
             if let Some(peaks) = self.get_waveform(track_id) {
                 track.set_waveform(peaks);
             }
         }
-
-        // Check if freq waveform is in cache
         if !track.has_freq_waveform() {
             if let Some(fw) = self.get_freq_waveform(track_id) {
                 track.set_freq_waveform(fw.low, fw.mid, fw.high);
             }
         }
-
-        // Check if beat grid is in cache
         if !track.has_beat_grid() {
             if let Some(bg) = self.get_beat_grid(track_id) {
                 track.set_beat_grid(bg.first_beat_ms, bg.beat_interval_ms, bg.beats);
             }
         }
 
-        // Load track to audio engine
-        let loaded = if let Ok(mut eng) = (self.engine)().lock() {
-            let deck_idx = deck - 1; // Convert to 0-indexed (deck 1 = index 0)
-            eng.load_track(deck_idx, track.clone()).is_ok()
-        } else {
-            false
-        };
+        spawn(async move {
+            let resolved = match resolve_track_path(track_id, &track.path).await {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    eprintln!("Could not prepare track {track_id} for playback: {error}");
+                    return;
+                }
+            };
 
-        if loaded {
-            // Update shared deck state
+            let mut engine_track = track.clone();
+            engine_track.path = resolved.path.clone();
+            let loaded = if let Ok(mut engine) = (self.engine)().lock() {
+                engine.load_track(deck - 1, engine_track).is_ok()
+            } else {
+                false
+            };
+
+            if !loaded {
+                return;
+            }
+
             if deck == 1 {
                 self.deck1_track.set(Some(track.clone()));
-            } else if deck == 2 {
+            } else {
                 self.deck2_track.set(Some(track.clone()));
             }
 
-            // Spawn background analysis if track needs any analysis
             if track.needs_analysis() {
-                spawn_track_analysis(self, track_id, track_path);
+                spawn_track_analysis(self, track_id, resolved.path);
             }
-        }
+        });
 
-        loaded
+        true
     }
 
     /// Update deck track with analysis results (waveform, freq waveform, beat grid, BPM, key).
@@ -1210,86 +1287,77 @@ impl AppState {
 
     // ==================== Analysis Operations ====================
 
-    /// Analyze a track (clears cached data and spawns fresh analysis).
-    pub fn analyze_track(mut self, track_id: Uuid) {
-        // Get track path
-        let track_path = self
+    /// Analyze a track after resolving its canonical/provider asset to a local file.
+    pub fn analyze_track(self, track_id: Uuid) {
+        let identity_path = self
             .library_tracks
             .read()
             .iter()
-            .find(|t| t.id == track_id)
-            .map(|t| t.path.clone());
+            .find(|track| track.id == track_id)
+            .map(|track| track.path.clone());
 
-        let Some(path) = track_path else {
+        let Some(identity_path) = identity_path else {
             return;
         };
 
-        // Clear cached analysis data
-        self.waveform_cache.write().remove(&track_id);
-        self.freq_waveform_cache.write().remove(&track_id);
-        self.beat_grid_cache.write().remove(&track_id);
+        spawn(async move {
+            let resolved = match resolve_track_path(track_id, &identity_path).await {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    eprintln!("Could not prepare track {track_id} for analysis: {error}");
+                    return;
+                }
+            };
 
-        // Clear analysis data from track in library
-        let mut library_tracks = self.library_tracks.write();
-        if let Some(track) = library_tracks.iter_mut().find(|t| t.id == track_id) {
-            track.waveform = None;
-            track.freq_waveform = None;
-            track.beat_grid = None;
-            track.bpm = None;
-            track.key = None;
-        }
-        drop(library_tracks);
+            let mut app_state = self;
+            app_state.waveform_cache.write().remove(&track_id);
+            app_state.freq_waveform_cache.write().remove(&track_id);
+            app_state.beat_grid_cache.write().remove(&track_id);
 
-        // Clear from playlists too
-        let mut playlists = self.playlists.write();
-        for playlist in playlists.iter_mut() {
-            if let Some(track) = playlist.tracks.iter_mut().find(|t| t.id == track_id) {
+            let mut library_tracks = app_state.library_tracks.write();
+            if let Some(track) = library_tracks.iter_mut().find(|track| track.id == track_id) {
                 track.waveform = None;
                 track.freq_waveform = None;
                 track.beat_grid = None;
                 track.bpm = None;
                 track.key = None;
             }
-        }
-        drop(playlists);
+            drop(library_tracks);
 
-        // Clear from decks if loaded
-        let deck1_clear = self
-            .deck1_track
-            .read()
-            .as_ref()
-            .map(|t| t.id == track_id)
-            .unwrap_or(false);
-        if deck1_clear {
-            let mut track = self.deck1_track.write();
-            if let Some(ref mut t) = *track {
-                t.waveform = None;
-                t.freq_waveform = None;
-                t.beat_grid = None;
+            let mut playlists = app_state.playlists.write();
+            for playlist in playlists.iter_mut() {
+                if let Some(track) = playlist
+                    .tracks
+                    .iter_mut()
+                    .find(|track| track.id == track_id)
+                {
+                    track.waveform = None;
+                    track.freq_waveform = None;
+                    track.beat_grid = None;
+                    track.bpm = None;
+                    track.key = None;
+                }
             }
-        }
+            drop(playlists);
 
-        let deck2_clear = self
-            .deck2_track
-            .read()
-            .as_ref()
-            .map(|t| t.id == track_id)
-            .unwrap_or(false);
-        if deck2_clear {
-            let mut track = self.deck2_track.write();
-            if let Some(ref mut t) = *track {
-                t.waveform = None;
-                t.freq_waveform = None;
-                t.beat_grid = None;
+            for mut deck_track in [app_state.deck1_track, app_state.deck2_track] {
+                let should_clear = deck_track
+                    .read()
+                    .as_ref()
+                    .is_some_and(|track| track.id == track_id);
+                if should_clear {
+                    if let Some(track) = deck_track.write().as_mut() {
+                        track.waveform = None;
+                        track.freq_waveform = None;
+                        track.beat_grid = None;
+                    }
+                }
             }
-        }
 
-        // Remove from analyzing set (in case it was stuck)
-        self.analyzing_tracks.write().remove(&track_id);
-
-        // Spawn new analysis
-        spawn_track_analysis(self, track_id, path);
-        self.mark_save_pending();
+            app_state.analyzing_tracks.write().remove(&track_id);
+            spawn_track_analysis(app_state, track_id, resolved.path);
+            app_state.mark_save_pending();
+        });
     }
 
     /// Analyze multiple tracks.
@@ -1323,6 +1391,94 @@ impl AppState {
         let current = self.get_theme();
         let new_theme = if current == "dark" { "light" } else { "dark" };
         self.set_theme(new_theme.to_string()).await;
+    }
+}
+
+fn merge_canonical_tracks(existing: Vec<Track>, canonical_tracks: &[CanonicalTrack]) -> Vec<Track> {
+    let canonical_by_id: HashMap<_, _> = canonical_tracks
+        .iter()
+        .map(|track| (track.id, track))
+        .collect();
+    let mut projected_ids = HashSet::new();
+    let mut merged = Vec::with_capacity(existing.len() + canonical_tracks.len());
+
+    for legacy in existing {
+        if let Some(canonical) = canonical_by_id.get(&legacy.id) {
+            if projected_ids.insert(legacy.id) {
+                merged.push(project_canonical_track(canonical, Some(legacy)));
+            }
+        } else {
+            merged.push(legacy);
+        }
+    }
+
+    for canonical in canonical_tracks {
+        if projected_ids.insert(canonical.id) {
+            merged.push(project_canonical_track(canonical, None));
+        }
+    }
+    merged
+}
+
+fn project_canonical_track(canonical: &CanonicalTrack, existing: Option<Track>) -> Track {
+    let mut track = existing.unwrap_or_else(|| {
+        Track::new_without_metadata(PathBuf::from(format!("canonical-track://{}", canonical.id)))
+    });
+    track.id = canonical.id;
+    track.path = PathBuf::from(format!("canonical-track://{}", canonical.id));
+    track.added_at = canonical.created_at;
+
+    if let Some(value) = canonical_text(canonical, MetadataField::Title) {
+        track.title = value;
+    } else if track.title.is_empty() || track.title == "Unknown" {
+        track.title = "Unknown track".to_string();
+    }
+    track.artist = canonical_text(canonical, MetadataField::Artist).or(track.artist);
+    track.album = canonical_text(canonical, MetadataField::Album).or(track.album);
+    track.genre = canonical_text(canonical, MetadataField::Genre).or(track.genre);
+    track.key = canonical_text(canonical, MetadataField::MusicalKey).or(track.key);
+    track.bpm = canonical_number(canonical, MetadataField::Bpm)
+        .map(|value| value as f32)
+        .or(track.bpm);
+    track.duration = canonical_integer(canonical, MetadataField::DurationMs)
+        .and_then(|value| u64::try_from(value).ok())
+        .map(std::time::Duration::from_millis)
+        .or(track.duration);
+    track.year = canonical_integer(canonical, MetadataField::ReleaseYear)
+        .and_then(|value| u32::try_from(value).ok())
+        .or(track.year);
+    track.track_number = canonical_integer(canonical, MetadataField::TrackNumber)
+        .and_then(|value| u32::try_from(value).ok())
+        .or(track.track_number);
+    track
+}
+
+fn canonical_value(canonical: &CanonicalTrack, field: MetadataField) -> Option<&MetadataValue> {
+    canonical
+        .metadata
+        .preferred(&field)
+        .map(|candidate| &candidate.value)
+}
+
+fn canonical_text(canonical: &CanonicalTrack, field: MetadataField) -> Option<String> {
+    match canonical_value(canonical, field)? {
+        MetadataValue::Text(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn canonical_integer(canonical: &CanonicalTrack, field: MetadataField) -> Option<i64> {
+    match canonical_value(canonical, field)? {
+        MetadataValue::Integer(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn canonical_number(canonical: &CanonicalTrack, field: MetadataField) -> Option<f64> {
+    match canonical_value(canonical, field)? {
+        MetadataValue::Integer(value) => Some(*value as f64),
+        MetadataValue::Decimal(value) => value.parse().ok(),
+        _ => None,
     }
 }
 
@@ -1439,4 +1595,124 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) 
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::playback_bridge::{
+        resolve_track_path, set_playback_path_resolver, PlaybackPathFuture, PlaybackPathResolver,
+        ResolvedPlaybackPath,
+    };
+    use chrono::Utc;
+    use rec_core::{MetadataFieldValue, MetadataOrigin, MetadataProvenance};
+
+    struct StubPlaybackResolver {
+        paths: HashMap<Uuid, ResolvedPlaybackPath>,
+    }
+
+    impl PlaybackPathResolver for StubPlaybackResolver {
+        fn resolve<'a>(&'a self, track_id: Uuid) -> PlaybackPathFuture<'a> {
+            let resolved = self.paths.get(&track_id).cloned().unwrap();
+            Box::pin(async move { Ok(resolved) })
+        }
+    }
+
+    fn canonical_track(id: Uuid, title: &str, artist: &str) -> CanonicalTrack {
+        let mut track = CanonicalTrack::new();
+        track.id = id;
+        for (field, value) in [
+            (MetadataField::Title, title),
+            (MetadataField::Artist, artist),
+        ] {
+            track.metadata.add(MetadataFieldValue::new(
+                field,
+                MetadataValue::Text(value.to_string()),
+                MetadataProvenance::new(MetadataOrigin::User, Utc::now()),
+            ));
+        }
+        track
+    }
+
+    fn temp_audio(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("rec-bag-state-{label}-{}", Uuid::new_v4()));
+        std::fs::write(&path, b"audio").unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn migrated_local_and_drive_tracks_are_selectable_and_bridge_resolvable() {
+        let local_id = Uuid::new_v4();
+        let drive_id = Uuid::new_v4();
+        let legacy_id = Uuid::new_v4();
+        let local_file = temp_audio("migrated-local");
+        let drive_cache = temp_audio("drive-cache");
+
+        let mut migrated_local = Track::new_without_metadata(local_file.clone());
+        migrated_local.id = local_id;
+        migrated_local.title = "Stale legacy title".to_string();
+        let mut duplicate_local = migrated_local.clone();
+        duplicate_local.path = PathBuf::from("duplicate-legacy-row");
+        let mut legacy_only = Track::new_without_metadata(PathBuf::from("legacy-only.mp3"));
+        legacy_only.id = legacy_id;
+
+        let merged = merge_canonical_tracks(
+            vec![migrated_local, duplicate_local, legacy_only],
+            &[
+                canonical_track(local_id, "Canonical Local", "Local Artist"),
+                canonical_track(drive_id, "Canonical Drive", "Drive Artist"),
+            ],
+        );
+
+        assert_eq!(
+            merged.iter().filter(|track| track.id == local_id).count(),
+            1
+        );
+        assert_eq!(
+            merged.iter().filter(|track| track.id == drive_id).count(),
+            1
+        );
+        assert!(merged.iter().any(|track| track.id == legacy_id));
+        let local = merged.iter().find(|track| track.id == local_id).unwrap();
+        assert_eq!(local.title, "Canonical Local");
+        assert_eq!(local.artist.as_deref(), Some("Local Artist"));
+        assert_ne!(local.path, local_file);
+        assert!(local.path.to_string_lossy().contains(&local_id.to_string()));
+        let drive = merged.iter().find(|track| track.id == drive_id).unwrap();
+        assert_eq!(drive.title, "Canonical Drive");
+        assert_ne!(drive.path, drive_cache);
+        assert!(drive.path.to_string_lossy().contains(&drive_id.to_string()));
+
+        set_playback_path_resolver(Some(Arc::new(StubPlaybackResolver {
+            paths: HashMap::from([
+                (
+                    local_id,
+                    ResolvedPlaybackPath {
+                        path: local_file.clone(),
+                        cached: false,
+                    },
+                ),
+                (
+                    drive_id,
+                    ResolvedPlaybackPath {
+                        path: drive_cache.clone(),
+                        cached: true,
+                    },
+                ),
+            ]),
+        })));
+
+        // Deck loading and explicit analysis both call this bridge with the canonical UUID.
+        let resolved_local = resolve_track_path(local.id, &local.path).await.unwrap();
+        let resolved_drive = resolve_track_path(drive.id, &drive.path).await.unwrap();
+        assert_eq!(resolved_local.path, local_file);
+        assert!(!resolved_local.cached);
+        assert_eq!(resolved_drive.path, drive_cache);
+        assert!(resolved_drive.cached);
+        assert_ne!(drive.path, resolved_drive.path);
+
+        set_playback_path_resolver(None);
+        std::fs::remove_file(local_file).unwrap();
+        std::fs::remove_file(drive_cache).unwrap();
+    }
 }
