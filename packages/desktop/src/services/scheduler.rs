@@ -490,6 +490,7 @@ where
 
         let now = clock.now();
         if let Some(task) = schedule.take_due(now) {
+            tracing::debug!(?task, "scheduler task started");
             let run = tasks.run(task, now);
             let result = tokio::select! {
                 biased;
@@ -499,11 +500,20 @@ where
                 }
                 result = run => result,
             };
-            if let Err(error) = &result {
-                *inner
-                    .last_error
-                    .lock()
-                    .expect("scheduler error lock poisoned") = Some(error.clone());
+            match &result {
+                Ok(outcome) if outcome.made_progress => {
+                    tracing::info!(?task, next_due = ?outcome.next_due, "scheduler task completed with progress");
+                }
+                Ok(outcome) => {
+                    tracing::debug!(?task, next_due = ?outcome.next_due, "scheduler task completed without work");
+                }
+                Err(error) => {
+                    tracing::warn!(?task, error = %error, "scheduler task failed; retry will be scheduled");
+                    *inner
+                        .last_error
+                        .lock()
+                        .expect("scheduler error lock poisoned") = Some(error.clone());
+                }
             }
             schedule.complete(task, now, result, &config);
             continue;

@@ -68,24 +68,21 @@ pub async fn migrate(
     } else {
         None
     };
-
     connection.execute_batch("BEGIN IMMEDIATE;").await?;
     let result = async {
         match from_version {
-            0 => install_current_schema(connection).await?,
+            0 | 2 => install_current_schema(connection).await?,
             1 => migrate_legacy_schema(connection).await?,
-            2 => install_current_schema(connection).await?,
             _ => unreachable!(),
         }
         connection.execute_batch("COMMIT;").await?;
         Ok::<(), MigrationError>(())
     }
     .await;
-    if result.is_err() {
+    if let Err(error) = result {
         let _ = connection.execute_batch("ROLLBACK;").await;
+        return Err(error);
     }
-    result?;
-
     Ok(MigrationOutcome {
         from_version,
         to_version: target,
@@ -262,7 +259,6 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
             }
         }
     }
-
     let mut source_ids = Vec::new();
     if table_exists(connection, "legacy_v1_sources").await? {
         let mut rows = connection.query("SELECT id,name,source_type,uri,config_json,enabled,created_at,last_scanned FROM legacy_v1_sources ORDER BY id", ()).await?;
@@ -341,6 +337,7 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
     // Every legacy path becomes an unverified original and an unassigned local location.
     // No path is opened and no storage is selected as primary.
     let storage_id = stable_uuid(Uuid::NAMESPACE_OID, "rec_bag:legacy-local-storage");
+
     if !tracks.is_empty() {
         let now = Utc::now();
         let storage = MusicStorage::new(
@@ -366,6 +363,7 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
                 ),
             )
             .await?;
+        let mut located_paths = BTreeSet::new();
         for (track_id, (track, path)) in &tracks {
             let file_name = Path::new(path)
                 .file_name()
@@ -381,13 +379,26 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
             asset.lineage_id = stable_uuid(*track_id, "legacy-original-lineage");
             asset.record.created_at = track.created_at;
             asset.is_preferred = false;
-            connection.execute("INSERT INTO assets(id,track_id,asset_type,payload,created_at) VALUES(?1,?2,'original',?3,?4)", (asset.id().to_string(), track_id.to_string(), json(&asset.record)?, track.created_at.to_rfc3339())).await?;
+            connection
+                .execute(
+                    "INSERT INTO assets(id,track_id,asset_type,payload,created_at) VALUES(?1,?2,'original',?3,?4)",
+                    (asset.id().to_string(), track_id.to_string(), json(&asset.record)?, track.created_at.to_rfc3339()),
+                )
+                .await?;
             connection
                 .execute(
                     "INSERT INTO original_assets(id,payload) VALUES(?1,?2)",
                     (asset.id().to_string(), json(&asset)?),
                 )
                 .await?;
+
+            // A legacy catalog could contain multiple track records for one local path. The
+            // current schema correctly permits only one storage object/location per path. Keep
+            // every track and original-asset record, but associate the physical file with its
+            // first migrated asset instead of inventing a distinct path for duplicates.
+            if !located_paths.insert(path.clone()) {
+                continue;
+            }
             let object = StorageObject {
                 storage_id,
                 object_id: path.clone(),
@@ -401,7 +412,12 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
                 embedded_asset_id: Some(asset.id()),
                 is_trashed: false,
             };
-            connection.execute("INSERT INTO storage_objects(storage_id,object_id,generation_id,payload,is_current) VALUES(?1,?2,NULL,?3,1)", (storage_id.to_string(), path.clone(), json(&object)?)).await?;
+            connection
+                .execute(
+                    "INSERT INTO storage_objects(storage_id,object_id,generation_id,payload,is_current) VALUES(?1,?2,NULL,?3,1)",
+                    (storage_id.to_string(), path.clone(), json(&object)?),
+                )
+                .await?;
             let location = AssetLocation {
                 id: stable_uuid(asset.id(), path),
                 asset_id: asset.id(),
@@ -416,7 +432,18 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
                 verified_at: None,
                 error_message: None,
             };
-            connection.execute("INSERT INTO asset_locations(id,asset_id,storage_id,object_id,payload) VALUES(?1,?2,?3,?4,?5)", (location.id.to_string(), location.asset_id.to_string(), storage_id.to_string(), path.clone(), json(&location)?)).await?;
+            connection
+                .execute(
+                    "INSERT INTO asset_locations(id,asset_id,storage_id,object_id,payload) VALUES(?1,?2,?3,?4,?5)",
+                    (
+                        location.id.to_string(),
+                        location.asset_id.to_string(),
+                        storage_id.to_string(),
+                        path.clone(),
+                        json(&location)?,
+                    ),
+                )
+                .await?;
         }
     }
 
@@ -546,7 +573,9 @@ INSERT INTO catalog_schema_version(singleton,version,updated_at) VALUES(1,3,'197
     ] {
         ensure_column(connection, table, column, definition).await?;
     }
-    backfill_sync_job_indexes(connection).await?;
+    if sync_job_index_backfill_required(connection).await? {
+        backfill_sync_job_indexes(connection).await?;
+    }
     connection.execute_batch(r#"
 CREATE INDEX IF NOT EXISTS idx_storage_objects_current ON storage_objects(storage_id,is_current,object_id);
 CREATE INDEX IF NOT EXISTS idx_candidates_filter ON match_candidates(track_id,asset_id,storage_id,confidence,review_required,id);
@@ -561,6 +590,18 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_logical_fingerprint ON catalog_snapshot
 CREATE INDEX IF NOT EXISTS idx_inventory_latest ON inventory_generations(storage_id,status,finished_at DESC);
 "#).await?;
     Ok(())
+}
+
+/// Legacy Stage 2A rows can lack the indexed values mirrored from their JSON payload. Once
+/// populated, do not scan and rewrite every job again at application startup.
+async fn sync_job_index_backfill_required(connection: &Connection) -> Result<bool, MigrationError> {
+    let mut rows = connection
+        .query(
+            "SELECT 1 FROM sync_jobs WHERE kind IS NULL OR status IS NULL OR idempotency_key IS NULL OR idempotency_key='' LIMIT 1",
+            (),
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
 }
 
 async fn backfill_sync_job_indexes(connection: &Connection) -> Result<(), MigrationError> {

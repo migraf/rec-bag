@@ -24,6 +24,11 @@ pub use types::{
 };
 pub use waveform::WaveformAnalyzer;
 
+/// Maximum number of mono samples to decode. This caps memory usage at roughly
+/// 400 MB of f32 samples (100 million samples ≈ ~38 minutes at 44.1 kHz).
+/// Files longer than this are analyzed using only the first portion.
+const MAX_DECODE_SAMPLES: usize = 100_000_000;
+
 use std::path::Path;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -170,12 +175,15 @@ fn decode_audio(path: &Path) -> Result<(Vec<f32>, u32), AnalysisError> {
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| AnalysisError::Decoder(e.to_string()))?;
 
-    // Collect all samples
+    // Collect all samples, capped at MAX_DECODE_SAMPLES to prevent OOM on very large files.
     let mut all_samples: Vec<f32> = Vec::new();
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     // Read all packets
     loop {
+        if all_samples.len() >= MAX_DECODE_SAMPLES {
+            break;
+        }
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(symphonia::core::errors::Error::IoError(ref e))

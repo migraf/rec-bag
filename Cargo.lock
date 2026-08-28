@@ -1548,6 +1548,8 @@ dependencies = [
  "subtle",
  "thiserror 2.0.17",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "ui",
  "url",
  "uuid",

@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use crate::{
@@ -224,6 +225,7 @@ impl IntegrationController {
         state
             .events
             .push(IntegrationEvent::RequestQueued { id, slice });
+        tracing::debug!(request_id = id, ?slice, action = ?state.pending.back().expect("request was just queued").event, "integration request queued");
         Some(id)
     }
 
@@ -306,7 +308,18 @@ impl IntegrationContext {
                 .find(|request| request.id == request_id)
                 .map(|request| request.slice);
             if let (Some(runtime), Some(slice)) = (&self.runtime.read().runtime, slice) {
+                tracing::debug!(
+                    request_id,
+                    ?slice,
+                    "waking integration slice for queued request"
+                );
                 runtime.wake(slice);
+            } else {
+                tracing::debug!(
+                    request_id,
+                    ?slice,
+                    "request queued while integration runtime is still starting"
+                );
             }
         }
         request_id
@@ -403,22 +416,25 @@ impl IntegrationContext {
 
 /// Installs desktop integration state. The fullstack server intentionally supplies `None`: it
 /// serves assets and server functions but must not open or own a local desktop profile.
+///
+/// On desktop builds without a pre-opened runtime the integration is opened asynchronously
+/// so the UI appears immediately.
 pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, IntegrationError>>) {
     let app_state = super::use_app_state();
     let mut state = IntegrationState::default();
     let mut slot = RuntimeSlot::default();
     match startup {
-        Some(Ok(DesktopStartup::Ready(runtime))) => {
-            slot.runtime = Some(runtime);
+        Some(Ok(DesktopStartup::Ready(ref runtime))) => {
+            slot.runtime = Some(runtime.clone());
         }
-        Some(Ok(DesktopStartup::OwnershipBlocked(offer))) => {
+        Some(Ok(DesktopStartup::OwnershipBlocked(ref offer))) => {
             state.ownership_blocked_by = Some(offer.owner_device.clone());
             state.events.push(IntegrationEvent::OwnershipBlocked {
                 owner_device: offer.owner_device.clone(),
             });
-            slot.takeover = Some(offer);
+            slot.takeover = Some(offer.clone());
         }
-        Some(Err(error)) => state.report_error(error),
+        Some(Err(ref error)) => state.report_error(error.clone()),
         None => {}
     }
     if let Some(runtime) = &slot.runtime {
@@ -428,11 +444,71 @@ pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, Int
         }
     }
     let mut state = Signal::new(state);
-    let runtime_slot = Signal::new(slot);
+    let mut runtime_slot = Signal::new(slot);
     use_context_provider(|| IntegrationContext {
         state,
         runtime: runtime_slot,
     });
+
+    // On desktop, open the integration on a background tokio task when no pre-opened
+    // runtime was supplied so the UI renders immediately. The heavy catalog, migration,
+    // and provider setup runs off the Dioxus executor; only the final signal writes
+    // happen back on the UI thread.
+    #[cfg(feature = "desktop")]
+    {
+        let needs_open = startup.is_none();
+        use_future(move || async move {
+            if !needs_open {
+                return;
+            }
+            tracing::info!("desktop integration startup task started");
+            let mut startup = tokio::task::spawn(async move { DesktopIntegration::open().await });
+            let startup_result = tokio::select! {
+                result = &mut startup => result,
+                _ = tokio::time::sleep(Duration::from_secs(45)) => {
+                    tracing::warn!("desktop integration startup has exceeded 45 seconds; allowing catalog recovery to continue");
+                    startup.await
+                }
+            };
+            let result = startup_result.unwrap_or_else(|error| {
+                Err(IntegrationError {
+                    request_id: None,
+                    slice: None,
+                    message: format!("Integration startup task panicked: {error}"),
+                    retryable: false,
+                })
+            });
+            match result {
+                Ok(DesktopStartup::Ready(runtime)) => {
+                    tracing::info!("desktop integration startup completed");
+                    let _ =
+                        crate::INTEGRATION_STARTUP.set(Ok(DesktopStartup::Ready(runtime.clone())));
+                    for error in runtime.startup_errors() {
+                        state.write().report_error(error.clone());
+                    }
+                    runtime_slot.write().runtime = Some(runtime);
+                }
+                Ok(DesktopStartup::OwnershipBlocked(offer)) => {
+                    tracing::warn!(owner_device = %offer.owner_device, "desktop integration startup is blocked by another profile manager");
+                    let _ = crate::INTEGRATION_STARTUP
+                        .set(Ok(DesktopStartup::OwnershipBlocked(offer.clone())));
+                    state.write().ownership_blocked_by = Some(offer.owner_device.clone());
+                    state
+                        .write()
+                        .events
+                        .push(IntegrationEvent::OwnershipBlocked {
+                            owner_device: offer.owner_device.clone(),
+                        });
+                    runtime_slot.write().takeover = Some(offer);
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "desktop integration startup failed");
+                    let _ = crate::INTEGRATION_STARTUP.set(Err(error.clone()));
+                    state.write().report_error(error);
+                }
+            }
+        });
+    }
 
     // React to a runtime that is installed after a confirmed ownership takeover as well as the
     // runtime available at launch. `use_future` runs only once and would otherwise leave a
@@ -453,16 +529,24 @@ pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, Int
                 .write()
                 .events
                 .push(IntegrationEvent::SchedulerStarted);
-            match runtime.initial_view().await {
-                Ok(view) => {
-                    state.write().view = view;
-                    if let Err(error) = refresh_app_catalog(app_state, runtime.catalog()).await {
-                        state.write().report_error(error);
-                    }
-                }
-                Err(error) => state.write().report_error(error),
-            }
+            // Start slice runners immediately so user-dispatched events are
+            // handled without waiting for the initial view projection to finish.
+            let mut view_state = state;
+            let view_runtime = runtime.clone();
             tokio::join!(
+                async move {
+                    match view_runtime.initial_view().await {
+                        Ok(view) => {
+                            view_state.write().view = view;
+                            if let Err(error) =
+                                refresh_app_catalog(app_state, view_runtime.catalog()).await
+                            {
+                                view_state.write().report_error(error);
+                            }
+                        }
+                        Err(error) => view_state.write().report_error(error),
+                    }
+                },
                 run_slice(
                     state,
                     app_state,
@@ -499,10 +583,10 @@ async fn run_slice(
     runtime: Arc<DesktopIntegration>,
     slice: IntegrationSlice,
 ) {
+    tracing::info!(?slice, "integration slice runner started");
     loop {
-        if !runtime.wait_for_work(slice).await {
-            return;
-        }
+        // Drain first: a user can queue work while the integration runtime is opening, before
+        // this runner has registered its Notify waiter.
         loop {
             let request = {
                 let mut snapshot = state.write();
@@ -512,15 +596,19 @@ async fn run_slice(
                 break;
             };
             let request_id = request.id;
+            tracing::info!(request_id, ?slice, action = ?request.event, "integration request started");
             match runtime.execute(request).await {
                 Ok(outcome) => {
+                    tracing::info!(request_id, ?slice, message = ?outcome.message, "integration request completed");
                     IntegrationController::complete(&mut state.write(), request_id, outcome);
                     if let Err(error) = refresh_app_catalog(app_state, runtime.catalog()).await {
+                        tracing::warn!(?slice, error = %error, "playable catalog refresh failed after integration request");
                         state.write().report_error(error);
                     }
                 }
                 Err(error) => {
                     let retryable = error.retryable;
+                    tracing::warn!(request_id, ?slice, retryable, error = %error, "integration request failed");
                     IntegrationController::fail(
                         &mut state.write(),
                         request_id,
@@ -530,8 +618,15 @@ async fn run_slice(
                 }
             }
             if runtime.is_shutdown() {
+                tracing::info!(?slice, "integration slice runner stopped during shutdown");
                 return;
             }
+        }
+
+        tracing::debug!(?slice, "integration slice waiting for work");
+        if !runtime.wait_for_work(slice).await {
+            tracing::info!(?slice, "integration slice runner stopped");
+            return;
         }
     }
 }
@@ -635,9 +730,8 @@ fn slice_for_event(
         MusicManagementEvent::AddSource(ProviderChoice::LocalFolder) => {
             Ok(IntegrationSlice::LocalLibrary)
         }
-        MusicManagementEvent::AddSource(ProviderChoice::SoundCloud) => {
-            Ok(IntegrationSlice::SoundcloudCatalog)
-        }
+        MusicManagementEvent::AddSource(ProviderChoice::SoundCloud)
+        | MusicManagementEvent::ConfigureSoundCloud(_) => Ok(IntegrationSlice::SoundcloudCatalog),
         MusicManagementEvent::AddSource(ProviderChoice::GoogleDrive) => {
             Ok(IntegrationSlice::GoogleDrive)
         }

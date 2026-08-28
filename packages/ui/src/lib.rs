@@ -38,9 +38,9 @@ pub use music_management::{
     ExternalChangeView, FailedReconciliationView, HealthTone, JobProgressView, MatchCandidateView,
     MusicManagementDashboard, MusicManagementDashboardProps, MusicManagementEvent,
     MusicManagementMock, MusicManagementView, PlaylistCompletenessView, PrimaryConfigurationView,
-    PrimaryMetadataUpdateView, PrimaryMigrationPlanView, ProviderChoice, SourceCollectionView,
-    SourceView, StorageRoleView, StorageView, TrackFilter, TrackStorageStatusView,
-    TrackStorageView, UnknownPrimaryFileView,
+    PrimaryMetadataUpdateView, PrimaryMigrationPlanView, ProviderChoice,
+    SoundCloudConfigurationView, SourceCollectionView, SourceView, StorageRoleView, StorageView,
+    TrackFilter, TrackStorageStatusView, TrackStorageView, UnknownPrimaryFileView,
 };
 
 mod search_bar;

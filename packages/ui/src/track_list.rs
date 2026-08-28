@@ -8,6 +8,11 @@ use uuid::Uuid;
 
 const TRACK_LIST_CSS: Asset = asset!("/assets/components/track-list.css");
 
+/// Maximum number of tracks to render in the DOM at once to prevent
+/// excessive memory usage in the webview. Tracks beyond this limit are
+/// hidden and the user is prompted to use search or folder filtering.
+const MAX_RENDERED_ROWS: usize = 500;
+
 /// Reference to a playlist (for displaying badges).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaylistRef {
@@ -94,6 +99,14 @@ pub fn TrackList(props: TrackListProps) -> Element {
     // Track the last clicked index for shift-selection
     let mut last_clicked_index: Signal<Option<usize>> = use_signal(|| None);
 
+    let total_tracks = props.tracks.len();
+    let display_tracks: &[Track] = if total_tracks > MAX_RENDERED_ROWS {
+        &props.tracks[..MAX_RENDERED_ROWS]
+    } else {
+        &props.tracks
+    };
+    let is_truncated = total_tracks > MAX_RENDERED_ROWS;
+
     rsx! {
         document::Stylesheet { href: TRACK_LIST_CSS }
         div { class: "track-list",
@@ -115,7 +128,7 @@ pub fn TrackList(props: TrackListProps) -> Element {
                     }
                 }
                 tbody {
-                    for (idx, track) in props.tracks.iter().enumerate() {
+                    for (idx, track) in display_tracks.iter().enumerate() {
                         {
                             let id = track.id;
                             let is_selected = props.selected_ids.contains(&id);
@@ -271,6 +284,12 @@ pub fn TrackList(props: TrackListProps) -> Element {
                             }
                         }
                     }
+                }
+            }
+
+            if is_truncated {
+                div { class: "track-list-truncated",
+                    "Showing {MAX_RENDERED_ROWS} of {total_tracks} tracks. Use search or folder filtering to narrow results."
                 }
             }
 

@@ -310,6 +310,15 @@ pub struct PrimaryConfigurationView {
     pub verify_after_copy: bool,
 }
 
+/// Public desktop OAuth values submitted for the SoundCloud connection.
+///
+/// The broker secret is deliberately absent and must never be collected or stored by this UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoundCloudConfigurationView {
+    pub client_id: String,
+    pub redirect_uri: String,
+}
+
 /// Mutable metadata and copy policy for an already configured primary.
 ///
 /// Provider and location are intentionally absent: changing either requires a migration.
@@ -361,6 +370,7 @@ pub struct MusicManagementView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MusicManagementEvent {
     AddSource(ProviderChoice),
+    ConfigureSoundCloud(SoundCloudConfigurationView),
     SyncSource(String),
     RetrySyncRun {
         sync_run_id: String,
@@ -544,6 +554,7 @@ pub fn MusicManagementDashboard(props: MusicManagementDashboardProps) -> Element
     let mut open_match = use_signal(|| None::<String>);
     let mut open_unknown = use_signal(|| None::<String>);
     let mut cleanup_open = use_signal(|| false);
+    let mut soundcloud_configuration_open = use_signal(|| false);
     let mut migration_open = use_signal(|| false);
     let mut primary_editor = use_signal(|| None::<ProviderChoice>);
     let mut backup_policy_editor = use_signal(|| None::<String>);
@@ -566,10 +577,18 @@ pub fn MusicManagementDashboard(props: MusicManagementDashboardProps) -> Element
                         h2 { "Sources" }
                         p { "Catalog connections are independent from where music files are stored." }
                     }
-                    ProviderChooser {
-                        providers: vec![ProviderChoice::LocalFolder, ProviderChoice::SoundCloud],
-                        action_label: "Add source".to_string(),
-                        on_choose: move |provider| on_event.call(MusicManagementEvent::AddSource(provider)),
+                    div { class: "mm-provider-chooser",
+                        button {
+                            class: "mm-button secondary",
+                            "aria-haspopup": "dialog",
+                            onclick: move |_| soundcloud_configuration_open.set(true),
+                            "Configure SoundCloud"
+                        }
+                        ProviderChooser {
+                            providers: vec![ProviderChoice::LocalFolder, ProviderChoice::SoundCloud],
+                            action_label: "Add source".to_string(),
+                            on_choose: move |provider| on_event.call(MusicManagementEvent::AddSource(provider)),
+                        }
                     }
                 }
                 div { class: "mm-source-grid",
@@ -786,6 +805,12 @@ pub fn MusicManagementDashboard(props: MusicManagementDashboardProps) -> Element
                 }
             }
 
+            if soundcloud_configuration_open() {
+                SoundCloudConfigurationDialog {
+                    on_close: move |_| soundcloud_configuration_open.set(false),
+                    on_event,
+                }
+            }
             if let Some(id) = open_match() {
                 if let Some(candidate) = props.view.possible_matches.iter().find(|candidate| candidate.candidate_id == id).cloned() {
                     PossibleMatchDialog {
@@ -1313,6 +1338,63 @@ fn ReviewQueue(props: ReviewQueueProps) -> Element {
                 p { class: "mm-empty-inline", "{props.empty}" }
             } else {
                 div { class: "mm-queue-list", {props.children} }
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+struct SoundCloudConfigurationDialogProps {
+    on_close: EventHandler<()>,
+    on_event: EventHandler<MusicManagementEvent>,
+}
+
+#[component]
+fn SoundCloudConfigurationDialog(props: SoundCloudConfigurationDialogProps) -> Element {
+    let mut client_id = use_signal(String::new);
+    let mut redirect_uri = use_signal(|| "http://127.0.0.1:17841/oauth/soundcloud".to_string());
+
+    rsx! {
+        Modal { title: "Configure SoundCloud".to_string(), on_close: props.on_close,
+            p { class: "mm-message warning",
+                "Client ID and redirect URI are public desktop OAuth settings. The broker secret is never entered or stored here."
+            }
+            label { class: "mm-field",
+                span { "Client ID" }
+                input {
+                    r#type: "text",
+                    value: "{client_id}",
+                    oninput: move |event| client_id.set(event.value()),
+                }
+            }
+            label { class: "mm-field",
+                span { "Redirect URI" }
+                input {
+                    r#type: "url",
+                    value: "{redirect_uri}",
+                    oninput: move |event| redirect_uri.set(event.value()),
+                }
+            }
+            div { class: "mm-dialog-actions",
+                button {
+                    class: "mm-button secondary",
+                    onclick: move |_| props.on_close.call(()),
+                    "Cancel"
+                }
+                button {
+                    class: "mm-button primary",
+                    disabled: client_id().trim().is_empty() || redirect_uri().trim().is_empty(),
+                    onclick: move |_| {
+                        props.on_event.call(MusicManagementEvent::ConfigureSoundCloud(
+                            SoundCloudConfigurationView {
+                                client_id: client_id().trim().to_string(),
+                                redirect_uri: redirect_uri().trim().to_string(),
+                            },
+                        ));
+                        props.on_close.call(());
+                    },
+                    "Save SoundCloud setup"
+                }
             }
         }
     }

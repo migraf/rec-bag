@@ -279,3 +279,13 @@
     background: rgba(0, 149, 179, 0.3);
 }
 
+/* Truncation notice */
+.track-list-truncated {
+    padding: 0.75rem 1rem;
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border-top: 1px solid var(--border-color);
+}
+

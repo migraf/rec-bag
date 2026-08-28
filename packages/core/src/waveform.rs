@@ -17,6 +17,10 @@ use thiserror::Error;
 /// Higher values = more detail, larger data size.
 const POINTS_PER_SECOND: usize = 100;
 
+/// Maximum number of mono samples to decode for waveform extraction.
+/// Caps memory usage at roughly 400 MB (~38 minutes at 44.1 kHz).
+const MAX_WAVEFORM_SAMPLES: usize = 100_000_000;
+
 /// Errors that can occur during waveform extraction.
 #[derive(Debug, Error)]
 pub enum WaveformError {
@@ -125,12 +129,15 @@ pub fn extract_waveform(path: impl AsRef<Path>) -> Result<WaveformData, Waveform
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| WaveformError::Decoder(e.to_string()))?;
 
-    // Collect all samples and compute peaks
+    // Collect all samples and compute peaks, capped to prevent OOM on very large files.
     let mut all_samples: Vec<f32> = Vec::new();
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     // Read all packets
     loop {
+        if all_samples.len() >= MAX_WAVEFORM_SAMPLES {
+            break;
+        }
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(symphonia::core::errors::Error::IoError(ref e))

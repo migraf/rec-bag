@@ -191,6 +191,23 @@ impl PlaybackPathResolver for RuntimePlaybackResolver {
                 }
             }
 
+            // Fall back to source occurrences for tracks that only exist in local
+            // sources and have not yet been copied to a managed storage. Uses an
+            // indexed query on canonical_track_id to avoid a full table scan.
+            let source_paths = self
+                .catalog
+                .local_source_paths_for_track(track_id)
+                .await
+                .unwrap_or_default();
+            for path in source_paths {
+                if path.is_file() {
+                    return Ok(ResolvedPlaybackPath {
+                        path,
+                        cached: false,
+                    });
+                }
+            }
+
             Err(last_error.unwrap_or_else(|| {
                 PlaybackPathError::new(format!(
                     "track {track_id} has no verified available asset location"

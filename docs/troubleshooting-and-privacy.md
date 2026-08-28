@@ -45,7 +45,7 @@ A copied catalog does not include tokens. Reauthorize on the destination device.
 
 ### “SoundCloud is not configured”
 
-Set `REC_BAG_SOUNDCLOUD_CLIENT_ID`, confirm the desktop redirect, restart, and ensure the broker uses the matching application client ID/secret and exact allow-list entry.
+Open **Music Management → Configure SoundCloud**, enter the public client ID and registered desktop redirect, then save. Confirm the broker uses the matching application client ID/secret and exact allow-list entry. The broker secret is server-only and is never entered in rec_bag.
 
 ### Callback port cannot bind or authorization times out
 

@@ -48,11 +48,11 @@ Recommended desktop configuration:
 
 ```dotenv
 REC_BAG_DATA_DIR=/absolute/private/path
-REC_BAG_SOUNDCLOUD_CLIENT_ID=public-soundcloud-client-id
-REC_BAG_SOUNDCLOUD_REDIRECT_URI=http://127.0.0.1:17841/oauth/soundcloud
 REC_BAG_GOOGLE_CLIENT_ID=google-installed-app-client-id
 REC_BAG_GOOGLE_REDIRECT_URI=http://127.0.0.1:17842/oauth/google
 ```
+
+Configure the public SoundCloud client ID and registered loopback redirect in **Music Management → Configure SoundCloud**. rec_bag validates and stores those desktop-safe values in the local profile; no restart is needed. The SoundCloud broker client secret is server-only and is never collected by the desktop UI.
 
 Optional local-folder override:
 

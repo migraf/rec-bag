@@ -2,6 +2,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    io::ErrorKind,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -32,8 +34,8 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex as AsyncMutex;
 use ui::{
     CompletenessView, HealthTone, JobProgressView, MusicManagementEvent, MusicManagementView,
-    PlaylistCompletenessView, ProviderChoice, SourceCollectionView, SourceView,
-    TrackStorageStatusView, TrackStorageView,
+    PlaylistCompletenessView, ProviderChoice, SoundCloudConfigurationView, SourceCollectionView,
+    SourceView, TrackStorageStatusView, TrackStorageView,
 };
 use url::Url;
 use uuid::Uuid;
@@ -54,6 +56,13 @@ const MAX_CALLBACK_URL_BYTES: usize = 16 * 1024;
 #[cfg(feature = "desktop")]
 const SIGN_OUT_URL: &str = "https://secure.soundcloud.com/sign-out";
 const FORGOTTEN_CONFIG_KEY: &str = "soundcloud_catalog_forgotten";
+const DESKTOP_OAUTH_CONFIGURATION_FILE: &str = "soundcloud-desktop-oauth.json";
+
+fn desktop_oauth_configuration_path(catalog: &TursoCatalog) -> Option<PathBuf> {
+    catalog
+        .path()
+        .map(|catalog_path| catalog_path.with_file_name(DESKTOP_OAUTH_CONFIGURATION_FILE))
+}
 
 fn integration_error(message: impl Into<String>, retryable: bool) -> IntegrationError {
     IntegrationError {
@@ -119,6 +128,36 @@ impl SoundCloudOAuthClientConfig {
                 .expect("the fixed SoundCloud authorization URL is valid"),
             callback_timeout: CALLBACK_TIMEOUT,
         })
+    }
+
+    fn from_view(view: &SoundCloudConfigurationView) -> Result<Self, IntegrationError> {
+        let redirect_uri = Url::parse(view.redirect_uri.trim())
+            .map_err(|_| integration_error("SoundCloud redirect URI is invalid", false))?;
+        Self::new(view.client_id.trim(), redirect_uri)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedSoundCloudOAuthConfiguration {
+    client_id: String,
+    redirect_uri: String,
+}
+
+impl From<&SoundCloudConfigurationView> for PersistedSoundCloudOAuthConfiguration {
+    fn from(view: &SoundCloudConfigurationView) -> Self {
+        Self {
+            client_id: view.client_id.trim().to_owned(),
+            redirect_uri: view.redirect_uri.trim().to_owned(),
+        }
+    }
+}
+
+impl From<PersistedSoundCloudOAuthConfiguration> for SoundCloudConfigurationView {
+    fn from(configuration: PersistedSoundCloudOAuthConfiguration) -> Self {
+        Self {
+            client_id: configuration.client_id,
+            redirect_uri: configuration.redirect_uri,
+        }
     }
 }
 
@@ -715,7 +754,7 @@ fn refresh_metadata(
 
 /// Complete SoundCloud vertical-slice service.
 pub struct SoundCloudCatalogService {
-    config: SoundCloudOAuthClientConfig,
+    config: AsyncMutex<Option<SoundCloudOAuthClientConfig>>,
     user_agent: Arc<dyn OAuthUserAgent>,
     credentials: Arc<dyn CredentialStore>,
     broker: Arc<dyn SoundCloudBrokerClient>,
@@ -736,8 +775,26 @@ impl SoundCloudCatalogService {
         connectors: Arc<dyn SoundCloudConnectorFactory>,
         catalog: Arc<TursoCatalog>,
     ) -> Self {
+        Self::new_with_optional_config(
+            Some(config),
+            user_agent,
+            credentials,
+            broker,
+            connectors,
+            catalog,
+        )
+    }
+
+    pub fn new_with_optional_config(
+        config: Option<SoundCloudOAuthClientConfig>,
+        user_agent: Arc<dyn OAuthUserAgent>,
+        credentials: Arc<dyn CredentialStore>,
+        broker: Arc<dyn SoundCloudBrokerClient>,
+        connectors: Arc<dyn SoundCloudConnectorFactory>,
+        catalog: Arc<TursoCatalog>,
+    ) -> Self {
         Self {
-            config,
+            config: AsyncMutex::new(config),
             user_agent,
             credentials,
             broker,
@@ -750,6 +807,50 @@ impl SoundCloudCatalogService {
         }
     }
 
+    pub async fn load_persisted_configuration(
+        catalog: &TursoCatalog,
+    ) -> Result<Option<SoundCloudOAuthClientConfig>, IntegrationError> {
+        let Some(path) = desktop_oauth_configuration_path(catalog) else {
+            return Ok(None);
+        };
+        let contents = match std::fs::read(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(_) => {
+                return Err(integration_error(
+                    "Could not read saved SoundCloud desktop OAuth settings",
+                    true,
+                ))
+            }
+        };
+        let persisted = serde_json::from_slice::<PersistedSoundCloudOAuthConfiguration>(&contents)
+            .map_err(|_| {
+                integration_error(
+                    "Saved SoundCloud desktop OAuth settings are invalid; configure SoundCloud again",
+                    false,
+                )
+            })?;
+        SoundCloudOAuthClientConfig::from_view(&persisted.into()).map(Some)
+    }
+
+    async fn configure(
+        &self,
+        configuration: SoundCloudConfigurationView,
+    ) -> Result<(), IntegrationError> {
+        let config = SoundCloudOAuthClientConfig::from_view(&configuration)?;
+        let persisted = PersistedSoundCloudOAuthConfiguration::from(&configuration);
+        if let Some(path) = desktop_oauth_configuration_path(self.catalog.as_ref()) {
+            let contents = serde_json::to_vec(&persisted).map_err(|_| {
+                integration_error("Could not save SoundCloud desktop OAuth settings", false)
+            })?;
+            std::fs::write(path, contents).map_err(|_| {
+                integration_error("Could not save SoundCloud desktop OAuth settings", true)
+            })?;
+        }
+        *self.config.lock().await = Some(config);
+        Ok(())
+    }
+
     pub fn with_sign_out_client(mut self, sign_out: Arc<dyn SoundCloudSignOutClient>) -> Self {
         self.sign_out = sign_out;
         self
@@ -757,6 +858,12 @@ impl SoundCloudCatalogService {
 
     pub async fn connect(&self) -> Result<MusicManagementView, IntegrationError> {
         let _operation = self.operation_lock.lock().await;
+        let config = self.config.lock().await.clone().ok_or_else(|| {
+            integration_error(
+                "SoundCloud is not configured. Open Music Management and choose Configure SoundCloud before connecting.",
+                false,
+            )
+        })?;
         let mut source = self
             .existing_soundcloud_source()
             .await?
@@ -782,13 +889,13 @@ impl SoundCloudCatalogService {
                 },
             );
         }
-        let authorization_url = self.authorization_url(&state, &challenge);
+        let authorization_url = Self::authorization_url(&config, &state, &challenge);
         let callback = self
             .user_agent
             .authorize(
                 authorization_url,
-                self.config.redirect_uri.clone(),
-                self.config.callback_timeout,
+                config.redirect_uri.clone(),
+                config.callback_timeout,
             )
             .await;
         let pending = self
@@ -798,7 +905,7 @@ impl SoundCloudCatalogService {
             .remove(&source_id)
             .ok_or_else(|| integration_error("OAuth authorization state expired", false))?;
         let callback = callback?;
-        if !same_callback_endpoint(&callback, &self.config.redirect_uri) {
+        if !same_callback_endpoint(&callback, &config.redirect_uri) {
             return Err(integration_error(
                 "OAuth callback endpoint did not match the registered redirect",
                 false,
@@ -831,7 +938,7 @@ impl SoundCloudCatalogService {
             .exchange_authorization_code(SoundCloudAuthorizationCodeExchange {
                 code,
                 code_verifier: pending.verifier,
-                redirect_uri: self.config.redirect_uri.to_string(),
+                redirect_uri: config.redirect_uri.to_string(),
                 state: parsed.state,
             })
             .await?;
@@ -1308,12 +1415,16 @@ impl SoundCloudCatalogService {
         Ok(())
     }
 
-    fn authorization_url(&self, state: &str, challenge: &str) -> Url {
-        let mut url = self.config.authorization_endpoint.clone();
+    fn authorization_url(
+        config: &SoundCloudOAuthClientConfig,
+        state: &str,
+        challenge: &str,
+    ) -> Url {
+        let mut url = config.authorization_endpoint.clone();
         url.query_pairs_mut()
             .append_pair("response_type", "code")
-            .append_pair("client_id", &self.config.client_id)
-            .append_pair("redirect_uri", self.config.redirect_uri.as_str())
+            .append_pair("client_id", &config.client_id)
+            .append_pair("redirect_uri", config.redirect_uri.as_str())
             .append_pair("code_challenge", challenge)
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", state);
@@ -1576,6 +1687,13 @@ impl IntegrationSliceHandler for SoundCloudCatalogService {
                     "Request belongs to another integration slice",
                     false,
                 ));
+            }
+            if let MusicManagementEvent::ConfigureSoundCloud(configuration) = &request.event {
+                self.configure(configuration.clone()).await?;
+                return Ok(IntegrationOutcome {
+                    view: None,
+                    message: Some("SoundCloud desktop OAuth settings saved".to_string()),
+                });
             }
             let result = match &request.event {
                 MusicManagementEvent::AddSource(ProviderChoice::SoundCloud) => self.connect().await,
@@ -2452,6 +2570,61 @@ mod tests {
         (service, user_agent, broker, credentials, connector)
     }
 
+    #[tokio::test]
+    async fn desktop_oauth_configuration_is_persisted_and_reloaded() {
+        let root =
+            std::env::temp_dir().join(format!("rec-bag-soundcloud-config-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Arc::new(TursoCatalog::open(root.join("library.db")).await.unwrap());
+        let configuration_path = desktop_oauth_configuration_path(catalog.as_ref()).unwrap();
+        let connector = Arc::new(QueueConnector {
+            pages: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+        });
+        let service = SoundCloudCatalogService::new_with_optional_config(
+            None,
+            Arc::new(MockUserAgent::successful()),
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(MockBroker::default()),
+            Arc::new(FixedFactory(connector)),
+            catalog.clone(),
+        );
+        let configuration = SoundCloudConfigurationView {
+            client_id: "public-client-id".to_string(),
+            redirect_uri: "http://127.0.0.1:32123/callback".to_string(),
+        };
+
+        let outcome = service
+            .handle(IntegrationRequest {
+                id: 1,
+                slice: IntegrationSlice::SoundcloudCatalog,
+                event: MusicManagementEvent::ConfigureSoundCloud(configuration.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.message.as_deref(),
+            Some("SoundCloud desktop OAuth settings saved")
+        );
+        assert!(outcome.view.is_none());
+
+        let saved = std::fs::read(configuration_path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<PersistedSoundCloudOAuthConfiguration>(&saved).unwrap(),
+            PersistedSoundCloudOAuthConfiguration::from(&configuration)
+        );
+
+        let reloaded = SoundCloudCatalogService::load_persisted_configuration(catalog.as_ref())
+            .await
+            .unwrap()
+            .expect("configuration must reload");
+        assert_eq!(reloaded.client_id, configuration.client_id);
+        assert_eq!(reloaded.redirect_uri.as_str(), configuration.redirect_uri);
+        drop(service);
+        drop(catalog);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn pkce_is_url_safe_s256_and_has_required_entropy() {
         let (state, verifier, challenge) = generate_pkce().unwrap();
@@ -2523,8 +2696,14 @@ mod tests {
             callback: Mutex::new(None),
             opened: Mutex::new(Vec::new()),
         });
+        let config = service
+            .config
+            .lock()
+            .await
+            .clone()
+            .expect("fixture config must be present");
         let service = SoundCloudCatalogService::new(
-            service.config.clone(),
+            config,
             bad_agent,
             service.credentials.clone(),
             broker.clone(),

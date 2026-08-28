@@ -951,6 +951,42 @@ impl TursoCatalog {
             }
         }
     }
+
+    /// Returns resolved local file paths for a track that exists in local folder sources
+    /// but may not yet have managed storage locations. Unlike `list_occurrences`, this
+    /// uses an indexed query on `canonical_track_id` to avoid a full table scan.
+    pub async fn local_source_paths_for_track(
+        &self,
+        track_id: Uuid,
+    ) -> RepositoryResult<Vec<std::path::PathBuf>> {
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT o.payload, s.payload FROM source_track_occurrences o JOIN catalog_sources s ON s.id = o.source_id WHERE o.canonical_track_id = ?1",
+                [track_id.to_string()],
+            )
+            .await
+            .map_err(database_error)?;
+        let mut paths = Vec::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            let occurrence: SourceTrackOccurrence =
+                decode(row.get::<String>(0).map_err(database_error)?)?;
+            let source: CatalogSource = decode(row.get::<String>(1).map_err(database_error)?)?;
+            if source.kind != CatalogSourceKind::LocalFolder {
+                continue;
+            }
+            let Some(root) = source.config.get("path") else {
+                continue;
+            };
+            let Some(relative) = occurrence.provider_metadata.get("relative_path") else {
+                continue;
+            };
+            if let MetadataValue::Text(relative) = relative {
+                paths.push(std::path::PathBuf::from(root).join(relative));
+            }
+        }
+        Ok(paths)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

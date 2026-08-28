@@ -53,7 +53,7 @@ use super::{
     },
     soundcloud_catalog::{
         ApiSoundCloudBrokerClient, OAuthUserAgent, ProductionSoundCloudConnectorFactory,
-        SoundCloudCatalogService, SoundCloudOAuthClientConfig,
+        SoundCloudCatalogService,
     },
 };
 use crate::state::integration::{
@@ -204,6 +204,9 @@ pub struct DesktopIntegration {
     previous_owner_device: Option<String>,
     drive_registry: Arc<DriveRuntimeRegistry>,
     backup_providers: Arc<BackupProviderRegistry>,
+    /// Turso's local connection rejects concurrent operations. All UI and scheduler catalog
+    /// access shares this gate while the desktop runtime owns the profile.
+    catalog_operation_lock: Arc<Mutex<()>>,
     projection_lock: Mutex<()>,
     asset_resolver: Arc<dyn AssetResolver>,
     wakes: BTreeMap<IntegrationSlice, Arc<Notify>>,
@@ -219,7 +222,9 @@ pub struct DesktopIntegration {
 impl DesktopIntegration {
     /// Acquires the one-active-manager lease before opening or migrating the catalog.
     pub async fn open() -> Result<DesktopStartup, IntegrationError> {
+        tracing::info!("desktop integration startup: resolving data paths");
         let paths = DesktopPaths::load()?;
+        tracing::info!(data_root = %paths.root.display(), "desktop integration startup: preparing profile manager");
         let manager = ProfileManager::new(
             paths.root.clone(),
             ManagerIdentity::new("default", device_identity()),
@@ -227,14 +232,20 @@ impl DesktopIntegration {
         )
         .map_err(ownership_error)?;
         let now = Utc::now();
-        let previous_owner_device = match manager.status(now).map_err(ownership_error)? {
-            OwnershipStatus::Stale(lease) => Some(lease.device_id),
-            _ => None,
+        tracing::debug!("desktop integration startup: reading profile ownership");
+        let status = manager.status(now).map_err(ownership_error)?;
+        let previous_owner_device = match status {
+            OwnershipStatus::Available | OwnershipStatus::Corrupt(_) => None,
+            OwnershipStatus::Owned(lease) | OwnershipStatus::Stale(lease) => Some(lease.device_id),
         };
+        tracing::debug!("desktop integration startup: acquiring profile ownership");
         match manager.acquire(now) {
-            Ok(lease) => Self::open_owned(paths, manager, lease, previous_owner_device)
-                .await
-                .map(DesktopStartup::Ready),
+            Ok(lease) => {
+                tracing::info!(takeover_reason = ?lease.takeover_reason, "desktop integration startup: profile ownership acquired");
+                Self::open_owned(paths, manager, lease, previous_owner_device)
+                    .await
+                    .map(DesktopStartup::Ready)
+            }
             Err(ProfileManagerError::AlreadyOwned { .. }) => {
                 let confirmation = manager
                     .prepare_assume_ownership(Utc::now())
@@ -273,22 +284,26 @@ impl DesktopIntegration {
         lease: OwnershipLease,
         previous_owner_device: Option<String>,
     ) -> Result<Arc<Self>, IntegrationError> {
+        tracing::info!(catalog_path = %paths.catalog.display(), "desktop integration startup: opening catalog");
         let catalog = Arc::new(TursoCatalog::open(&paths.catalog).await.map_err(|error| {
             startup_error(format!(
                 "Could not open the music catalog at {}: {error}",
                 paths.catalog.display()
             ))
         })?);
+        tracing::info!("desktop integration startup: catalog opened and migrations completed");
         let recovery = Arc::new(RecoveryService::new(
             catalog.clone(),
             paths.snapshots.clone(),
         ));
         let mut startup_errors = Vec::new();
+        tracing::debug!("desktop integration startup: checking interrupted recovery");
         if let Some(progress) = recovery.recover_interrupted().await.map_err(|error| {
             startup_error(format!("Could not reconcile interrupted recovery: {error}"))
         })? {
             startup_errors.push(startup_error(progress.message));
         }
+        tracing::debug!("desktop integration startup: persisting catalog authority");
         recovery
             .persist_catalog_authority(&manager, &lease)
             .await
@@ -296,11 +311,13 @@ impl DesktopIntegration {
                 startup_error(format!("Could not persist profile authority: {error}"))
             })?;
 
+        tracing::debug!("desktop integration startup: creating local-library services");
         let credentials = production_credentials();
         let local = Arc::new(LocalLibraryService::new(
             catalog.clone(),
             production_local_selection(),
         ));
+        tracing::debug!("desktop integration startup: checking local-library migration");
         match adopt_migrated_local_library(catalog.as_ref(), local.as_ref()).await {
             Ok(StartupAdoption::NotNeeded | StartupAdoption::Adopted) => {}
             Ok(StartupAdoption::NeedsSelection(message)) => {
@@ -309,7 +326,8 @@ impl DesktopIntegration {
             Err(error) => startup_errors.push(error),
         }
 
-        let soundcloud = Arc::new(soundcloud_service(catalog.clone(), credentials.clone())?);
+        tracing::debug!("desktop integration startup: loading SoundCloud configuration");
+        let soundcloud = Arc::new(soundcloud_service(catalog.clone(), credentials.clone()).await?);
         let google_oauth = production_google_oauth();
         let drive_factory = production_drive_factory(
             credentials.clone(),
@@ -333,6 +351,7 @@ impl DesktopIntegration {
             backup_providers.clone(),
             paths.staging.join("backup"),
         ));
+        tracing::debug!(staging_path = %paths.staging.display(), "desktop integration startup: reconciling staging files");
         reconcile_staging(&paths.staging).map_err(|error| {
             startup_error(format!("Could not reconcile staging directory: {error}"))
         })?;
@@ -345,6 +364,7 @@ impl DesktopIntegration {
         registry.register(backup.clone());
         registry.register(reconciliation);
 
+        tracing::debug!("desktop integration startup: registering configured storage providers");
         initialize_storage_registries(
             catalog.as_ref(),
             drive_registry.clone(),
@@ -353,6 +373,10 @@ impl DesktopIntegration {
         )
         .await;
 
+        tracing::info!(
+            startup_warnings = startup_errors.len(),
+            "desktop integration startup: services ready"
+        );
         let resolver = Arc::new(DesktopAssetResolver {
             catalog: catalog.clone(),
             drive,
@@ -405,6 +429,7 @@ impl DesktopIntegration {
             previous_owner_device,
             drive_registry,
             backup_providers,
+            catalog_operation_lock: Arc::new(Mutex::new(())),
             projection_lock: Mutex::new(()),
             asset_resolver,
             wakes,
@@ -435,6 +460,7 @@ impl DesktopIntegration {
     }
 
     pub fn wake(&self, slice: IntegrationSlice) {
+        tracing::debug!(?slice, "integration slice wake requested");
         if let Some(wake) = self.wakes.get(&slice) {
             wake.notify_one();
         }
@@ -454,6 +480,7 @@ impl DesktopIntegration {
         &self,
         request: IntegrationRequest,
     ) -> Result<IntegrationOutcome, IntegrationError> {
+        tracing::debug!(request_id = request.id, slice = ?request.slice, action = ?request.event, "dispatching integration request to provider handler");
         let _operation = self.begin_operation(&request)?;
         if self.is_shutdown() {
             return Err(IntegrationError::for_request(
@@ -463,6 +490,7 @@ impl DesktopIntegration {
             ));
         }
         self.require_ownership(Some(&request))?;
+        let _catalog_operation = self.catalog_operation_lock.lock().await;
         if matches!(
             request.event,
             ui::MusicManagementEvent::PreparePrimaryMigration(_)
@@ -481,6 +509,7 @@ impl DesktopIntegration {
             )
         })?;
         let mut outcome = handler.handle(request.clone()).await?;
+        tracing::debug!(request_id = request.id, slice = ?request.slice, "provider handler completed; processing cross-slice work");
         if let Some(reason) = snapshot_reason_for_event(&request.event) {
             self.record_snapshot(reason, None).await.map_err(|error| {
                 IntegrationError::for_request(&request, error.message, error.retryable)
@@ -488,6 +517,12 @@ impl DesktopIntegration {
         }
         self.complete_cross_slice_handoffs(&request, &mut outcome)
             .await;
+        if matches!(
+            request.event,
+            ui::MusicManagementEvent::ConfigureSoundCloud(_)
+        ) {
+            return Ok(outcome);
+        }
 
         // Handler projections may overlap. Serialize the final catalog projection so a
         // slower slice cannot overwrite newer data with a stale full view.
@@ -528,7 +563,8 @@ impl DesktopIntegration {
     ) {
         let storage_changed = matches!(
             request.event,
-            ui::MusicManagementEvent::AddBackup(_)
+            ui::MusicManagementEvent::CreatePrimary(_)
+                | ui::MusicManagementEvent::AddBackup(_)
                 | ui::MusicManagementEvent::PreparePrimaryMigration(_)
         );
         if storage_changed {
@@ -583,6 +619,7 @@ impl DesktopIntegration {
     }
 
     pub async fn start_background(self: &Arc<Self>) -> Result<(), IntegrationError> {
+        tracing::info!("starting integration background services");
         self.require_ownership(None)?;
         {
             let mut heartbeat = self.heartbeat.lock().await;
@@ -598,11 +635,13 @@ impl DesktopIntegration {
             let tasks = Arc::new(RuntimeSchedulerTasks {
                 catalog: self.catalog.clone(),
                 backup: self.backup.clone(),
+                catalog_operation_lock: self.catalog_operation_lock.clone(),
                 soundcloud: self.soundcloud.clone(),
                 recovery: self.recovery.clone(),
                 profile_manager: self.profile_manager.clone(),
             });
             *scheduler = Some(start_scheduler(tasks, SchedulerConfig::default()));
+            tracing::info!("background scheduler started");
         }
         Ok(())
     }
@@ -721,6 +760,7 @@ impl DesktopIntegration {
     }
 
     pub async fn initial_view(&self) -> Result<MusicManagementView, IntegrationError> {
+        let _catalog_operation = self.catalog_operation_lock.lock().await;
         let _projection = self.projection_lock.lock().await;
         self.projector
             .project_view()
@@ -924,6 +964,7 @@ async fn drain_operations_and_release(
 struct RuntimeSchedulerTasks {
     catalog: Arc<TursoCatalog>,
     backup: Arc<BackupService>,
+    catalog_operation_lock: Arc<Mutex<()>>,
     soundcloud: Arc<SoundCloudCatalogService>,
     recovery: Arc<RecoveryService>,
     profile_manager: ProfileManager,
@@ -945,6 +986,7 @@ impl SchedulerTasks for RuntimeSchedulerTasks {
                     "profile ownership was lost".into(),
                 ));
             }
+            let _catalog_operation = self.catalog_operation_lock.lock().await;
             match task {
                 ScheduledTask::DurableJobs => self
                     .backup
@@ -1624,31 +1666,14 @@ fn production_credentials() -> Arc<dyn CredentialStore> {
     }
 }
 
-fn soundcloud_service(
+async fn soundcloud_service(
     catalog: Arc<TursoCatalog>,
     credentials: Arc<dyn CredentialStore>,
 ) -> Result<SoundCloudCatalogService, IntegrationError> {
-    let client_id = std::env::var("REC_BAG_SOUNDCLOUD_CLIENT_ID").ok();
-    let redirect = std::env::var("REC_BAG_SOUNDCLOUD_REDIRECT_URI")
-        .unwrap_or_else(|_| "http://127.0.0.1:17841/oauth/soundcloud".to_string());
-    let redirect = url::Url::parse(&redirect).map_err(|error| {
-        provider_error(
-            IntegrationSlice::SoundcloudCatalog,
-            format!("REC_BAG_SOUNDCLOUD_REDIRECT_URI is invalid: {error}"),
-        )
-    })?;
-    let config = SoundCloudOAuthClientConfig::new(
-        client_id.clone().unwrap_or_else(|| "not-configured".into()),
-        redirect,
-    )?;
-    let user_agent: Arc<dyn OAuthUserAgent> = if client_id.is_none() {
-        Arc::new(MissingSoundCloudConfiguration)
-    } else {
-        production_soundcloud_user_agent()
-    };
-    Ok(SoundCloudCatalogService::new(
+    let config = SoundCloudCatalogService::load_persisted_configuration(catalog.as_ref()).await?;
+    Ok(SoundCloudCatalogService::new_with_optional_config(
         config,
-        user_agent,
+        production_soundcloud_user_agent(),
         credentials,
         Arc::new(ApiSoundCloudBrokerClient),
         Arc::new(ProductionSoundCloudConnectorFactory),
@@ -1656,8 +1681,10 @@ fn soundcloud_service(
     ))
 }
 
+#[cfg(not(feature = "desktop"))]
 struct MissingSoundCloudConfiguration;
 
+#[cfg(not(feature = "desktop"))]
 impl OAuthUserAgent for MissingSoundCloudConfiguration {
     fn authorize(
         &self,
@@ -1668,7 +1695,7 @@ impl OAuthUserAgent for MissingSoundCloudConfiguration {
         Box::pin(async {
             Err(provider_error(
                 IntegrationSlice::SoundcloudCatalog,
-                "SoundCloud is not configured. Set REC_BAG_SOUNDCLOUD_CLIENT_ID and, if needed, REC_BAG_SOUNDCLOUD_REDIRECT_URI, then restart rec_bag.",
+                "SoundCloud desktop OAuth requires the native desktop runtime",
             ))
         })
     }
@@ -1722,14 +1749,26 @@ impl LocalSelectionProvider for NativeLocalSelection {
         Box::pin(async {
             // The override keeps headless integration tests and managed deployments injectable.
             if let Some(root) = std::env::var_os("REC_BAG_LOCAL_SOURCE") {
-                return Ok(Some(local_selection(PathBuf::from(root))));
+                let root = PathBuf::from(root);
+                tracing::info!(root = %root.display(), "using REC_BAG_LOCAL_SOURCE instead of native folder chooser");
+                return Ok(Some(local_selection(root)));
             }
+            tracing::info!("opening native local-folder chooser");
             let selected = tokio::task::spawn_blocking(native_folder_dialog)
                 .await
                 .map_err(|error| {
                     LocalLibraryError::InvalidRoot(format!("The folder chooser failed: {error}"))
                 })??;
-            Ok(selected.map(local_selection))
+            match selected {
+                Some(root) => {
+                    tracing::info!(root = %root.display(), "native local-folder chooser returned a folder");
+                    Ok(Some(local_selection(root)))
+                }
+                None => {
+                    tracing::info!("native local-folder chooser was cancelled or closed");
+                    Ok(None)
+                }
+            }
         })
     }
 }
@@ -2737,7 +2776,11 @@ mod tests {
         ));
         let credentials =
             Arc::new(super::super::soundcloud_catalog::MemoryCredentialStore::default());
-        let soundcloud = Arc::new(soundcloud_service(catalog.clone(), credentials).unwrap());
+        let soundcloud = Arc::new(
+            soundcloud_service(catalog.clone(), credentials)
+                .await
+                .unwrap(),
+        );
         let backup_providers = Arc::new(BackupProviderRegistry::default());
         let backup = Arc::new(BackupService::new(
             catalog.clone(),

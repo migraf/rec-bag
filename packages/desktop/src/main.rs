@@ -37,17 +37,37 @@ const MAIN_CSS: Asset = asset!("/assets/main.css");
 #[cfg(feature = "desktop")]
 static INTEGRATION_STARTUP: OnceLock<Result<DesktopStartup, IntegrationError>> = OnceLock::new();
 
+/// Installs one process-wide subscriber before Dioxus or Turso initialize tracing.
+///
+/// Development defaults expose the application's background lifecycle without enabling noisy
+/// dependency spans (including Turso). `RUST_LOG` remains an explicit developer override.
+fn initialize_logging() {
+    let default_filter = if cfg!(debug_assertions) {
+        "warn,desktop=debug"
+    } else {
+        "warn,desktop=info"
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_level(true)
+        .try_init();
+}
+
 /// The desktop process is the only runtime permitted to acquire and mutate the local profile.
 /// `dx serve --platform desktop` also starts a fullstack server sidecar for server functions;
 /// letting that sidecar acquire the lease first would make the native UI block itself.
 #[cfg(feature = "desktop")]
 fn main() {
+    initialize_logging();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to create the startup runtime");
-    let startup = runtime.block_on(DesktopIntegration::open());
-    let _ = INTEGRATION_STARTUP.set(startup);
+    // Launch the UI immediately — integration opens in the background so the
+    // window appears without waiting for catalog, migration, and service setup.
     dioxus::launch(App);
     if let Some(Ok(DesktopStartup::Ready(integration))) = INTEGRATION_STARTUP.get() {
         let _ = runtime.block_on(integration.shutdown());
@@ -58,24 +78,14 @@ fn main() {
 /// profile, because the companion native process is the sole catalog manager.
 #[cfg(not(feature = "desktop"))]
 fn main() {
+    initialize_logging();
     dioxus::launch(App);
 }
 
 #[component]
 fn App() -> Element {
     use_app_state_provider();
-    #[cfg(feature = "desktop")]
-    let startup = Some(INTEGRATION_STARTUP.get().cloned().unwrap_or_else(|| {
-        Err(IntegrationError {
-            request_id: None,
-            slice: None,
-            message: "The desktop integration runtime was not initialized".into(),
-            retryable: false,
-        })
-    }));
-    #[cfg(not(feature = "desktop"))]
-    let startup = None;
-    use_integration_state_provider(startup);
+    use_integration_state_provider(None);
     let integration = state::integration::use_integration_state();
     use_drop(move || {
         if let Some(runtime) = integration.runtime() {

@@ -38,11 +38,11 @@ Desktop:
 
 ```dotenv
 REC_BAG_DATA_DIR=/absolute/writable/profile-directory
-REC_BAG_SOUNDCLOUD_CLIENT_ID=public-client-id
-REC_BAG_SOUNDCLOUD_REDIRECT_URI=http://127.0.0.1:17841/oauth/soundcloud
 REC_BAG_GOOGLE_CLIENT_ID=installed-app-client-id
 REC_BAG_GOOGLE_REDIRECT_URI=http://127.0.0.1:17842/oauth/google
 ```
+
+Configure the public SoundCloud client ID and registered loopback redirect from **Music Management → Configure SoundCloud**. These values are stored in the local profile; the broker client secret is never entered in the desktop app.
 
 SoundCloud broker:
 

@@ -1084,6 +1084,7 @@ async fn legacy_playlist_analysis_sources_paths_and_ids_are_preserved() {
     let media_path = directory.path().join("track.mp3");
     fs::write(&media_path, b"unchanged audio").unwrap();
     let track_id = Uuid::new_v4();
+    let duplicate_path_track_id = Uuid::new_v4();
     let playlist_id = Uuid::new_v4();
     let source_id = Uuid::new_v4();
     let database = Builder::new_local(path.to_str().unwrap())
@@ -1104,6 +1105,16 @@ async fn legacy_playlist_analysis_sources_paths_and_ids_are_preserved() {
             "INSERT INTO tracks VALUES(?1,?2,'Legacy title','2026-01-01T00:00:00Z','[0.1,0.2]')",
             (
                 track_id.to_string(),
+                media_path.to_string_lossy().to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO tracks VALUES(?1,?2,'Duplicate legacy path','2026-01-01T00:00:00Z',NULL)",
+            (
+                duplicate_path_track_id.to_string(),
                 media_path.to_string_lossy().to_string(),
             ),
         )
@@ -1169,8 +1180,21 @@ async fn legacy_playlist_analysis_sources_paths_and_ids_are_preserved() {
         .list_locations_for_asset(assets[0].id())
         .await
         .unwrap();
-    assert_eq!(locations.len(), 1);
-    assert_eq!(locations[0].object_id, media_path.to_string_lossy());
+    let duplicate_assets = catalog
+        .list_originals_for_track(duplicate_path_track_id)
+        .await
+        .unwrap();
+    assert_eq!(duplicate_assets.len(), 1);
+    let duplicate_locations = catalog
+        .list_locations_for_asset(duplicate_assets[0].id())
+        .await
+        .unwrap();
+    assert_eq!(locations.len() + duplicate_locations.len(), 1);
+    let location = locations
+        .first()
+        .or_else(|| duplicate_locations.first())
+        .expect("one duplicate-path asset must retain the physical-file location");
+    assert_eq!(location.object_id, media_path.to_string_lossy());
     assert!(catalog.get_active_primary().await.unwrap().is_none());
     assert!(MusicStorageRepository::list(&catalog)
         .await

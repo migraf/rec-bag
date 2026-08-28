@@ -27,6 +27,16 @@ impl SafeErrorKind {
         if contains_any(
             &value,
             &[
+                "not configured",
+                "configuration",
+                "registered desktop callback",
+                "redirect uri",
+            ],
+        ) {
+            Self::Configuration
+        } else if contains_any(
+            &value,
+            &[
                 "oauth",
                 "auth",
                 "credential",
@@ -111,6 +121,26 @@ fn contains_any(value: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| value.contains(marker))
 }
 
+fn classify_error(error: &IntegrationError) -> SafeErrorKind {
+    let message = error.message.to_ascii_lowercase();
+    if error.slice == Some(IntegrationSlice::LocalLibrary) {
+        if contains_any(&message, &["permission", "access denied", "read-only"]) {
+            return SafeErrorKind::Permission;
+        }
+        if contains_any(
+            &message,
+            &[
+                "folder chooser",
+                "folder picker",
+                "local root is unavailable",
+            ],
+        ) {
+            return SafeErrorKind::Configuration;
+        }
+    }
+    SafeErrorKind::classify(&message)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DryRunReview {
     listing: SnapshotListing,
@@ -174,6 +204,7 @@ pub fn MusicManagement() -> Element {
     let pending_count = snapshot.pending_requests().count();
     let in_flight_count = snapshot.in_flight_requests().count();
     let errors = snapshot.errors.clone();
+    let startup_failed = errors.iter().any(|error| error.request_id.is_none());
     let retry_events: Vec<_> = errors
         .iter()
         .map(|error| snapshot.failed_event(error.request_id).cloned())
@@ -432,7 +463,13 @@ pub fn MusicManagement() -> Element {
         if pending_count + in_flight_count > 0 {
             aside { class: "mm-activity-banner", role: "status", "aria-live": "polite",
                 span { class: "mm-activity-indicator", "" }
-                span { "Integration work: {pending_count} queued, {in_flight_count} running" }
+                if !runtime_ready && startup_failed {
+                    span { "Desktop integration startup failed; {pending_count} queued request(s) cannot run. Review the startup error below." }
+                } else if !runtime_ready {
+                    span { "Desktop integration is starting; {pending_count} queued request(s) will begin when the catalog is ready." }
+                } else {
+                    span { "Integration work: {pending_count} queued, {in_flight_count} running" }
+                }
             }
         }
         if !errors.is_empty() {
@@ -509,7 +546,7 @@ struct ErrorBannerProps {
 
 #[component]
 fn ErrorBanner(props: ErrorBannerProps) -> Element {
-    let kind = SafeErrorKind::classify(&props.error.message);
+    let kind = classify_error(&props.error);
     let provider = provider_label(props.error.slice);
     let retry_available =
         retry_event(&props.error, &props.view, props.failed_event.as_ref()).is_some();
@@ -567,7 +604,7 @@ struct ErrorDetailsDialogProps {
 
 #[component]
 fn ErrorDetailsDialog(props: ErrorDetailsDialogProps) -> Element {
-    let kind = SafeErrorKind::classify(&props.error.message);
+    let kind = classify_error(&props.error);
     let reason = safe_failure_reason(&props.error);
     let diagnostics = safe_diagnostics(&props.error, props.run_id.as_deref(), &props.history);
     let title_id = format!("mm-error-dialog-title-{}", props.index);
@@ -767,16 +804,36 @@ fn safe_failure_reason(error: &IntegrationError) -> &'static str {
     if message.contains("soundcloud is not configured")
         || message.contains("soundcloud oauth client id is not configured")
     {
-        "SoundCloud desktop OAuth is not configured. Set REC_BAG_SOUNDCLOUD_CLIENT_ID and restart rec_bag."
+        "SoundCloud desktop OAuth is not configured. Open Music Management, choose Configure SoundCloud, then enter the public client ID and registered redirect URI."
+    } else if message.contains("soundcloud redirect uri")
+        || message.contains("registered desktop callback")
+    {
+        "The SoundCloud redirect URI is invalid. In Music Management → Configure SoundCloud, use the exact loopback redirect registered with SoundCloud and allowed by the broker."
     } else if message.contains("authorization broker could not be reached") {
         "The SoundCloud broker is unavailable. Start or deploy the rec_bag fullstack web service and verify it is reachable before retrying."
+    } else if error.slice == Some(IntegrationSlice::LocalLibrary)
+        && message.contains("local storage is read-only")
+    {
+        "The selected local primary folder is read-only. Choose a folder rec_bag can write to, or update that folder's permissions, then create the primary again."
+    } else if error.slice == Some(IntegrationSlice::LocalLibrary)
+        && contains_any(&message, &["folder chooser", "folder picker"])
+    {
+        "rec_bag cannot open a local-folder chooser in this session. Run the native desktop app and install zenity or kdialog on Linux, or set REC_BAG_LOCAL_SOURCE to an absolute writable folder before starting rec_bag."
+    } else if error.slice == Some(IntegrationSlice::LocalLibrary)
+        && message.contains("local root is unavailable")
+    {
+        "rec_bag could not open the selected local folder. Confirm the folder exists, its drive is mounted, and your account can access every parent directory, then try again."
+    } else if error.slice == Some(IntegrationSlice::LocalLibrary)
+        && classify_error(error) == SafeErrorKind::Permission
+    {
+        "rec_bag could not access the selected local folder. Choose a folder your account can read and write, ensure its drive is mounted read-write, then create the primary again."
     } else if error.slice.is_none()
         && error.request_id.is_none()
         && SafeErrorKind::classify(&message) == SafeErrorKind::Connectivity
     {
         "rec_bag could not complete desktop startup because its catalog or required runtime service was unavailable. Check the profile data directory, network access for any remote catalog, and then restart rec_bag."
     } else {
-        match SafeErrorKind::classify(&message) {
+        match classify_error(error) {
             SafeErrorKind::Authentication => {
                 "The saved provider authorization is missing or expired. Reconnect the provider to authorize rec_bag again."
             }
@@ -800,7 +857,7 @@ fn safe_failure_reason(error: &IntegrationError) -> &'static str {
 }
 
 fn safe_diagnostics(error: &IntegrationError, run_id: Option<&str>, history: &[String]) -> String {
-    let kind = SafeErrorKind::classify(&error.message);
+    let kind = classify_error(error);
     let mut lines = vec![
         "rec_bag music-management diagnostic".to_owned(),
         format!("provider: {}", provider_label(error.slice)),
@@ -859,6 +916,63 @@ mod tests {
             .contains("summary: The saved provider authorization is missing or expired."));
         assert!(diagnostics.contains("request: 42"));
         assert!(diagnostics.contains("run: run-safe-id"));
+    }
+
+    #[test]
+    fn soundcloud_redirect_validation_is_a_configuration_error() {
+        let error = error(
+            IntegrationSlice::SoundcloudCatalog,
+            "SoundCloud redirect URI is not a valid registered desktop callback",
+            false,
+        );
+
+        assert_eq!(
+            SafeErrorKind::classify(&error.message),
+            SafeErrorKind::Configuration
+        );
+        assert!(safe_failure_reason(&error).contains("redirect URI is invalid"));
+    }
+
+    #[test]
+    fn read_only_local_primary_has_a_safe_actionable_summary() {
+        let error = error(
+            IntegrationSlice::LocalLibrary,
+            "local root is unavailable: local storage is read-only",
+            false,
+        );
+
+        let diagnostics = safe_diagnostics(&error, None, &[]);
+        assert_eq!(classify_error(&error), SafeErrorKind::Permission);
+        assert!(diagnostics.contains("selected local primary folder is read-only"));
+        assert!(!diagnostics.contains("local root is unavailable"));
+    }
+
+    #[test]
+    fn missing_local_folder_chooser_is_a_configuration_error() {
+        let error = error(
+            IntegrationSlice::LocalLibrary,
+            "local root is unavailable: No native folder chooser is installed",
+            false,
+        );
+
+        let diagnostics = safe_diagnostics(&error, None, &[]);
+        assert_eq!(classify_error(&error), SafeErrorKind::Configuration);
+        assert!(diagnostics.contains("install zenity or kdialog"));
+        assert!(diagnostics.contains("category: configuration"));
+    }
+
+    #[test]
+    fn local_primary_permission_denied_has_a_safe_actionable_summary() {
+        let error = error(
+            IntegrationSlice::LocalLibrary,
+            "filesystem operation failed: Permission denied",
+            true,
+        );
+
+        let diagnostics = safe_diagnostics(&error, None, &[]);
+        assert!(diagnostics.contains("selected local folder"));
+        assert!(diagnostics.contains("mounted read-write"));
+        assert!(!diagnostics.contains("filesystem operation failed"));
     }
 
     #[test]

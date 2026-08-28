@@ -203,11 +203,13 @@ impl LocalLibraryService {
     }
 
     pub async fn add_selected_source(&self) -> Result<SourceScanResult, LocalLibraryError> {
+        tracing::info!("requesting local source folder selection");
         let selected = self
             .selection
             .select_source()
             .await?
             .ok_or(LocalLibraryError::SelectionCancelled)?;
+        tracing::info!(source_name = %selected.name, root = %selected.root.display(), "local source folder selected");
         self.register_local_source(selected).await
     }
 
@@ -216,6 +218,7 @@ impl LocalLibraryService {
         selection: LocalSourceSelection,
     ) -> Result<SourceScanResult, LocalLibraryError> {
         let root = canonical_directory(&selection.root)?;
+        tracing::info!(source_name = %selection.name, root = %root.display(), "registering local source");
         let existing = self.list_sources().await?.into_iter().find(|source| {
             source.kind == CatalogSourceKind::LocalFolder
                 && source.config.get(CONFIG_PATH).is_some_and(|path| {
@@ -231,6 +234,7 @@ impl LocalLibraryService {
             .config
             .insert(CONFIG_PATH.into(), root.to_string_lossy().into_owned());
         SourceRepository::upsert(self.catalog.as_ref(), source.clone()).await?;
+        tracing::debug!(source_id = %source.id, "local source registered; starting scan");
         self.scan_local_source(source.id).await
     }
 
@@ -245,9 +249,11 @@ impl LocalLibraryService {
             return Err(LocalLibraryError::NotLocal);
         }
         let root = source_root(&source)?;
+        tracing::info!(source_id = %source_id, root = %root.display(), "local source scan started");
         let scanned = tokio::task::spawn_blocking(move || scan_files(&root))
             .await
             .map_err(|error| LocalLibraryError::Join(error.to_string()))??;
+        tracing::info!(source_id = %source_id, discovered = scanned.len(), "local source filesystem scan completed");
 
         let existing_occurrences = self.list_occurrences(Some(source_id), None).await?;
         let existing_by_external: HashMap<_, _> = existing_occurrences
@@ -364,13 +370,15 @@ impl LocalLibraryService {
         transaction.sync_runs().upsert(run.clone()).await?;
         transaction.commit().await?;
 
-        Ok(SourceScanResult {
+        let result = SourceScanResult {
             source_id,
             run_id: run.id,
             discovered: created + reused,
             created_tracks: created,
             reused_tracks: reused,
-        })
+        };
+        tracing::info!(source_id = %result.source_id, run_id = %result.run_id, discovered = result.discovered, created_tracks = result.created_tracks, reused_tracks = result.reused_tracks, "local source scan persisted");
+        Ok(result)
     }
 
     pub async fn configure_local_storage(
@@ -380,11 +388,14 @@ impl LocalLibraryService {
         if configuration.provider != ProviderChoice::LocalFolder {
             return Err(LocalLibraryError::NotLocal);
         }
+        tracing::info!(storage_name = %configuration.name, location = %configuration.location, "configuring local primary storage");
         let root = ensure_directory(Path::new(&configuration.location))?;
         let id = Uuid::new_v4();
         let adapter = LocalMusicStorage::new(id, &root)?;
         let health = adapter.health().await?;
-        if health.status == HealthStatus::Unavailable || !health.capabilities.can_inventory {
+        if health.status == HealthStatus::Unavailable
+            || !health.capabilities.supports_role(StorageRole::Primary)
+        {
             return Err(LocalLibraryError::InvalidRoot(
                 health.message.unwrap_or_else(|| root.display().to_string()),
             ));
@@ -406,15 +417,18 @@ impl LocalLibraryService {
             configuration.verify_after_copy.to_string(),
         );
         MusicStorageRepository::upsert(self.catalog.as_ref(), storage.clone()).await?;
+        tracing::info!(storage_id = %storage.id, root = %root.display(), "local primary storage configuration persisted");
         Ok(storage)
     }
 
     pub async fn add_selected_backup(&self) -> Result<InventoryResult, LocalLibraryError> {
+        tracing::info!("requesting local backup folder selection");
         let selected = self
             .selection
             .select_source()
             .await?
             .ok_or(LocalLibraryError::SelectionCancelled)?;
+        tracing::info!(backup_name = %selected.name, root = %selected.root.display(), "local backup folder selected");
         let root = ensure_directory(&selected.root)?;
         self.ensure_separate_local_root(&root).await?;
         let id = Uuid::new_v4();
@@ -488,6 +502,7 @@ impl LocalLibraryService {
     ) -> Result<InventoryResult, LocalLibraryError> {
         let storage = self.local_storage_record(storage_id).await?;
         let adapter = local_adapter(&storage)?;
+        tracing::info!(storage_id = %storage_id, mode = ?mode, include_checksums, "local storage inventory started");
         let mut run = SyncRun::new(SyncRunKind::StorageInventory, None, Some(storage_id));
         run.start().map_err(transition_error)?;
         SyncRunRepository::upsert(self.catalog.as_ref(), run.clone()).await?;
@@ -600,13 +615,15 @@ impl LocalLibraryService {
             .await?;
         transaction.sync_runs().upsert(run.clone()).await?;
         transaction.commit().await?;
-        Ok(InventoryResult {
+        let result = InventoryResult {
             run_id: run.id,
             generation,
             object_count: objects,
             removal_count: removals,
             change_cursor,
-        })
+        };
+        tracing::info!(storage_id = %storage_id, run_id = %result.run_id, objects = result.object_count, removals = result.removal_count, "local storage inventory completed");
+        Ok(result)
     }
 
     pub async fn adopt_migrated_library(
@@ -1568,10 +1585,23 @@ impl IntegrationSliceHandler for LocalLibraryService {
                         })
                     }
                     MusicManagementEvent::CreatePrimary(configuration) => {
-                        if self.catalog.get_active_primary().await?.is_some() {
-                            Err(LocalLibraryError::UnsupportedEvent(
-                                "an active primary already exists; use primary migration".into(),
-                            ))
+                        if let Some(active) = self.catalog.get_active_primary().await? {
+                            let requested_root =
+                                canonical_directory(Path::new(&configuration.location))?;
+                            let matches_active_primary = active.kind
+                                == MusicStorageKind::LocalDirectory
+                                && active.root_identifier.as_deref().is_some_and(|root| {
+                                    canonical_directory(Path::new(root)).ok().as_ref()
+                                        == Some(&requested_root)
+                                });
+                            if matches_active_primary {
+                                Ok(format!("Primary {} is already configured", active.id))
+                            } else {
+                                Err(LocalLibraryError::UnsupportedEvent(
+                                    "an active primary already exists; use primary migration"
+                                        .into(),
+                                ))
+                            }
                         } else {
                             self.migrate_primary(&configuration, false)
                                 .await
@@ -2056,6 +2086,25 @@ mod tests {
         let second = service.scan_local_source(first.source_id).await.unwrap();
         assert_eq!(second.created_tracks, 0);
         assert_eq!(service.list_tracks().await.unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configure_local_storage_rejects_a_read_only_primary_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDirectory::new("read-only-primary");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let service = service(None).await;
+
+        let error = service
+            .configure_local_storage(&primary_view(root.path()))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, LocalLibraryError::InvalidRoot(message) if message == "local storage is read-only")
+        );
     }
 
     #[tokio::test]
