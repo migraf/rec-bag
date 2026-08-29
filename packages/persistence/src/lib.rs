@@ -13,9 +13,10 @@ pub use repositories::{
 };
 
 use rec_core::{
-    AssetRepository, CatalogSnapshotRepository, MusicStorageRepository, PlaylistRepository,
-    ReconciliationRepository, RepositoryResult, RepositoryTransaction, SettingsRepository,
-    SourceRepository, SyncRunRepository, TrackRepository, TransactionManager,
+    AssetRepository, CatalogSnapshotRepository, LibraryEntryRepository, MusicStorageRepository,
+    PlaylistRepository, ReconciliationRepository, RepositoryResult, RepositoryTransaction,
+    SettingsRepository, SourceRepository, SyncRunRepository, TrackAnalysisRepository,
+    TrackRepository, TransactionManager,
 };
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -93,6 +94,12 @@ impl TursoCatalog {
 
 impl RepositoryTransaction for CatalogTransaction {
     fn tracks(&self) -> &dyn TrackRepository {
+        self
+    }
+    fn library_entries(&self) -> &dyn LibraryEntryRepository {
+        self
+    }
+    fn track_analysis(&self) -> &dyn TrackAnalysisRepository {
         self
     }
     fn playlists(&self) -> &dyn PlaylistRepository {

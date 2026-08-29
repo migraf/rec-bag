@@ -1,5 +1,6 @@
 //! Library management view for browsing and organizing music files.
 
+use crate::state::integration::use_integration_state;
 use crate::state::use_app_state;
 use dioxus::prelude::*;
 use rec_core::Track;
@@ -7,7 +8,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use ui::{
     ContextMenu, ContextMenuAction, ContextMenuEvent, MetadataEditor, MetadataSaveEvent,
-    PlaylistInfo, SearchBar, SelectionEvent, SourcesPanel, TrackIssueInfo, TrackList,
+    MusicManagementEvent, PlaylistInfo, SearchBar, SelectionEvent, SourcesPanel, TrackIssueInfo,
+    TrackList,
 };
 use uuid::Uuid;
 
@@ -66,37 +68,65 @@ pub fn Library() -> Element {
     let sources = app_state.sources.read().clone();
     let playlists = app_state.playlists.read().clone();
 
-    // Source handlers
+    // Source handlers. Sources belong to the catalog, so configuring and scanning one
+    // is integration work dispatched to the slice that owns its provider — the same
+    // path the Music management view uses.
+    let integration = use_integration_state();
+    let mut add_source_integration = integration.clone();
+    let mut remove_source_integration = integration.clone();
+    let mut rescan_source_integration = integration.clone();
+    let mut rescan_all_integration = integration.clone();
+
     let on_add_source = move |path: String| {
-        let app = app_state;
-        spawn(async move {
-            app.add_source(path).await;
-        });
+        add_source_integration.dispatch(MusicManagementEvent::AddLocalFolderSource { path });
     };
 
     let on_remove_source = move |source_id: Uuid| {
-        let app = app_state;
-        spawn(async move {
-            app.remove_source(source_id).await;
+        remove_source_integration.dispatch(MusicManagementEvent::DisconnectSource {
+            source_id: source_id.to_string(),
         });
     };
 
     let on_rescan_source = move |source_id: Uuid| {
-        let app = app_state;
-        spawn(async move {
-            app.rescan_source(source_id).await;
-        });
+        rescan_source_integration.dispatch(MusicManagementEvent::SyncSource(source_id.to_string()));
     };
 
     let on_rescan_all = move |_| {
-        let app = app_state;
-        spawn(async move {
-            app.rescan_all_sources().await;
-        });
+        for source in app_state.sources.read().iter().filter(|s| s.enabled) {
+            rescan_all_integration
+                .dispatch(MusicManagementEvent::SyncSource(source.id.to_string()));
+        }
     };
 
     let on_create_playlist_from_source = move |source_id: Uuid| {
-        app_state.create_playlist_from_source(source_id);
+        let Some(root) = app_state
+            .sources
+            .read()
+            .iter()
+            .find(|source| source.id == source_id)
+            .and_then(|source| source.local_path().map(PathBuf::from))
+        else {
+            return;
+        };
+        let name = app_state
+            .sources
+            .read()
+            .iter()
+            .find(|source| source.id == source_id)
+            .map(|source| source.name.clone())
+            .unwrap_or_else(|| "Source".to_string());
+        let tracks: Vec<Track> = app_state
+            .library_tracks
+            .read()
+            .iter()
+            .filter(|track| track.path.starts_with(&root))
+            .cloned()
+            .collect();
+        if tracks.is_empty() {
+            return;
+        }
+        let playlist_id = app_state.create_playlist(name);
+        app_state.add_tracks_to_playlist(tracks, playlist_id);
     };
 
     // Selection handler with shift/ctrl support
@@ -138,12 +168,7 @@ pub fn Library() -> Element {
 
     // Load track to deck using shared state
     let load_track_to_deck = move |track_id: Uuid, deck: usize| {
-        // Find the track
-        let track = filtered_tracks().iter().find(|t| t.id == track_id).cloned();
-
-        if let Some(track) = track {
-            app_state.load_track_to_deck(track, deck);
-        }
+        app_state.load_track_to_deck(track_id, deck);
     };
 
     // Context menu handler

@@ -461,7 +461,7 @@ async fn create_legacy_catalog(count: usize) -> BenchResult<TempDir> {
     let connection = database.connect()?;
     connection
         .execute_batch(
-            "CREATE TABLE tracks(id TEXT PRIMARY KEY,path TEXT NOT NULL,title TEXT NOT NULL,added_at TEXT NOT NULL,waveform_json TEXT);\
+            "CREATE TABLE tracks(id TEXT PRIMARY KEY,path TEXT NOT NULL,title TEXT NOT NULL,artist TEXT,album TEXT,duration_ms INTEGER,bpm REAL,key TEXT,genre TEXT,rating INTEGER,comment TEXT,added_at TEXT NOT NULL,last_played TEXT,play_count INTEGER DEFAULT 0,sample_rate INTEGER,bitrate INTEGER,year INTEGER,track_number INTEGER,waveform_json TEXT);\
              CREATE TABLE playlists(id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT,created_at TEXT NOT NULL,modified_at TEXT NOT NULL);\
              CREATE TABLE playlist_tracks(playlist_id TEXT NOT NULL,track_id TEXT NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(playlist_id,track_id));\
              CREATE TABLE sources(id TEXT PRIMARY KEY,name TEXT NOT NULL,source_type TEXT NOT NULL,uri TEXT NOT NULL,config_json TEXT,track_count INTEGER,enabled INTEGER,created_at TEXT NOT NULL,last_scanned TEXT);\
@@ -481,7 +481,7 @@ async fn create_legacy_catalog(count: usize) -> BenchResult<TempDir> {
         let track_id = stable_id(&format!("legacy-track:{index}"));
         connection
             .execute(
-                "INSERT INTO tracks VALUES(?1,?2,?3,?4,NULL)",
+                "INSERT INTO tracks(id,path,title,artist,rating,play_count,added_at) VALUES(?1,?2,?3,?4,3,?5,?6)",
                 (
                     track_id.to_string(),
                     format!(
@@ -489,6 +489,8 @@ async fn create_legacy_catalog(count: usize) -> BenchResult<TempDir> {
                         index % 500
                     ),
                     format!("Legacy Track {index:06}"),
+                    format!("Artist {:04}", index % 500),
+                    index as i64 % 7,
                     FIXED_TIME,
                 ),
             )

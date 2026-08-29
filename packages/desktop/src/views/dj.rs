@@ -103,12 +103,7 @@ pub fn DjView() -> Element {
     // Load track to deck
     // Load track to deck using shared state
     let load_track_to_deck = move |track_id: Uuid, deck: usize| {
-        // Find the track in filtered tracks or playlist tracks
-        let track = filtered_tracks().iter().find(|t| t.id == track_id).cloned();
-
-        if let Some(track) = track {
-            app_state.load_track_to_deck(track, deck);
-        }
+        app_state.load_track_to_deck(track_id, deck);
     };
 
     let on_load_track = move |(track_id, deck): (Uuid, usize)| {
@@ -117,12 +112,7 @@ pub fn DjView() -> Element {
 
     let mut on_remove_track = move |track_ids: Vec<Uuid>| {
         if let Some(playlist_id) = *app_state.selected_playlist_id.read() {
-            let mut playlists = app_state.playlists.write();
-            if let Some(playlist) = playlists.iter_mut().find(|p| p.id == playlist_id) {
-                for track_id in &track_ids {
-                    playlist.remove_track_by_id(*track_id);
-                }
-            }
+            app_state.remove_tracks_from_playlist(&track_ids, playlist_id);
         }
         // Clear selection for removed tracks
         let mut ids = selected_track_ids();

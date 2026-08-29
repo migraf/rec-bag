@@ -3,7 +3,6 @@
 //! This crate provides:
 //! - Multi-channel audio playback engine using rodio (requires `audio` feature)
 //! - Track and playlist data models
-//! - Storage abstraction for local/cloud backends
 //! - Audio analysis (waveform, BPM, key detection)
 //! - Fuzzy search for tracks
 //! - Track diagnostics (Doctor) for detecting and fixing compatibility issues
@@ -23,7 +22,6 @@ pub mod repository;
 pub mod schema;
 pub mod search;
 pub mod source;
-pub mod storage;
 pub mod sync;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -47,11 +45,11 @@ pub use asset::{
 pub use audio::{AudioEngine, Deck, DeckState};
 pub use catalog::{
     CanonicalMetadata, CanonicalPlaylist, CanonicalPlaylistEntry, CanonicalTrack, CatalogSource,
-    CatalogSourceKind, ExternalPlaylist, ExternalPlaylistEntry, MetadataField, MetadataFieldValue,
-    MetadataOrigin, MetadataProvenance, MetadataValue, SourceAccount, SourceAvailability,
-    SourceCapabilities, SourceCollection, SourceCollectionRelationship,
+    CatalogSourceKind, ExternalPlaylist, ExternalPlaylistEntry, LibraryEntry, MetadataField,
+    MetadataFieldValue, MetadataOrigin, MetadataProvenance, MetadataValue, SourceAccount,
+    SourceAvailability, SourceCapabilities, SourceCollection, SourceCollectionRelationship,
     SourceCollectionRelationshipIdentity, SourceEntityKind, SourceTrackIdentity,
-    SourceTrackOccurrence,
+    SourceTrackOccurrence, TrackAnalysis,
 };
 pub use doctor::{
     Diagnosis, DiagnosisGroup, DiagnosisSummary, DiagnosticCheck, Doctor, DoctorError,
@@ -59,7 +57,7 @@ pub use doctor::{
     WavExtensibleCheck,
 };
 pub use folder::{build_folder_tree, is_audio_extension, FolderNode};
-pub use playlist::{Library, Playlist};
+pub use playlist::Playlist;
 pub use provider::{
     BoxFuture, ByteRange, CatalogAssetReadRequest, CatalogAssetReadResult, CatalogAssetReader,
     CatalogSourceConnector, DownloadRequest, DownloadResult, HealthStatus, InventoryMode,
@@ -80,12 +78,13 @@ pub use repository::{
     ExternalPlaylistEntryStagingScope, ExternalPlaylistFilter, InventoryGeneration,
     InventoryGenerationAbort, InventoryGenerationAbortKind, InventoryGenerationKind,
     InventoryGenerationStart, InventoryGenerationStatus, InventoryStagingPage,
-    MatchCandidateFilter, MusicStorageRepository, OriginalAssetFilter, PlaylistRepository,
-    ReconciliationRepository, ReconciliationResolutionFilter, ReconciliationResultFilter,
-    RepositoryCursor, RepositoryError, RepositoryErrorKind, RepositoryPage, RepositoryPageRequest,
-    RepositoryResult, RepositoryTransaction, Setting, SettingsRepository,
-    SourceCollectionRelationshipFilter, SourceOccurrenceFilter, SourceRepository,
-    StorageObjectTombstone, SyncRunFilter, SyncRunRepository, TrackRepository, TransactionManager,
+    LibraryEntryRepository, MatchCandidateFilter, MusicStorageRepository, OriginalAssetFilter,
+    PlaylistRepository, ReconciliationRepository, ReconciliationResolutionFilter,
+    ReconciliationResultFilter, RepositoryCursor, RepositoryError, RepositoryErrorKind,
+    RepositoryPage, RepositoryPageRequest, RepositoryResult, RepositoryTransaction, Setting,
+    SettingsRepository, SourceCollectionRelationshipFilter, SourceOccurrenceFilter,
+    SourceRepository, StorageObjectTombstone, SyncRunFilter, SyncRunRepository,
+    TrackAnalysisRepository, TrackRepository, TransactionManager,
 };
 pub use schema::{
     CatalogSchemaVersion, CatalogSchemaVersionError, MigrationPlan, MigrationPlanError,
@@ -95,8 +94,6 @@ pub use schema::{
 };
 pub use search::SearchEngine;
 pub use source::{LocalSourceConfig, MusicSource, SourceType};
-pub use storage::StorageBackend as LibraryStorageBackend;
-pub use storage::{LocalStorage, SqliteStorage, StorageBackend, StorageError};
 pub use sync::{
     SyncCheckpoint, SyncCursor, SyncError, SyncErrorKind, SyncIssue, SyncIssueSeverity, SyncJob,
     SyncJobKind, SyncJobKindMismatch, SyncJobPayload, SyncProgress, SyncRun, SyncRunKind,

@@ -9,15 +9,15 @@ use std::{
 
 use crate::{
     services::{
+        catalog::Catalog,
         integration::{DesktopIntegration, DesktopStartup, OwnershipTakeoverOffer},
+        playback_bridge::AssetPlaybackPaths,
         recovery::{RecoveryProgress, RestoreReport, SnapshotListing},
     },
     state::AppState,
 };
 
 use dioxus::prelude::*;
-use rec_core::{RepositoryPageRequest, TrackRepository};
-use rec_persistence::TursoCatalog;
 use ui::{
     CompletenessView, MusicManagementEvent, MusicManagementView, ProviderChoice, TrackFilter,
 };
@@ -438,7 +438,6 @@ pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, Int
         None => {}
     }
     if let Some(runtime) = &slot.runtime {
-        crate::services::playback_bridge::register_integration_runtime(runtime.clone());
         for error in runtime.startup_errors() {
             state.report_error(error.clone());
         }
@@ -519,7 +518,9 @@ pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, Int
             return;
         };
         spawn(async move {
-            crate::services::playback_bridge::register_integration_runtime(runtime.clone());
+            // The Catalog is composed here, from the runtime's own repositories and its
+            // asset resolver, and handed to the application state as a value.
+            app_state.adopt_catalog(catalog_for(&runtime)).await;
             if let Err(error) = runtime.start_background().await {
                 state.write().report_error(error);
                 return;
@@ -538,11 +539,7 @@ pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, Int
                     match view_runtime.initial_view().await {
                         Ok(view) => {
                             view_state.write().view = view;
-                            if let Err(error) =
-                                refresh_app_catalog(app_state, view_runtime.catalog()).await
-                            {
-                                view_state.write().report_error(error);
-                            }
+                            app_state.refresh_catalog().await;
                         }
                         Err(error) => view_state.write().report_error(error),
                     }
@@ -601,10 +598,7 @@ async fn run_slice(
                 Ok(outcome) => {
                     tracing::info!(request_id, ?slice, message = ?outcome.message, "integration request completed");
                     IntegrationController::complete(&mut state.write(), request_id, outcome);
-                    if let Err(error) = refresh_app_catalog(app_state, runtime.catalog()).await {
-                        tracing::warn!(?slice, error = %error, "playable catalog refresh failed after integration request");
-                        state.write().report_error(error);
-                    }
+                    app_state.refresh_catalog().await;
                 }
                 Err(error) => {
                     let retryable = error.retryable;
@@ -631,35 +625,12 @@ async fn run_slice(
     }
 }
 
-async fn refresh_app_catalog(
-    app_state: AppState,
-    catalog: &TursoCatalog,
-) -> Result<(), IntegrationError> {
-    let mut canonical_tracks = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = TrackRepository::list(
-            catalog,
-            RepositoryPageRequest {
-                cursor,
-                limit: Some(500),
-            },
-        )
-        .await
-        .map_err(|error| IntegrationError {
-            request_id: None,
-            slice: None,
-            message: format!("Could not refresh the playable catalog: {error}"),
-            retryable: error.is_retryable(),
-        })?;
-        canonical_tracks.extend(page.items);
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-    app_state.project_canonical_tracks(canonical_tracks);
-    Ok(())
+/// Compose the one Catalog from a live integration runtime.
+fn catalog_for(runtime: &Arc<DesktopIntegration>) -> Arc<Catalog> {
+    Arc::new(Catalog::new(
+        runtime.catalog().clone(),
+        AssetPlaybackPaths::new(runtime),
+    ))
 }
 
 pub fn use_integration_state() -> IntegrationContext {
@@ -727,9 +698,8 @@ fn slice_for_event(
     };
 
     match event {
-        MusicManagementEvent::AddSource(ProviderChoice::LocalFolder) => {
-            Ok(IntegrationSlice::LocalLibrary)
-        }
+        MusicManagementEvent::AddSource(ProviderChoice::LocalFolder)
+        | MusicManagementEvent::AddLocalFolderSource { .. } => Ok(IntegrationSlice::LocalLibrary),
         MusicManagementEvent::AddSource(ProviderChoice::SoundCloud)
         | MusicManagementEvent::ConfigureSoundCloud(_) => Ok(IntegrationSlice::SoundcloudCatalog),
         MusicManagementEvent::AddSource(ProviderChoice::GoogleDrive) => {

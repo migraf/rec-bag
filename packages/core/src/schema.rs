@@ -537,6 +537,10 @@ pub enum RequiredCatalogTable {
     Tracks,
     /// Field-level canonical metadata values and their provenance.
     TrackMetadataValues,
+    /// The user's own rating, comment, and play history per canonical track.
+    LibraryEntries,
+    /// Cached audio analysis per canonical track.
+    TrackAnalysis,
     /// Canonical user playlists with stable UUIDs.
     CanonicalPlaylists,
     /// Ordered canonical playlist-to-track memberships, with position stored apart
@@ -597,6 +601,8 @@ impl RequiredCatalogTable {
         match self {
             Self::Tracks => "tracks",
             Self::TrackMetadataValues => "track_metadata_values",
+            Self::LibraryEntries => "library_entries",
+            Self::TrackAnalysis => "track_analysis",
             Self::CanonicalPlaylists => "canonical_playlists",
             Self::CanonicalPlaylistMemberships => "canonical_playlist_memberships",
             Self::CatalogSources => "catalog_sources",
@@ -636,6 +642,8 @@ impl fmt::Display for RequiredCatalogTable {
 pub const REQUIRED_CATALOG_TABLES: &[RequiredCatalogTable] = &[
     RequiredCatalogTable::Tracks,
     RequiredCatalogTable::TrackMetadataValues,
+    RequiredCatalogTable::LibraryEntries,
+    RequiredCatalogTable::TrackAnalysis,
     RequiredCatalogTable::CanonicalPlaylists,
     RequiredCatalogTable::CanonicalPlaylistMemberships,
     RequiredCatalogTable::CatalogSources,

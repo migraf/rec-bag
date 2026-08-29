@@ -1333,6 +1333,10 @@ impl IntegrationSliceHandler for LocalLibraryService {
                         .add_selected_source()
                         .await
                         .map(|result| format!("Scanned {} local audio files", result.discovered)),
+                    MusicManagementEvent::AddLocalFolderSource { path } => self
+                        .register_local_source(local_source_at(&path))
+                        .await
+                        .map(|result| format!("Scanned {} local audio files", result.discovered)),
                     MusicManagementEvent::SyncSource(id) => {
                         let id = parse_uuid(&id)?;
                         self.scan_local_source(id).await.map(|result| {
@@ -1517,6 +1521,20 @@ fn hash_file(path: &Path) -> Result<ContentHash, LocalLibraryError> {
     let digest = Sha256::digest(bytes);
     ContentHash::new(HashAlgorithm::Sha256, format!("{digest:x}"))
         .map_err(|error| LocalLibraryError::InvalidRoot(error.to_string()))
+}
+
+/// A source configuration for a folder the user named directly. The folder's own name
+/// is the source's name, which is what the native picker would also produce.
+fn local_source_at(path: &str) -> LocalSourceSelection {
+    let root = PathBuf::from(path);
+    LocalSourceSelection {
+        name: root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_owned()),
+        root,
+        copy_policy: SourceCopyPolicy::default(),
+    }
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, LocalLibraryError> {

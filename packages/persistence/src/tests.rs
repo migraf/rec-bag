@@ -103,8 +103,8 @@ async fn interrupted_legacy_migration_rolls_back_and_can_be_retried() {
         .unwrap();
     let connection = database.connect().unwrap();
     connection.execute_batch(
-        "CREATE TABLE tracks(id TEXT PRIMARY KEY,path TEXT NOT NULL,title TEXT NOT NULL,added_at TEXT NOT NULL,waveform_json TEXT);\
-         INSERT INTO tracks VALUES('not-a-uuid','/music/a.mp3','A','2026-01-01T00:00:00Z',NULL);",
+        "CREATE TABLE tracks(id TEXT PRIMARY KEY,path TEXT NOT NULL,title TEXT NOT NULL,artist TEXT,album TEXT,duration_ms INTEGER,bpm REAL,key TEXT,genre TEXT,rating INTEGER,comment TEXT,added_at TEXT NOT NULL,last_played TEXT,play_count INTEGER DEFAULT 0,sample_rate INTEGER,bitrate INTEGER,year INTEGER,track_number INTEGER,waveform_json TEXT);\
+         INSERT INTO tracks(id,path,title,added_at) VALUES('not-a-uuid','/music/a.mp3','A','2026-01-01T00:00:00Z');",
     ).await.unwrap();
     drop(connection);
     drop(database);
@@ -420,12 +420,20 @@ async fn replacement_import_removes_new_rows_and_restores_authority_and_owned_ta
         .put_cleanup_approval(approval.clone())
         .await
         .unwrap();
-    catalog
-        .connection()
-        .execute(
-            "INSERT INTO legacy_track_analysis(track_id,waveform_json) VALUES(?1,'[0.25]')",
-            [track.id.to_string()],
-        )
+    let mut library_entry = LibraryEntry::new(track.id);
+    library_entry.rating = Some(5);
+    library_entry.record_play(Utc::now());
+    LibraryEntryRepository::upsert(&catalog, library_entry.clone())
+        .await
+        .unwrap();
+    let analysis = TrackAnalysis {
+        waveform: Some(WaveformPeaks {
+            peaks: vec![0.25, 0.5],
+        }),
+        bpm: Some(128.0),
+        ..TrackAnalysis::new(track.id)
+    };
+    TrackAnalysisRepository::upsert(&catalog, analysis.clone())
         .await
         .unwrap();
     SettingsRepository::set(
@@ -495,23 +503,17 @@ async fn replacement_import_removes_new_rows_and_restores_authority_and_owned_ta
             .unwrap(),
         Some(approval)
     );
-    let mut legacy_rows = catalog
-        .connection()
-        .query(
-            "SELECT waveform_json FROM legacy_track_analysis WHERE track_id=?1",
-            [track.id.to_string()],
-        )
-        .await
-        .unwrap();
     assert_eq!(
-        legacy_rows
-            .next()
+        LibraryEntryRepository::get(&catalog, track.id)
             .await
-            .unwrap()
-            .unwrap()
-            .get::<String>(0)
             .unwrap(),
-        "[0.25]"
+        Some(library_entry)
+    );
+    assert_eq!(
+        TrackAnalysisRepository::get(&catalog, track.id)
+            .await
+            .unwrap(),
+        Some(analysis)
     );
     assert_eq!(
         catalog.get_resolution(resolution.id).await.unwrap(),
@@ -637,7 +639,8 @@ async fn interrupted_replace_transaction_rolls_back_and_legacy_documents_still_i
         "catalog_snapshots",
         "snapshot_triggers",
         "cleanup_approvals",
-        "legacy_track_analysis",
+        "library_entries",
+        "track_analysis",
     ] {
         legacy.as_object_mut().unwrap().remove(field);
     }
@@ -1093,7 +1096,7 @@ async fn legacy_playlist_analysis_sources_paths_and_ids_are_preserved() {
         .unwrap();
     let connection = database.connect().unwrap();
     connection.execute_batch(
-        "CREATE TABLE tracks(id TEXT PRIMARY KEY,path TEXT NOT NULL,title TEXT NOT NULL,added_at TEXT NOT NULL,waveform_json TEXT);\
+        "CREATE TABLE tracks(id TEXT PRIMARY KEY,path TEXT NOT NULL,title TEXT NOT NULL,artist TEXT,album TEXT,duration_ms INTEGER,bpm REAL,key TEXT,genre TEXT,rating INTEGER,comment TEXT,added_at TEXT NOT NULL,last_played TEXT,play_count INTEGER DEFAULT 0,sample_rate INTEGER,bitrate INTEGER,year INTEGER,track_number INTEGER,waveform_json TEXT);\
          CREATE TABLE playlists(id TEXT PRIMARY KEY,name TEXT NOT NULL,description TEXT,created_at TEXT NOT NULL,modified_at TEXT NOT NULL);\
          CREATE TABLE playlist_tracks(playlist_id TEXT NOT NULL,track_id TEXT NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(playlist_id,track_id));\
          CREATE TABLE sources(id TEXT PRIMARY KEY,name TEXT NOT NULL,source_type TEXT NOT NULL,uri TEXT NOT NULL,config_json TEXT,track_count INTEGER,enabled INTEGER,created_at TEXT NOT NULL,last_scanned TEXT);\
@@ -1102,7 +1105,7 @@ async fn legacy_playlist_analysis_sources_paths_and_ids_are_preserved() {
     ).await.unwrap();
     connection
         .execute(
-            "INSERT INTO tracks VALUES(?1,?2,'Legacy title','2026-01-01T00:00:00Z','[0.1,0.2]')",
+            "INSERT INTO tracks VALUES(?1,?2,'Legacy title','Legacy artist','Legacy album',213000,128.5,'Am','House',4,'Legacy note','2026-01-01T00:00:00Z','2026-02-01T00:00:00Z',7,44100,320,2019,3,'{\"peaks\":[0.1,0.2]}')",
             (
                 track_id.to_string(),
                 media_path.to_string_lossy().to_string(),
@@ -1112,7 +1115,7 @@ async fn legacy_playlist_analysis_sources_paths_and_ids_are_preserved() {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO tracks VALUES(?1,?2,'Duplicate legacy path','2026-01-01T00:00:00Z',NULL)",
+            "INSERT INTO tracks VALUES(?1,?2,'Duplicate legacy path',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,'2026-01-01T00:00:00Z',NULL,0,NULL,NULL,NULL,NULL,NULL)",
             (
                 duplicate_path_track_id.to_string(),
                 media_path.to_string_lossy().to_string(),
@@ -1201,23 +1204,71 @@ async fn legacy_playlist_analysis_sources_paths_and_ids_are_preserved() {
         .unwrap()
         .iter()
         .all(|storage| storage.role == StorageRole::Unassigned));
-    let mut rows = catalog
-        .connection()
-        .query(
-            "SELECT waveform_json FROM legacy_track_analysis WHERE track_id=?1",
-            [track_id.to_string()],
-        )
-        .await
-        .unwrap();
     assert_eq!(
-        rows.next()
+        preferred_text(&track, MetadataField::Artist).as_deref(),
+        Some("Legacy artist")
+    );
+    assert_eq!(
+        preferred_text(&track, MetadataField::Album).as_deref(),
+        Some("Legacy album")
+    );
+    assert_eq!(
+        preferred_text(&track, MetadataField::Genre).as_deref(),
+        Some("House")
+    );
+    assert_eq!(
+        preferred_text(&track, MetadataField::MusicalKey).as_deref(),
+        Some("Am")
+    );
+
+    let entry = LibraryEntryRepository::get(&catalog, track_id)
+        .await
+        .unwrap()
+        .expect("a rated, commented, played legacy track keeps its library entry");
+    assert_eq!(entry.rating, Some(4));
+    assert_eq!(entry.comment.as_deref(), Some("Legacy note"));
+    assert_eq!(entry.play_count, 7);
+    assert!(entry.last_played_at.is_some());
+    // A track the user never rated, commented on, or played gains no entry row.
+    assert!(
+        LibraryEntryRepository::get(&catalog, duplicate_path_track_id)
             .await
             .unwrap()
-            .unwrap()
-            .get::<String>(0)
-            .unwrap(),
-        "[0.1,0.2]"
+            .is_none()
     );
+
+    let analysis = TrackAnalysisRepository::get(&catalog, track_id)
+        .await
+        .unwrap()
+        .expect("a legacy waveform survives as track analysis");
+    assert_eq!(
+        analysis.waveform.map(|waveform| waveform.peaks),
+        Some(vec![0.1, 0.2])
+    );
+    assert!(!table_exists(&catalog, "legacy_track_analysis").await);
+}
+
+/// The preferred value of one metadata field, for assertions about migrated tags.
+fn preferred_text(track: &CanonicalTrack, field: MetadataField) -> Option<String> {
+    match &track.metadata.preferred(&field)?.value {
+        MetadataValue::Text(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+async fn table_exists(catalog: &TursoCatalog, name: &str) -> bool {
+    catalog
+        .connection()
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .is_some()
 }
 
 #[tokio::test]

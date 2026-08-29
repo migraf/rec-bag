@@ -370,6 +370,11 @@ pub struct MusicManagementView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MusicManagementEvent {
     AddSource(ProviderChoice),
+    /// Adds a local folder source at a path the user already named, rather than one
+    /// chosen through the provider's own folder picker.
+    AddLocalFolderSource {
+        path: String,
+    },
     ConfigureSoundCloud(SoundCloudConfigurationView),
     SyncSource(String),
     RetrySyncRun {

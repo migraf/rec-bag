@@ -56,6 +56,10 @@ _Avoid_: Imported playlist, remote playlist, synced playlist
 A canonical track prepared for playback: a decoded audio file at a concrete path, with its analysis attached. A loaded track is a moment in the life of a track, not a record of one — it exists only while loaded.
 _Avoid_: Deck track, playing track, track (unqualified)
 
+**Track Analysis**:
+The waveform, frequency bands, beat grid, tempo, and key derived from a track's audio. Analysis is reproducible from any original asset, so it is cached rather than owned, and it is attached to a loaded track.
+_Avoid_: Waveform (unqualified), beat data
+
 **Deck**:
 One playback channel that a loaded track occupies. Decks are what the DJ view mixes between.
 

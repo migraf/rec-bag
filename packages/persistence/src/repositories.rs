@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use rec_core::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use turso::Connection;
 use uuid::Uuid;
@@ -55,12 +55,6 @@ pub struct CleanupApproval {
     pub consumed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct LegacyTrackAnalysis {
-    track_id: Uuid,
-    waveform_json: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotDocument {
     format_version: u32,
@@ -101,7 +95,9 @@ struct SnapshotDocument {
     #[serde(default)]
     cleanup_approvals: Vec<CleanupApproval>,
     #[serde(default)]
-    legacy_track_analysis: Vec<LegacyTrackAnalysis>,
+    library_entries: Vec<LibraryEntry>,
+    #[serde(default)]
+    track_analysis: Vec<TrackAnalysis>,
 }
 
 /// The single secrecy boundary for portable catalog snapshots.
@@ -479,6 +475,42 @@ macro_rules! impl_repositories {
             }
         }
 
+        impl LibraryEntryRepository for $ty {
+            fn get(&self, track_id: Uuid) -> BoxFuture<'_, RepositoryResult<Option<LibraryEntry>>> {
+                Box::pin(async move { get_payload(self.db(), "SELECT payload FROM library_entries WHERE track_id=?1", [track_id.to_string()]).await })
+            }
+            fn list(&self) -> BoxFuture<'_, RepositoryResult<Vec<LibraryEntry>>> {
+                Box::pin(async move { list_payloads(self.db(), "SELECT payload FROM library_entries ORDER BY track_id").await })
+            }
+            fn upsert(&self, entry: LibraryEntry) -> BoxFuture<'_, RepositoryResult<()>> {
+                Box::pin(async move {
+                    self.db().execute("INSERT INTO library_entries(track_id,payload,updated_at) VALUES(?1,?2,?3) ON CONFLICT(track_id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at", (entry.track_id.to_string(), encode(&entry)?, entry.updated_at.to_rfc3339())).await.map_err(database_error)?;
+                    Ok(())
+                })
+            }
+        }
+
+        impl TrackAnalysisRepository for $ty {
+            fn get(&self, track_id: Uuid) -> BoxFuture<'_, RepositoryResult<Option<TrackAnalysis>>> {
+                Box::pin(async move { get_payload(self.db(), "SELECT payload FROM track_analysis WHERE track_id=?1", [track_id.to_string()]).await })
+            }
+            fn list(&self) -> BoxFuture<'_, RepositoryResult<Vec<TrackAnalysis>>> {
+                Box::pin(async move { list_payloads(self.db(), "SELECT payload FROM track_analysis ORDER BY track_id").await })
+            }
+            fn upsert(&self, analysis: TrackAnalysis) -> BoxFuture<'_, RepositoryResult<()>> {
+                Box::pin(async move {
+                    self.db().execute("INSERT INTO track_analysis(track_id,payload) VALUES(?1,?2) ON CONFLICT(track_id) DO UPDATE SET payload=excluded.payload", (analysis.track_id.to_string(), encode(&analysis)?)).await.map_err(database_error)?;
+                    Ok(())
+                })
+            }
+            fn remove(&self, track_id: Uuid) -> BoxFuture<'_, RepositoryResult<()>> {
+                Box::pin(async move {
+                    self.db().execute("DELETE FROM track_analysis WHERE track_id=?1", [track_id.to_string()]).await.map_err(database_error)?;
+                    Ok(())
+                })
+            }
+        }
+
         impl PlaylistRepository for $ty {
             fn get(&self, id: Uuid) -> BoxFuture<'_, RepositoryResult<Option<CanonicalPlaylist>>> { Box::pin(async move { get_payload(self.db(), "SELECT payload FROM canonical_playlists WHERE id=?1", [id.to_string()]).await }) }
             fn list(&self, page: RepositoryPageRequest) -> BoxFuture<'_, RepositoryResult<RepositoryPage<CanonicalPlaylist>>> { Box::pin(async move { page_payloads(self.db(), "canonical_playlists", &page).await }) }
@@ -489,6 +521,17 @@ macro_rules! impl_repositories {
                         self.db().execute("INSERT INTO canonical_playlists(id,payload,created_at,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at", (playlist.id.to_string(),encode(&playlist)?,playlist.created_at.to_rfc3339(),playlist.updated_at.to_rfc3339())).await.map_err(database_error)?;
                         self.db().execute("DELETE FROM canonical_playlist_memberships WHERE playlist_id=?1",[playlist.id.to_string()]).await.map_err(database_error)?;
                         for entry in &playlist.entries { self.db().execute("INSERT INTO canonical_playlist_memberships(playlist_id,position,track_id) VALUES(?1,?2,?3)",(playlist.id.to_string(),entry.position as i64,entry.track_id.to_string())).await.map_err(database_error)?; }
+                        Ok(())
+                    }.await;
+                    finish_atomic(self,owner,result).await
+                })
+            }
+            fn remove(&self, id: Uuid) -> BoxFuture<'_, RepositoryResult<()>> {
+                Box::pin(async move {
+                    let owner=begin_atomic(self).await?;
+                    let result=async {
+                        self.db().execute("DELETE FROM canonical_playlist_memberships WHERE playlist_id=?1",[id.to_string()]).await.map_err(database_error)?;
+                        self.db().execute("DELETE FROM canonical_playlists WHERE id=?1",[id.to_string()]).await.map_err(database_error)?;
                         Ok(())
                     }.await;
                     finish_atomic(self,owner,result).await
@@ -895,7 +938,8 @@ impl TursoCatalog {
             catalog_snapshots:list_payloads(self.connection(),"SELECT payload FROM catalog_snapshots ORDER BY created_at,id").await?,
             snapshot_triggers:list_payloads(self.connection(),"SELECT payload FROM snapshot_triggers ORDER BY requested_at,id").await?,
             cleanup_approvals:list_payloads(self.connection(),"SELECT payload FROM cleanup_approvals ORDER BY approved_at,id").await?,
-            legacy_track_analysis:list_legacy_track_analysis(self.connection()).await?,
+            library_entries:list_payloads(self.connection(),"SELECT payload FROM library_entries ORDER BY track_id").await?,
+            track_analysis:list_payloads(self.connection(),"SELECT payload FROM track_analysis ORDER BY track_id").await?,
         };
         let document = SnapshotExportPolicy::prepare(document)?;
         let snapshot = CatalogSnapshot::new(
@@ -959,19 +1003,49 @@ impl TursoCatalog {
         &self,
         track_id: Uuid,
     ) -> RepositoryResult<Vec<std::path::PathBuf>> {
-        let mut rows = self
-            .connection()
-            .query(
-                "SELECT o.payload, s.payload FROM source_track_occurrences o JOIN catalog_sources s ON s.id = o.source_id WHERE o.canonical_track_id = ?1",
-                [track_id.to_string()],
-            )
-            .await
-            .map_err(database_error)?;
-        let mut paths = Vec::new();
+        Ok(self
+            .local_source_paths(Some(track_id))
+            .await?
+            .remove(&track_id)
+            .unwrap_or_default())
+    }
+
+    /// The same resolution for every track at once, for callers projecting a whole
+    /// library. One query beats one query per track by two orders of magnitude.
+    pub async fn local_source_paths_by_track(
+        &self,
+    ) -> RepositoryResult<BTreeMap<Uuid, Vec<std::path::PathBuf>>> {
+        self.local_source_paths(None).await
+    }
+
+    async fn local_source_paths(
+        &self,
+        track_id: Option<Uuid>,
+    ) -> RepositoryResult<BTreeMap<Uuid, Vec<std::path::PathBuf>>> {
+        let mut rows = match track_id {
+            Some(track_id) => self
+                .connection()
+                .query(
+                    "SELECT o.canonical_track_id, o.payload, s.payload FROM source_track_occurrences o JOIN catalog_sources s ON s.id = o.source_id WHERE o.canonical_track_id = ?1",
+                    [track_id.to_string()],
+                )
+                .await,
+            None => self
+                .connection()
+                .query(
+                    "SELECT o.canonical_track_id, o.payload, s.payload FROM source_track_occurrences o JOIN catalog_sources s ON s.id = o.source_id WHERE o.canonical_track_id IS NOT NULL",
+                    (),
+                )
+                .await,
+        }
+        .map_err(database_error)?;
+        let mut paths: BTreeMap<Uuid, Vec<std::path::PathBuf>> = BTreeMap::new();
         while let Some(row) = rows.next().await.map_err(database_error)? {
+            let track_id = Uuid::parse_str(&row.get::<String>(0).map_err(database_error)?)
+                .map_err(|error| invalid_data(error.to_string()))?;
             let occurrence: SourceTrackOccurrence =
-                decode(row.get::<String>(0).map_err(database_error)?)?;
-            let source: CatalogSource = decode(row.get::<String>(1).map_err(database_error)?)?;
+                decode(row.get::<String>(1).map_err(database_error)?)?;
+            let source: CatalogSource = decode(row.get::<String>(2).map_err(database_error)?)?;
             if source.kind != CatalogSourceKind::LocalFolder {
                 continue;
             }
@@ -982,10 +1056,33 @@ impl TursoCatalog {
                 continue;
             };
             if let MetadataValue::Text(relative) = relative {
-                paths.push(std::path::PathBuf::from(root).join(relative));
+                paths
+                    .entry(track_id)
+                    .or_default()
+                    .push(std::path::PathBuf::from(root).join(relative));
             }
         }
         Ok(paths)
+    }
+
+    /// How many source occurrences each configured source currently holds.
+    pub async fn occurrence_counts_by_source(&self) -> RepositoryResult<BTreeMap<Uuid, u32>> {
+        let mut rows = self
+            .connection()
+            .query(
+                "SELECT source_id, COUNT(*) FROM source_track_occurrences GROUP BY source_id",
+                (),
+            )
+            .await
+            .map_err(database_error)?;
+        let mut counts = BTreeMap::new();
+        while let Some(row) = rows.next().await.map_err(database_error)? {
+            let source_id = Uuid::parse_str(&row.get::<String>(0).map_err(database_error)?)
+                .map_err(|error| invalid_data(error.to_string()))?;
+            let count = row.get::<i64>(1).map_err(database_error)?;
+            counts.insert(source_id, u32::try_from(count).unwrap_or(u32::MAX));
+        }
+        Ok(counts)
     }
 }
 
@@ -1050,7 +1147,8 @@ DELETE FROM original_assets;
 DELETE FROM assets;
 DELETE FROM canonical_playlist_memberships;
 DELETE FROM canonical_playlists;
-DELETE FROM legacy_track_analysis;
+DELETE FROM track_analysis;
+DELETE FROM library_entries;
 DELETE FROM track_metadata_values;
 DELETE FROM catalog_sources;
 DELETE FROM music_storages;
@@ -1072,11 +1170,11 @@ async fn restore_snapshot_document(
     for value in document.tracks {
         transaction.tracks().upsert(value).await?;
     }
-    for value in document.legacy_track_analysis {
-        transaction.db().execute(
-            "INSERT INTO legacy_track_analysis(track_id,waveform_json) VALUES(?1,?2) ON CONFLICT(track_id) DO UPDATE SET waveform_json=excluded.waveform_json",
-            (value.track_id.to_string(), value.waveform_json),
-        ).await.map_err(database_error)?;
+    for value in document.library_entries {
+        transaction.library_entries().upsert(value).await?;
+    }
+    for value in document.track_analysis {
+        transaction.track_analysis().upsert(value).await?;
     }
     for value in document.playlists {
         transaction.playlists().upsert(value).await?;
@@ -1833,27 +1931,6 @@ fn semantic_event_key(event: &rec_sync::JobEvent, kind: &str) -> Option<String> 
         )),
         _ => None,
     }
-}
-
-async fn list_legacy_track_analysis(
-    connection: &Connection,
-) -> RepositoryResult<Vec<LegacyTrackAnalysis>> {
-    let mut rows = connection
-        .query(
-            "SELECT track_id,waveform_json FROM legacy_track_analysis ORDER BY track_id",
-            (),
-        )
-        .await
-        .map_err(database_error)?;
-    let mut values = Vec::new();
-    while let Some(row) = rows.next().await.map_err(database_error)? {
-        values.push(LegacyTrackAnalysis {
-            track_id: Uuid::parse_str(&row.get::<String>(0).map_err(database_error)?)
-                .map_err(|error| invalid_data(error.to_string()))?,
-            waveform_json: row.get(1).map_err(database_error)?,
-        });
-    }
-    Ok(values)
 }
 
 async fn active_primary_storage_id(connection: &Connection) -> RepositoryResult<Option<Uuid>> {

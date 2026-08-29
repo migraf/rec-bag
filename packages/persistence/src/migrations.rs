@@ -1,11 +1,12 @@
 use chrono::{DateTime, Utc};
 use rec_core::{
     AssetLocation, AssetType, CanonicalMetadata, CanonicalPlaylist, CanonicalPlaylistEntry,
-    CanonicalTrack, CatalogSource, CatalogSourceKind, MetadataField, MetadataFieldValue,
-    MetadataOrigin, MetadataProvenance, MetadataValue, MusicStorage, MusicStorageKind,
-    OriginalAsset, OriginalAssetRole, Setting, SourceAvailability, SourceCapabilities,
-    SourceTrackOccurrence, StorageCapabilities, StorageObject, StorageRole,
-    StorageVerificationStatus, CURRENT_CATALOG_SCHEMA_VERSION, LEGACY_CATALOG_SCHEMA_VERSION,
+    CanonicalTrack, CatalogSource, CatalogSourceKind, LibraryEntry, MetadataField,
+    MetadataFieldValue, MetadataOrigin, MetadataProvenance, MetadataValue, MusicStorage,
+    MusicStorageKind, OriginalAsset, OriginalAssetRole, Setting, SourceAvailability,
+    SourceCapabilities, SourceTrackOccurrence, StorageCapabilities, StorageObject, StorageRole,
+    StorageVerificationStatus, TrackAnalysis, WaveformPeaks, CURRENT_CATALOG_SCHEMA_VERSION,
+    LEGACY_CATALOG_SCHEMA_VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -161,6 +162,17 @@ fn stable_uuid(namespace: Uuid, value: &str) -> Uuid {
     Uuid::new_v5(&namespace, value.as_bytes())
 }
 
+fn legacy_text(row: &turso::Row, index: usize) -> Result<Option<MetadataValue>, MigrationError> {
+    Ok(row
+        .get::<Option<String>>(index)?
+        .filter(|value| !value.trim().is_empty())
+        .map(MetadataValue::Text))
+}
+
+fn legacy_integer(row: &turso::Row, index: usize) -> Result<Option<MetadataValue>, MigrationError> {
+    Ok(row.get::<Option<i64>>(index)?.map(MetadataValue::Integer))
+}
+
 async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationError> {
     for (old, new) in [
         ("tracks", "legacy_v1_tracks"),
@@ -180,9 +192,12 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
 
     let mut tracks = BTreeMap::<Uuid, (CanonicalTrack, String)>::new();
     if table_exists(connection, "legacy_v1_tracks").await? {
+        let mut migrated = Vec::new();
         let mut rows = connection
             .query(
-                "SELECT id, path, title, added_at, waveform_json FROM legacy_v1_tracks ORDER BY id",
+                "SELECT id, path, title, artist, album, genre, key, bpm, duration_ms, year, \
+                 track_number, rating, comment, play_count, last_played, added_at, waveform_json \
+                 FROM legacy_v1_tracks ORDER BY id",
                 (),
             )
             .await?;
@@ -190,15 +205,34 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
             let raw_id: String = row.get(0)?;
             let id = parse_uuid(&raw_id, "track")?;
             let path: String = row.get(1)?;
-            let title: String = row.get(2)?;
-            let added_at = parse_time(&row.get::<String>(3)?, "track")?;
-            let waveform: Option<String> = row.get(4)?;
+            let added_at = parse_time(&row.get::<String>(15)?, "track")?;
+
+            // Every legacy tag was authored or read locally, so it migrates as one User
+            // candidate per field rather than as a provider observation.
             let mut metadata = CanonicalMetadata::new();
-            metadata.add(MetadataFieldValue::new(
+            let provenance = MetadataProvenance::new(MetadataOrigin::User, added_at);
+            let mut observe = |field: MetadataField, value: Option<MetadataValue>| {
+                if let Some(value) = value {
+                    metadata.add(MetadataFieldValue::new(field, value, provenance.clone()));
+                }
+            };
+            observe(
                 MetadataField::Title,
-                MetadataValue::Text(title),
-                MetadataProvenance::new(MetadataOrigin::User, added_at),
-            ));
+                Some(MetadataValue::Text(row.get::<String>(2)?)),
+            );
+            observe(MetadataField::Artist, legacy_text(&row, 3)?);
+            observe(MetadataField::Album, legacy_text(&row, 4)?);
+            observe(MetadataField::Genre, legacy_text(&row, 5)?);
+            observe(MetadataField::MusicalKey, legacy_text(&row, 6)?);
+            observe(
+                MetadataField::Bpm,
+                row.get::<Option<f64>>(7)?
+                    .map(|value| MetadataValue::Decimal(value.to_string())),
+            );
+            observe(MetadataField::DurationMs, legacy_integer(&row, 8)?);
+            observe(MetadataField::ReleaseYear, legacy_integer(&row, 9)?);
+            observe(MetadataField::TrackNumber, legacy_integer(&row, 10)?);
+
             let track = CanonicalTrack {
                 id,
                 metadata,
@@ -206,9 +240,35 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
                 created_at: added_at,
                 updated_at: added_at,
             };
+
+            // The user's own record is the only thing the path-keyed track still owned.
+            let mut entry = LibraryEntry::added_at(id, added_at);
+            entry.rating = row
+                .get::<Option<i64>>(11)?
+                .and_then(|value| u8::try_from(value).ok());
+            entry.comment = row.get::<Option<String>>(12)?;
+            entry.play_count = row
+                .get::<Option<i64>>(13)?
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(0);
+            entry.last_played_at = row
+                .get::<Option<String>>(14)?
+                .map(|value| parse_time(&value, "track play"))
+                .transpose()?;
+
+            let analysis = row
+                .get::<Option<String>>(16)?
+                .map(|waveform| track_analysis(id, &waveform))
+                .transpose()?;
+
+            migrated.push((raw_id, path, track, entry, analysis));
+        }
+        drop(rows);
+
+        for (raw_id, path, track, entry, analysis) in migrated {
             connection.execute(
                 "INSERT INTO tracks(id,payload,created_at,updated_at,legacy_path) VALUES(?1,?2,?3,?4,?5)",
-                (raw_id.clone(), json(&track)?, added_at.to_rfc3339(), added_at.to_rfc3339(), path.clone()),
+                (raw_id.clone(), json(&track)?, track.created_at.to_rfc3339(), track.updated_at.to_rfc3339(), path.clone()),
             ).await?;
             for (ordinal, value) in track.metadata.values.iter().enumerate() {
                 connection.execute(
@@ -216,15 +276,23 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
                     (raw_id.clone(), ordinal as i64, json(value)?),
                 ).await?;
             }
-            if let Some(waveform) = waveform {
+            if !entry.is_empty() {
                 connection
                     .execute(
-                        "INSERT INTO legacy_track_analysis(track_id,waveform_json) VALUES(?1,?2)",
-                        (raw_id, waveform),
+                        "INSERT INTO library_entries(track_id,payload,updated_at) VALUES(?1,?2,?3)",
+                        (raw_id.clone(), json(&entry)?, entry.updated_at.to_rfc3339()),
                     )
                     .await?;
             }
-            tracks.insert(id, (track, path));
+            if let Some(analysis) = analysis {
+                connection
+                    .execute(
+                        "INSERT INTO track_analysis(track_id,payload) VALUES(?1,?2)",
+                        (raw_id.clone(), json(&analysis)?),
+                    )
+                    .await?;
+            }
+            tracks.insert(track.id, (track, path));
         }
     }
 
@@ -511,7 +579,8 @@ CREATE TABLE IF NOT EXISTS snapshot_triggers(id TEXT PRIMARY KEY,source_run_id T
 CREATE TABLE IF NOT EXISTS cleanup_approvals(id TEXT PRIMARY KEY,storage_id TEXT NOT NULL,object_id TEXT NOT NULL,approved_at TEXT NOT NULL,expires_at TEXT,consumed_at TEXT,payload TEXT NOT NULL,UNIQUE(storage_id,object_id),FOREIGN KEY(storage_id) REFERENCES music_storages(id));
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,payload TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS catalog_snapshots(id TEXT PRIMARY KEY,content_hash TEXT NOT NULL UNIQUE,logical_fingerprint TEXT,created_at TEXT NOT NULL,payload TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS legacy_track_analysis(track_id TEXT PRIMARY KEY,waveform_json TEXT NOT NULL,FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS library_entries(track_id TEXT PRIMARY KEY,payload TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS track_analysis(track_id TEXT PRIMARY KEY,payload TEXT NOT NULL,FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS idx_tracks_updated ON tracks(updated_at,id);
 CREATE INDEX IF NOT EXISTS idx_playlist_memberships_track ON canonical_playlist_memberships(track_id);
 CREATE INDEX IF NOT EXISTS idx_source_accounts_source ON source_accounts(source_id,external_id);
@@ -573,6 +642,7 @@ INSERT INTO catalog_schema_version(singleton,version,updated_at) VALUES(1,3,'197
     ] {
         ensure_column(connection, table, column, definition).await?;
     }
+    fold_legacy_track_analysis(connection).await?;
     if sync_job_index_backfill_required(connection).await? {
         backfill_sync_job_indexes(connection).await?;
     }
@@ -651,6 +721,51 @@ async fn backfill_sync_job_indexes(connection: &Connection) -> Result<(), Migrat
         }
     }
     Ok(())
+}
+
+/// Analysis was briefly kept as a bare waveform blob under its own legacy table. It is a
+/// derived value, so folding it into `track_analysis` and dropping the old table costs at
+/// worst one re-analysis rather than anything the user owns.
+async fn fold_legacy_track_analysis(connection: &Connection) -> Result<(), MigrationError> {
+    if !table_exists(connection, "legacy_track_analysis").await? {
+        return Ok(());
+    }
+    let mut rows = connection
+        .query(
+            "SELECT track_id,waveform_json FROM legacy_track_analysis ORDER BY track_id",
+            (),
+        )
+        .await?;
+    let mut folded = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let raw_id: String = row.get(0)?;
+        let waveform_json: String = row.get(1)?;
+        let track_id = parse_uuid(&raw_id, "track")?;
+        folded.push((raw_id, track_analysis(track_id, &waveform_json)?));
+    }
+    drop(rows);
+    for (raw_id, analysis) in folded {
+        connection
+            .execute(
+                "INSERT INTO track_analysis(track_id,payload) VALUES(?1,?2) ON CONFLICT(track_id) DO NOTHING",
+                (raw_id, json(&analysis)?),
+            )
+            .await?;
+    }
+    connection
+        .execute_batch("DROP TABLE legacy_track_analysis;")
+        .await?;
+    Ok(())
+}
+
+/// Build an analysis record from a legacy waveform blob, discarding a blob this binary
+/// cannot read rather than refusing to open the catalog.
+fn track_analysis(track_id: Uuid, waveform_json: &str) -> Result<TrackAnalysis, MigrationError> {
+    Ok(TrackAnalysis {
+        track_id,
+        waveform: serde_json::from_str::<WaveformPeaks>(waveform_json).ok(),
+        ..TrackAnalysis::new(track_id)
+    })
 }
 
 async fn ensure_column(

@@ -5,6 +5,7 @@
 //! intentionally do not replace the existing `Track` model.
 
 use crate::asset::SourceCopyPolicy;
+use crate::track::{BeatGridData, FrequencyWaveformData, WaveformPeaks};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -689,6 +690,29 @@ impl CanonicalMetadata {
         self.values.push(value);
     }
 
+    /// Record the user's own value for a field, replacing any value they gave before.
+    ///
+    /// Passing `None` withdraws the user's override rather than blanking the field, so
+    /// what a source observed becomes canonical again. Candidates from other origins
+    /// are never touched: this is a reconciled model, not a set of overwritable cells.
+    pub fn retain_user_edit(
+        &mut self,
+        field: MetadataField,
+        value: Option<MetadataValue>,
+        edited_at: DateTime<Utc>,
+    ) {
+        self.values.retain(|candidate| {
+            candidate.field != field || candidate.provenance.origin != MetadataOrigin::User
+        });
+        if let Some(value) = value {
+            self.add(MetadataFieldValue::new(
+                field,
+                value,
+                MetadataProvenance::new(MetadataOrigin::User, edited_at),
+            ));
+        }
+    }
+
     /// Select the canonical candidate for a field.
     ///
     /// Higher explicit priority wins. For equal priority, the most recently observed
@@ -755,6 +779,113 @@ impl CanonicalTrack {
 impl Default for CanonicalTrack {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The user's own record about a canonical track.
+///
+/// A library entry is authored or accumulated locally: it is never observed from a
+/// provider and never reconciled against one, so it carries no metadata candidates and
+/// no provenance. It is the only thing the retired path-keyed track model still owned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LibraryEntry {
+    /// Canonical track this entry describes.
+    pub track_id: Uuid,
+    /// User-defined rating, from 0 to 5.
+    pub rating: Option<u8>,
+    /// User comment or note.
+    pub comment: Option<String>,
+    /// How many times the track has been played through rec_bag.
+    pub play_count: u32,
+    /// When the track was last played.
+    pub last_played_at: Option<DateTime<Utc>>,
+    /// When the track entered the user's library.
+    pub added_at: DateTime<Utc>,
+    /// When any of the above last changed.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl LibraryEntry {
+    /// Create an empty entry that was added now.
+    pub fn new(track_id: Uuid) -> Self {
+        let now = Utc::now();
+        Self::added_at(track_id, now)
+    }
+
+    /// Create an empty entry added at a known time.
+    pub fn added_at(track_id: Uuid, added_at: DateTime<Utc>) -> Self {
+        Self {
+            track_id,
+            rating: None,
+            comment: None,
+            play_count: 0,
+            last_played_at: None,
+            added_at,
+            updated_at: added_at,
+        }
+    }
+
+    /// Record one play, at `played_at`.
+    pub fn record_play(&mut self, played_at: DateTime<Utc>) {
+        self.play_count = self.play_count.saturating_add(1);
+        self.last_played_at = Some(played_at);
+        self.updated_at = played_at;
+    }
+
+    /// Whether this entry holds anything the user authored or accumulated.
+    ///
+    /// An empty entry carries no information beyond `added_at`, so callers may skip
+    /// persisting it rather than writing a row per track.
+    pub fn is_empty(&self) -> bool {
+        self.rating.is_none()
+            && self.comment.is_none()
+            && self.play_count == 0
+            && self.last_played_at.is_none()
+    }
+}
+
+/// What analysis derived from a canonical track's audio.
+///
+/// Analysis is reproducible from any original asset, so losing it loses nothing. It is
+/// cached in the catalog because recomputing it costs a full decode, and it is attached
+/// to a [`crate::track::Track`] only while that track is loaded on a deck.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TrackAnalysis {
+    /// Canonical track this analysis describes.
+    pub track_id: Uuid,
+    /// Amplitude peaks for waveform display.
+    #[serde(default)]
+    pub waveform: Option<WaveformPeaks>,
+    /// Per-band peaks for coloured waveform display.
+    #[serde(default)]
+    pub freq_waveform: Option<FrequencyWaveformData>,
+    /// Detected beat positions.
+    #[serde(default)]
+    pub beat_grid: Option<BeatGridData>,
+    /// Detected tempo, in beats per minute.
+    #[serde(default)]
+    pub bpm: Option<f32>,
+    /// Detected musical key, in the notation the analyzer reports.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+impl TrackAnalysis {
+    /// An analysis record holding no results yet.
+    pub fn new(track_id: Uuid) -> Self {
+        Self {
+            track_id,
+            ..Default::default()
+        }
+    }
+
+    /// Whether anything has been derived for this track.
+    pub fn is_empty(&self) -> bool {
+        self.waveform.is_none()
+            && self.freq_waveform.is_none()
+            && self.beat_grid.is_none()
+            && self.bpm.is_none()
+            && self.key.is_none()
     }
 }
 

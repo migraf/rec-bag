@@ -5,8 +5,10 @@
 //! the deck owns the lock, the index, and the reconciliation, so playback behaves the
 //! same wherever it is driven from.
 
+use crate::services::catalog::LoadedTrack;
 use dioxus::prelude::*;
 use rec_core::{AudioEngine, DeckState, Track};
+use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use ui::DeckDisplayState;
@@ -21,7 +23,7 @@ pub const DECK_COUNT: usize = 2;
 /// in-memory fake in this module's tests. Every method takes the deck's own index, so
 /// an out-of-range index is this trait's problem and never a caller's.
 pub trait DeckAudio {
-    fn load(&mut self, index: usize, track: Track) -> bool;
+    fn load(&mut self, index: usize, path: &Path) -> bool;
     fn play(&mut self, index: usize);
     fn pause(&mut self, index: usize);
     fn stop(&mut self, index: usize);
@@ -34,8 +36,8 @@ pub trait DeckAudio {
 }
 
 impl DeckAudio for AudioEngine {
-    fn load(&mut self, index: usize, track: Track) -> bool {
-        self.load_track(index, track).is_ok()
+    fn load(&mut self, index: usize, path: &Path) -> bool {
+        self.load_track(index, path).is_ok()
     }
 
     fn play(&mut self, index: usize) {
@@ -109,7 +111,7 @@ impl Default for DeckSnapshot {
 pub struct Deck {
     audio: Signal<SharedAudio>,
     index: usize,
-    track: Signal<Option<Track>>,
+    loaded: Signal<Option<LoadedTrack>>,
     live: Signal<DeckSnapshot>,
 }
 
@@ -119,7 +121,7 @@ impl Deck {
         Self {
             audio,
             index,
-            track: Signal::new(None),
+            loaded: Signal::new(None),
             live: Signal::new(DeckSnapshot::default()),
         }
     }
@@ -130,16 +132,24 @@ impl Deck {
     }
 
     /// The Loaded Track, if this deck holds one.
+    pub fn loaded(&self) -> Option<LoadedTrack> {
+        self.loaded.read().clone()
+    }
+
+    /// The Loaded Track's catalog record, if this deck holds one.
     pub fn track(&self) -> Option<Track> {
-        self.track.read().clone()
+        self.loaded
+            .read()
+            .as_ref()
+            .map(|loaded| loaded.track.clone())
     }
 
     /// Whether this deck holds the given canonical track.
     pub fn holds(&self, track_id: Uuid) -> bool {
-        self.track
+        self.loaded
             .read()
             .as_ref()
-            .is_some_and(|track| track.id == track_id)
+            .is_some_and(|loaded| loaded.id() == track_id)
     }
 
     pub fn state(&self) -> DeckDisplayState {
@@ -158,17 +168,15 @@ impl Deck {
         self.state() == DeckDisplayState::Playing
     }
 
-    /// Put `track` on this deck, decoding audio from `playback_path`.
+    /// Put a Loaded Track on this deck.
     ///
-    /// The path is only what the audio engine reads from; the deck keeps the track's
-    /// own identity, so a cached copy of a remote asset never becomes the track.
-    pub fn load(&self, track: Track, playback_path: std::path::PathBuf) -> bool {
-        let mut decoded = track.clone();
-        decoded.path = playback_path;
-        if !self.with_audio(|audio, index| audio.load(index, decoded)) {
+    /// The audio engine decodes the loaded track's resolved file; the deck keeps the
+    /// track's own identity, so a cached copy of a remote asset never becomes the track.
+    pub fn load(&self, loaded: LoadedTrack) -> bool {
+        if !self.with_audio(|audio, index| audio.load(index, &loaded.path)) {
             return false;
         }
-        self.set_track(Some(track));
+        self.set_loaded(Some(loaded));
         self.refresh();
         true
     }
@@ -218,12 +226,12 @@ impl Deck {
         if !self.holds(track_id) {
             return false;
         }
-        let mut track = match self.track.read().clone() {
-            Some(track) => track,
+        let mut loaded = match self.loaded.read().clone() {
+            Some(loaded) => loaded,
             None => return false,
         };
-        edit(&mut track);
-        self.set_track(Some(track));
+        edit(&mut loaded.track);
+        self.set_loaded(Some(loaded));
         true
     }
 
@@ -245,9 +253,9 @@ impl Deck {
         }
     }
 
-    fn set_track(&self, track: Option<Track>) {
-        let mut slot = self.track;
-        slot.set(track);
+    fn set_loaded(&self, loaded: Option<LoadedTrack>) {
+        let mut slot = self.loaded;
+        slot.set(loaded);
     }
 
     fn with_audio<T>(&self, act: impl FnOnce(&mut dyn DeckAudio, usize) -> T) -> T
@@ -327,12 +335,12 @@ mod tests {
     }
 
     impl DeckAudio for FakeAudio {
-        fn load(&mut self, index: usize, track: Track) -> bool {
+        fn load(&mut self, index: usize, path: &Path) -> bool {
             self.calls.push(format!("load {index}"));
             if self.decks[index].refuse_load {
                 return false;
             }
-            self.decks[index].loaded_from = Some(track.path);
+            self.decks[index].loaded_from = Some(path.to_path_buf());
             self.decks[index].state = DeckState::Stopped;
             true
         }
@@ -390,13 +398,21 @@ mod tests {
         Deck {
             audio,
             index,
-            track: Signal::new_in_scope(None, ScopeId::ROOT),
+            loaded: Signal::new_in_scope(None, ScopeId::ROOT),
             live: Signal::new_in_scope(DeckSnapshot::default(), ScopeId::ROOT),
         }
     }
 
-    fn a_track() -> Track {
-        Track::new(PathBuf::from("/music/canonical.mp3"))
+    /// A canonical track that has been prepared for a deck: its own record, plus the
+    /// disposable cache file the audio engine will decode.
+    fn a_loaded_track(cache: &str) -> LoadedTrack {
+        let mut track = Track::new_without_metadata(PathBuf::new());
+        track.title = "Canonical".into();
+        LoadedTrack {
+            track,
+            path: PathBuf::from(cache),
+            cached: true,
+        }
     }
 
     #[test]
@@ -419,16 +435,19 @@ mod tests {
     #[test]
     fn loading_plays_the_resolved_path_but_keeps_the_track() {
         with_decks(|decks, fake| {
-            let track = a_track();
-            assert!(decks[0].load(track.clone(), PathBuf::from("/cache/drive/abc.mp3")));
+            let loaded = a_loaded_track("/cache/drive/abc.mp3");
+            let id = loaded.id();
+            assert!(decks[0].load(loaded));
             assert_eq!(
                 fake.lock().unwrap().decks[0].loaded_from,
                 Some(PathBuf::from("/cache/drive/abc.mp3"))
             );
+            // The cache copy is what plays; it never becomes the track's identity.
             assert_eq!(
-                decks[0].track().map(|t| t.path),
-                Some(PathBuf::from("/music/canonical.mp3"))
+                decks[0].track().map(|track| track.path),
+                Some(PathBuf::new())
             );
+            assert!(decks[0].holds(id));
         });
     }
 
@@ -436,7 +455,7 @@ mod tests {
     fn a_deck_that_cannot_decode_does_not_claim_the_track() {
         with_decks(|decks, fake| {
             fake.lock().unwrap().decks[0].refuse_load = true;
-            assert!(!decks[0].load(a_track(), PathBuf::from("/cache/x.mp3")));
+            assert!(!decks[0].load(a_loaded_track("/cache/x.mp3")));
             assert!(decks[0].track().is_none());
         });
     }
@@ -476,10 +495,10 @@ mod tests {
     #[test]
     fn only_the_deck_holding_the_track_is_edited() {
         with_decks(|decks, _| {
-            let track = a_track();
-            let id = track.id;
-            decks[0].load(track, PathBuf::from("/cache/a.mp3"));
-            decks[1].load(a_track(), PathBuf::from("/cache/b.mp3"));
+            let loaded = a_loaded_track("/cache/a.mp3");
+            let id = loaded.id();
+            decks[0].load(loaded);
+            decks[1].load(a_loaded_track("/cache/b.mp3"));
 
             assert!(decks[0].edit_track(id, |track| track.set_bpm(128.0)));
             assert!(!decks[1].edit_track(id, |track| track.set_bpm(128.0)));

@@ -9,8 +9,8 @@ use crate::asset::{
 };
 use crate::catalog::{
     CanonicalPlaylist, CanonicalTrack, CatalogSource, ExternalPlaylist, ExternalPlaylistEntry,
-    SourceAccount, SourceCollection, SourceCollectionRelationship,
-    SourceCollectionRelationshipIdentity, SourceEntityKind, SourceTrackOccurrence,
+    LibraryEntry, SourceAccount, SourceCollection, SourceCollectionRelationship,
+    SourceCollectionRelationshipIdentity, SourceEntityKind, SourceTrackOccurrence, TrackAnalysis,
 };
 use crate::provider::BoxFuture;
 use crate::reconciliation::{
@@ -335,6 +335,32 @@ pub trait TrackRepository: Send + Sync {
     fn upsert(&self, track: CanonicalTrack) -> BoxFuture<'_, RepositoryResult<()>>;
 }
 
+/// Persistence operations for the user's own record about canonical tracks.
+///
+/// Library entries are keyed by canonical track, never by path, so they survive a file
+/// moving between storages.
+pub trait LibraryEntryRepository: Send + Sync {
+    fn get(&self, track_id: Uuid) -> BoxFuture<'_, RepositoryResult<Option<LibraryEntry>>>;
+
+    fn list(&self) -> BoxFuture<'_, RepositoryResult<Vec<LibraryEntry>>>;
+
+    fn upsert(&self, entry: LibraryEntry) -> BoxFuture<'_, RepositoryResult<()>>;
+}
+
+/// Persistence operations for cached audio analysis.
+///
+/// Analysis is reproducible from an original asset, so an implementation may discard a
+/// record at any time without losing anything the user owns.
+pub trait TrackAnalysisRepository: Send + Sync {
+    fn get(&self, track_id: Uuid) -> BoxFuture<'_, RepositoryResult<Option<TrackAnalysis>>>;
+
+    fn list(&self) -> BoxFuture<'_, RepositoryResult<Vec<TrackAnalysis>>>;
+
+    fn upsert(&self, analysis: TrackAnalysis) -> BoxFuture<'_, RepositoryResult<()>>;
+
+    fn remove(&self, track_id: Uuid) -> BoxFuture<'_, RepositoryResult<()>>;
+}
+
 /// Persistence operations for native and source-owned playlists.
 pub trait PlaylistRepository: Send + Sync {
     fn get(&self, id: Uuid) -> BoxFuture<'_, RepositoryResult<Option<CanonicalPlaylist>>>;
@@ -345,6 +371,10 @@ pub trait PlaylistRepository: Send + Sync {
     ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<CanonicalPlaylist>>>;
 
     fn upsert(&self, playlist: CanonicalPlaylist) -> BoxFuture<'_, RepositoryResult<()>>;
+
+    /// Remove a canonical playlist and its membership. Removing a playlist that is not
+    /// present succeeds, so a repeated delete is not an error.
+    fn remove(&self, id: Uuid) -> BoxFuture<'_, RepositoryResult<()>>;
 
     fn get_external(
         &self,
@@ -705,6 +735,8 @@ pub trait CatalogSnapshotRepository: Send + Sync {
 /// cursor atomic without forcing transaction parameters into every repository API.
 pub trait RepositoryTransaction: Send + Sync {
     fn tracks(&self) -> &dyn TrackRepository;
+    fn library_entries(&self) -> &dyn LibraryEntryRepository;
+    fn track_analysis(&self) -> &dyn TrackAnalysisRepository;
     fn playlists(&self) -> &dyn PlaylistRepository;
     fn sources(&self) -> &dyn SourceRepository;
     fn assets(&self) -> &dyn AssetRepository;
@@ -733,6 +765,8 @@ mod tests {
     use super::*;
 
     fn accepts_track_repository(_: &dyn TrackRepository) {}
+    fn accepts_library_entry_repository(_: &dyn LibraryEntryRepository) {}
+    fn accepts_track_analysis_repository(_: &dyn TrackAnalysisRepository) {}
     fn accepts_playlist_repository(_: &dyn PlaylistRepository) {}
     fn accepts_source_repository(_: &dyn SourceRepository) {}
     fn accepts_asset_repository(_: &dyn AssetRepository) {}
@@ -747,6 +781,8 @@ mod tests {
     #[test]
     fn repository_traits_are_object_safe() {
         let _ = accepts_track_repository;
+        let _ = accepts_library_entry_repository;
+        let _ = accepts_track_analysis_repository;
         let _ = accepts_playlist_repository;
         let _ = accepts_source_repository;
         let _ = accepts_asset_repository;
