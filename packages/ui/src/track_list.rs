@@ -48,9 +48,9 @@ pub struct TrackListProps {
     pub on_context_menu: EventHandler<ContextMenuEvent>,
     /// Number of available decks
     pub deck_count: usize,
-    /// Function to get playlist references for a track
+    /// Which playlists hold each track, keyed by track ID
     #[props(default)]
-    pub get_playlists: Option<fn(Uuid) -> Vec<PlaylistRef>>,
+    pub playlists_by_track: std::collections::HashMap<Uuid, Vec<PlaylistRef>>,
     /// Whether to show playlist badges column
     #[props(default = false)]
     pub show_playlist_badges: bool,
@@ -71,13 +71,16 @@ pub struct SelectionEvent {
     pub ctrl_key: bool,
 }
 
-/// Context menu event with position.
+/// A right-click on a row, and where it landed.
+///
+/// The event names the row only. What the menu then acts on is the selection, which
+/// belongs to whoever owns it — a list that decided that for itself would be a second
+/// place selection is defined.
 #[derive(Debug, Clone)]
 pub struct ContextMenuEvent {
     pub track_id: Uuid,
     pub x: i32,
     pub y: i32,
-    pub selected_ids: HashSet<Uuid>,
 }
 
 /// Format duration as MM:SS.
@@ -96,9 +99,6 @@ fn format_duration(d: Option<Duration>) -> String {
 /// Track list table component with multi-selection support.
 #[component]
 pub fn TrackList(props: TrackListProps) -> Element {
-    // Track the last clicked index for shift-selection
-    let mut last_clicked_index: Signal<Option<usize>> = use_signal(|| None);
-
     let total_tracks = props.tracks.len();
     let display_tracks: &[Track] = if total_tracks > MAX_RENDERED_ROWS {
         &props.tracks[..MAX_RENDERED_ROWS]
@@ -140,16 +140,14 @@ pub fn TrackList(props: TrackListProps) -> Element {
                             let track_key = track.key.clone().unwrap_or_default();
                             let track_duration = format_duration(track.duration);
 
-                            // Get playlist badges if function is provided
-                            let playlist_badges: Vec<PlaylistRef> = props.get_playlists
-                                .map(|f| f(id))
+                            let playlist_badges: Vec<PlaylistRef> = props.playlists_by_track
+                                .get(&id)
+                                .cloned()
                                 .unwrap_or_default();
 
                             // Get issue info from the HashMap
                             let issue_info: Option<TrackIssueInfo> = props.track_issues.get(&id).cloned();
 
-                            // Clone selected_ids for use in closures
-                            let selected_ids_for_context = props.selected_ids.clone();
                             let selected_ids_for_remove = props.selected_ids.clone();
 
                             rsx! {
@@ -157,7 +155,6 @@ pub fn TrackList(props: TrackListProps) -> Element {
                                     key: "{id}",
                                     class: if is_selected { "track-row selected" } else { "track-row" },
                                     onclick: move |e| {
-                                        last_clicked_index.set(Some(idx));
                                         props.on_select.call(SelectionEvent {
                                             track_id: id,
                                             track_index: idx,
@@ -167,17 +164,10 @@ pub fn TrackList(props: TrackListProps) -> Element {
                                     },
                                     oncontextmenu: move |e| {
                                         e.prevent_default();
-                                        // Include this track in selection if not already selected
-                                        let mut selected = selected_ids_for_context.clone();
-                                        if !selected.contains(&id) {
-                                            selected.clear();
-                                            selected.insert(id);
-                                        }
                                         props.on_context_menu.call(ContextMenuEvent {
                                             track_id: id,
                                             x: e.client_coordinates().x as i32,
                                             y: e.client_coordinates().y as i32,
-                                            selected_ids: selected,
                                         });
                                     },
                                     // Checkbox column
@@ -233,7 +223,7 @@ pub fn TrackList(props: TrackListProps) -> Element {
                                     if props.show_playlist_badges {
                                         td { class: "col-playlists",
                                             div { class: "playlist-badges",
-                                                for (badge_idx, badge) in playlist_badges.iter().take(2).enumerate() {
+                                                for badge in playlist_badges.iter().take(2) {
                                                     span {
                                                         key: "{badge.id}",
                                                         class: "playlist-badge",

@@ -9,20 +9,21 @@ use std::collections::HashMap;
 #[component]
 pub fn DoctorView() -> Element {
     let app_state = use_app_state();
+    let diagnostics = app_state.diagnostics();
 
     // Local state for UI
     let mut expanded_groups: Signal<std::collections::HashSet<String>> =
-        use_signal(|| std::collections::HashSet::new());
+        use_signal(std::collections::HashSet::new);
 
     // Get diagnostic data from state
-    let diagnoses = app_state.diagnoses.read().clone();
-    let scanning = *app_state.doctor_scanning.read();
-    let scanned_count = *app_state.doctor_scanned_count.read();
-    let library_count = app_state.library_tracks.read().len();
+    let diagnoses = diagnostics.diagnoses();
+    let scanning = diagnostics.scanning();
+    let scanned_count = diagnostics.scanned_count();
+    let library_count = app_state.projection().track_count();
 
     // Group diagnoses by check name
     let grouped = use_memo(move || {
-        let diagnoses = app_state.diagnoses.read().clone();
+        let diagnoses = diagnostics.diagnoses();
         let mut groups: HashMap<String, Vec<Diagnosis>> = HashMap::new();
         for d in diagnoses {
             groups.entry(d.check_name.clone()).or_default().push(d);
@@ -31,7 +32,7 @@ pub fn DoctorView() -> Element {
     });
 
     // Get check descriptions (including built-in duplicate check)
-    let doctor = app_state.doctor.read().clone();
+    let doctor = diagnostics.doctor();
     let mut check_descriptions: HashMap<String, String> = doctor
         .checks()
         .iter()
@@ -72,7 +73,7 @@ pub fn DoctorView() -> Element {
 
     // Handlers
     let on_scan = move |_| {
-        app_state.run_doctor_scan();
+        diagnostics.scan();
     };
 
     let mut toggle_group = move |name: String| {
@@ -196,7 +197,7 @@ pub fn DoctorView() -> Element {
                                                         class: "btn-fix-all",
                                                         onclick: move |e| {
                                                             e.stop_propagation();
-                                                            app_state.fix_all_by_check(&check_name_for_fix);
+                                                            diagnostics.fix_all_by_check(&check_name_for_fix);
                                                         },
                                                         "Fix All ({fixable_in_group})"
                                                     }
@@ -222,10 +223,7 @@ pub fn DoctorView() -> Element {
                                         div { class: "issue-list",
                                             for diagnosis in items.iter() {
                                                 {
-                                                    let track = app_state.library_tracks.read()
-                                                        .iter()
-                                                        .find(|t| t.id == diagnosis.track_id)
-                                                        .cloned();
+                                                    let track = app_state.projection().track(diagnosis.track_id);
 
                                                     let track_title = track.as_ref()
                                                         .map(|t| t.title.clone())
@@ -250,7 +248,7 @@ pub fn DoctorView() -> Element {
                                                                     button {
                                                                         class: "btn-fix",
                                                                         onclick: move |_| {
-                                                                            let _ = app_state.fix_diagnosis(track_id, &check_name_fix);
+                                                                            let _ = diagnostics.fix(track_id, &check_name_fix);
                                                                         },
                                                                         "Fix"
                                                                     }

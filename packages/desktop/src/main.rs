@@ -99,7 +99,7 @@ fn App() -> Element {
     });
 
     let app_state = use_app_state();
-    let theme = app_state.get_theme();
+    let theme = app_state.theme();
     let theme_class = if theme == "light" {
         "theme-light"
     } else {
@@ -132,16 +132,12 @@ fn DesktopNavbar() -> Element {
     let is_music_management = matches!(route, Route::MusicManagement {});
 
     // Get issue count for doctor badge
-    let issue_count = app_state.diagnoses.read().len();
-    let fixable_count = app_state
-        .diagnoses
-        .read()
-        .iter()
-        .filter(|d| d.fixable)
-        .count();
+    let diagnostics = app_state.diagnostics();
+    let issue_count = diagnostics.issue_count();
+    let fixable_count = diagnostics.fixable_count();
 
     // Get current theme for toggle button
-    let current_theme = app_state.get_theme();
+    let current_theme = app_state.theme();
     let theme_icon = if current_theme == "dark" {
         "☀️"
     } else {

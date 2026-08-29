@@ -287,6 +287,7 @@ fn observe(audio: &dyn DeckAudio, index: usize) -> DeckSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::test_support::with_runtime;
     use std::path::PathBuf;
 
     /// An audio output that records what it was asked to do, so deck behaviour can be
@@ -375,18 +376,13 @@ mod tests {
 
     /// Decks need Dioxus signals, which need a scope to be owned by.
     fn with_decks(test: impl FnOnce([Deck; DECK_COUNT], Arc<StdMutex<FakeAudio>>)) {
-        fn app() -> Element {
-            rsx! { "" }
-        }
-        let mut dom = VirtualDom::new(app);
-        dom.rebuild_in_place();
-        dom.in_runtime(|| {
+        with_runtime(|| {
             let fake = Arc::new(StdMutex::new(FakeAudio::new()));
             let shared: SharedAudio = fake.clone();
             let audio = Signal::new_in_scope(shared, ScopeId::ROOT);
             let decks = [deck_in_scope(audio, 0), deck_in_scope(audio, 1)];
             test(decks, fake);
-        });
+        })
     }
 
     fn deck_in_scope(audio: Signal<SharedAudio>, index: usize) -> Deck {

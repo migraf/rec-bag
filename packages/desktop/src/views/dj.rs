@@ -1,10 +1,9 @@
 //! Main DJ view with deck controls.
 
+use crate::state::browser::{use_library_browser, BrowseScope};
 use crate::state::use_app_state;
+use crate::views::{load_selection_to_deck, use_context_menu};
 use dioxus::prelude::*;
-use rec_core::Track;
-use std::collections::HashSet;
-
 use ui::{
     ContextMenu, ContextMenuAction, ContextMenuEvent, DeckControl, PlaylistBrowser, PlaylistInfo,
     SearchBar, SelectionEvent, TrackList,
@@ -14,166 +13,36 @@ use uuid::Uuid;
 /// Main DJ interface view.
 #[component]
 pub fn DjView() -> Element {
-    let mut app_state = use_app_state();
+    let app_state = use_app_state();
+    // The browser owns where this view is looking, what it is searching for, and what
+    // is selected. Everything below is a gesture on it.
+    let browser = use_library_browser();
+    let context_menu = use_context_menu();
 
-    // Track selection (multi-selection)
-    let mut selected_track_ids: Signal<HashSet<Uuid>> = use_signal(|| HashSet::new());
-    let mut last_clicked_index: Signal<Option<usize>> = use_signal(|| None);
+    // The deck refresh loop re-renders this view many times a second, so searching is
+    // memoized: it re-runs when the scope, the query, or the projection changes, not
+    // when a playhead moves.
+    let visible = use_memo(move || browser.visible_tracks());
 
-    // Search state
-    let mut search_query = use_signal(|| String::new());
-
-    // Context menu state
-    let mut context_menu_visible = use_signal(|| false);
-    let mut context_menu_x = use_signal(|| 0i32);
-    let mut context_menu_y = use_signal(|| 0i32);
-    let mut context_menu_selected: Signal<HashSet<Uuid>> = use_signal(|| HashSet::new());
-
-    // Browse the selected playlist, or the live library/catalog projection when no
-    // playlist is selected.
-    let browser_tracks = use_memo(move || app_state.dj_tracks());
-    let filtered_tracks = use_memo(move || {
-        let query = search_query();
-        let tracks = browser_tracks();
-        if query.is_empty() {
-            tracks
-        } else {
-            let mut engine = rec_core::SearchEngine::new();
-            engine
-                .search(&query, &tracks)
-                .into_iter()
-                .map(|r| r.track)
-                .collect()
+    let on_context_action = move |action: ContextMenuAction| match action {
+        ContextMenuAction::AddToPlaylist(playlist_id) => {
+            browser.add_selection_to_playlist(playlist_id);
         }
-    });
-
-    // Playlist handlers
-    let on_create_playlist = move |name: String| {
-        let id = app_state.create_playlist(name);
-        app_state.selected_playlist_id.set(Some(id));
-    };
-
-    let on_select_playlist = move |id: Uuid| {
-        app_state.selected_playlist_id.set(Some(id));
-        selected_track_ids.set(HashSet::new());
-        search_query.set(String::new());
-    };
-
-    let on_delete_playlist = move |id: Uuid| {
-        app_state.delete_playlist(id);
-    };
-
-    // Selection handler with shift/ctrl support
-    let on_select = move |event: SelectionEvent| {
-        let tracks = filtered_tracks();
-
-        if event.shift_key {
-            // Shift-click: select range
-            if let Some(last_idx) = last_clicked_index() {
-                let start = last_idx.min(event.track_index);
-                let end = last_idx.max(event.track_index);
-                let range_ids: HashSet<Uuid> = tracks[start..=end.min(tracks.len() - 1)]
-                    .iter()
-                    .map(|t| t.id)
-                    .collect();
-                selected_track_ids.set(range_ids);
-            } else {
-                let mut ids = HashSet::new();
-                ids.insert(event.track_id);
-                selected_track_ids.set(ids);
-            }
-        } else if event.ctrl_key {
-            // Ctrl-click: toggle selection
-            let mut ids = selected_track_ids();
-            if ids.contains(&event.track_id) {
-                ids.remove(&event.track_id);
-            } else {
-                ids.insert(event.track_id);
-            }
-            selected_track_ids.set(ids);
-        } else {
-            // Normal click: single selection
-            let mut ids = HashSet::new();
-            ids.insert(event.track_id);
-            selected_track_ids.set(ids);
+        ContextMenuAction::AddToNewPlaylist => {
+            browser.add_selection_to_new_playlist("New Playlist");
         }
-        last_clicked_index.set(Some(event.track_index));
-    };
-
-    // Load track to deck
-    // Load track to deck using shared state
-    let load_track_to_deck = move |track_id: Uuid, deck: usize| {
-        app_state.load_track_to_deck(track_id, deck);
-    };
-
-    let on_load_track = move |(track_id, deck): (Uuid, usize)| {
-        load_track_to_deck(track_id, deck);
-    };
-
-    let mut on_remove_track = move |track_ids: Vec<Uuid>| {
-        if let Some(playlist_id) = *app_state.selected_playlist_id.read() {
-            app_state.remove_tracks_from_playlist(&track_ids, playlist_id);
+        ContextMenuAction::LoadToDeck1 => load_selection_to_deck(app_state, browser, 1),
+        ContextMenuAction::LoadToDeck2 => load_selection_to_deck(app_state, browser, 2),
+        ContextMenuAction::RemoveFromPlaylist => {
+            browser.remove_from_playlist(&Vec::from_iter(browser.selected_ids()));
         }
-        // Clear selection for removed tracks
-        let mut ids = selected_track_ids();
-        for id in &track_ids {
-            ids.remove(id);
+        ContextMenuAction::Analyze => {
+            app_state.analyze_tracks(browser.selected_ids().into_iter().collect());
         }
-        selected_track_ids.set(ids);
+        _ => {}
     };
 
-    // Context menu handler
-    let on_context_menu = move |event: ContextMenuEvent| {
-        context_menu_x.set(event.x);
-        context_menu_y.set(event.y);
-        context_menu_selected.set(event.selected_ids);
-        context_menu_visible.set(true);
-    };
-
-    let on_context_action = move |action: ContextMenuAction| {
-        let selected = context_menu_selected();
-
-        match action {
-            ContextMenuAction::AddToPlaylist(playlist_id) => {
-                let tracks: Vec<Track> = filtered_tracks()
-                    .iter()
-                    .filter(|t| selected.contains(&t.id))
-                    .cloned()
-                    .collect();
-                app_state.add_tracks_to_playlist(tracks, playlist_id);
-            }
-            ContextMenuAction::AddToNewPlaylist => {
-                let tracks: Vec<Track> = filtered_tracks()
-                    .iter()
-                    .filter(|t| selected.contains(&t.id))
-                    .cloned()
-                    .collect();
-                let playlist_id = app_state.create_playlist("New Playlist".to_string());
-                app_state.add_tracks_to_playlist(tracks, playlist_id);
-            }
-            ContextMenuAction::LoadToDeck1 => {
-                if let Some(track_id) = selected.iter().next() {
-                    load_track_to_deck(*track_id, 1);
-                }
-            }
-            ContextMenuAction::LoadToDeck2 => {
-                if let Some(track_id) = selected.iter().next() {
-                    load_track_to_deck(*track_id, 2);
-                }
-            }
-            ContextMenuAction::RemoveFromPlaylist => {
-                on_remove_track(selected.iter().copied().collect());
-            }
-            ContextMenuAction::Analyze => {
-                // Trigger analysis for selected tracks
-                app_state.analyze_tracks(selected.iter().copied().collect());
-            }
-            _ => {}
-        }
-    };
-
-    // Build playlist info for context menu
-    let playlists = app_state.playlists.read().clone();
+    let playlists = browser.playlists();
     let playlist_infos: Vec<PlaylistInfo> = playlists
         .iter()
         .map(|p| PlaylistInfo {
@@ -182,9 +51,10 @@ pub fn DjView() -> Element {
         })
         .collect();
 
-    let track_count = filtered_tracks().len();
-    let has_playlist_selected = app_state.selected_playlist_id.read().is_some();
-    let browser_title = if has_playlist_selected {
+    let browsed_playlist = browser.browsed_playlist();
+    let track_count = visible().len();
+    let query = browser.query();
+    let browser_title = if browsed_playlist.is_some() {
         "Tracks"
     } else {
         "Library"
@@ -213,10 +83,10 @@ pub fn DjView() -> Element {
             div { class: "browser-container",
                 PlaylistBrowser {
                     playlists: playlists.clone(),
-                    selected_id: *app_state.selected_playlist_id.read(),
-                    on_select: on_select_playlist,
-                    on_create: on_create_playlist,
-                    on_delete: on_delete_playlist
+                    selected_id: browsed_playlist,
+                    on_select: move |id: Uuid| browser.browse(BrowseScope::Playlist(id)),
+                    on_create: move |name: String| { browser.create_playlist(name); },
+                    on_delete: move |id: Uuid| browser.delete_playlist(id)
                 }
 
                 div { class: "track-panel",
@@ -227,21 +97,21 @@ pub fn DjView() -> Element {
                             span { class: "track-panel-count", "({track_count})" }
                         }
                         SearchBar {
-                            value: search_query(),
-                            placeholder: if has_playlist_selected { "Search playlist...".to_string() } else { "Search library...".to_string() },
-                            on_change: move |q| search_query.set(q),
-                            result_count: if search_query().is_empty() { None } else { Some(track_count) },
+                            value: query.clone(),
+                            placeholder: if browsed_playlist.is_some() { "Search playlist...".to_string() } else { "Search library...".to_string() },
+                            on_change: move |q| browser.search(q),
+                            result_count: if query.is_empty() { None } else { Some(track_count) },
                             compact: true
                         }
                     }
 
                     TrackList {
-                        tracks: filtered_tracks(),
-                        selected_ids: selected_track_ids(),
-                        on_select: on_select,
-                        on_load: on_load_track,
-                        on_remove: on_remove_track,
-                        on_context_menu: on_context_menu,
+                        tracks: visible(),
+                        selected_ids: browser.selected_ids(),
+                        on_select: move |event: SelectionEvent| browser.select(event),
+                        on_load: move |(track_id, deck): (Uuid, usize)| { app_state.load_track_to_deck(track_id, deck); },
+                        on_remove: move |track_ids: Vec<Uuid>| browser.remove_from_playlist(&track_ids),
+                        on_context_menu: move |event: ContextMenuEvent| context_menu.open(browser, event),
                         deck_count: 2,
                         show_playlist_badges: false
                     }
@@ -250,13 +120,13 @@ pub fn DjView() -> Element {
 
             // Context menu
             ContextMenu {
-                visible: context_menu_visible(),
-                x: context_menu_x(),
-                y: context_menu_y(),
+                visible: context_menu.visible(),
+                x: context_menu.x(),
+                y: context_menu.y(),
                 playlists: playlist_infos,
-                selected_count: context_menu_selected().len(),
+                selected_count: browser.selected_count(),
                 on_action: on_context_action,
-                on_close: move |_| context_menu_visible.set(false)
+                on_close: move |_| context_menu.close()
             }
         }
     }

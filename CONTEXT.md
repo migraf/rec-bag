@@ -50,6 +50,14 @@ _Avoid_: Playlist (unqualified), library
 A playlist imported from a catalog source. External playlists are read-only observations and stay that way until explicitly copied into a canonical playlist.
 _Avoid_: Imported playlist, remote playlist, synced playlist
 
+**Catalog Projection**:
+The live, in-memory reading of the catalog that the running application renders — its tracks, playlists, and sources. The projection is derived from the catalog and never authoritative over it.
+_Avoid_: Cache, model, store
+
+**Library Browser**:
+One view's browse over the catalog projection: where it is looking, what it is searching for, and what the user has selected. Each view has its own browser, because looking at a playlist and looking at a folder are different places.
+_Avoid_: Track list (that is the component that renders one), selection state
+
 ### Playback
 
 **Loaded Track**:
