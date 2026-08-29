@@ -461,8 +461,14 @@ pub fn use_app_state_provider() {
     let app_state = use_context_provider(AppState::new);
     // One refresh loop feeds every view, so a deck reads the same wherever it is shown.
     use_future(move || async move {
+        // [DEBUG-4e77] Does the refresh loop actually keep ticking?
+        static TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        deck::debug_4e77("refresh loop: STARTED");
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if deck::debug_4e77_every(&TICKS, 20) {
+                deck::debug_4e77("refresh loop: tick");
+            }
             app_state.refresh_decks();
         }
     });

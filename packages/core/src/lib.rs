@@ -100,6 +100,9 @@ pub use sync::{
     SyncStatus, SyncTransitionError, TransferCheckpoint, TransferCheckpointError, TransferStage,
     DEFAULT_SYNC_JOB_MAX_ATTEMPTS, SYNC_JOB_PAYLOAD_VERSION,
 };
-pub use track::{BeatGridData, FrequencyWaveformData, MetadataError, Track, WaveformPeaks};
+pub use track::{
+    read_embedded_tags, BeatGridData, EmbeddedTags, FrequencyWaveformData, MetadataError, Track,
+    WaveformPeaks,
+};
 #[cfg(feature = "audio")]
 pub use waveform::{extract_waveform, WaveformData, WaveformError};

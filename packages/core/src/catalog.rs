@@ -702,15 +702,31 @@ impl CanonicalMetadata {
         value: Option<MetadataValue>,
         edited_at: DateTime<Utc>,
     ) {
+        self.set_observation(
+            field,
+            value,
+            MetadataProvenance::new(MetadataOrigin::User, edited_at),
+        );
+    }
+
+    /// Record what one observer currently says about a field, replacing whatever that
+    /// same observer said before.
+    ///
+    /// Candidates from every other observer are untouched, so re-reading a file's tags
+    /// restates that file's observations instead of accumulating a second copy of them.
+    /// Passing `None` withdraws the observation, which is how a value that has since
+    /// disappeared from a file stops being a candidate.
+    pub fn set_observation(
+        &mut self,
+        field: MetadataField,
+        value: Option<MetadataValue>,
+        provenance: MetadataProvenance,
+    ) {
         self.values.retain(|candidate| {
-            candidate.field != field || candidate.provenance.origin != MetadataOrigin::User
+            candidate.field != field || !same_observer(&candidate.provenance, &provenance)
         });
         if let Some(value) = value {
-            self.add(MetadataFieldValue::new(
-                field,
-                value,
-                MetadataProvenance::new(MetadataOrigin::User, edited_at),
-            ));
+            self.add(MetadataFieldValue::new(field, value, provenance));
         }
     }
 
@@ -729,6 +745,17 @@ impl CanonicalMetadata {
                 )
             })
     }
+}
+
+/// Whether two provenances describe the same observer: the same kind of origin looking
+/// through the same source, entity, and asset. When it observed and how much it is
+/// trusted are things an observer reports, not part of who it is.
+fn same_observer(left: &MetadataProvenance, right: &MetadataProvenance) -> bool {
+    left.origin == right.origin
+        && left.source_id == right.source_id
+        && left.external_id == right.external_id
+        && left.asset_id == right.asset_id
+        && left.storage_id == right.storage_id
 }
 
 /// A provider-neutral canonical track.

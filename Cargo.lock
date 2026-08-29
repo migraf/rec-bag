@@ -1420,6 +1420,7 @@ dependencies = [
  "base64",
  "chrono",
  "dioxus",
+ "dioxus-ssr",
  "keyring",
  "music_storage_google_drive",
  "music_storage_local",

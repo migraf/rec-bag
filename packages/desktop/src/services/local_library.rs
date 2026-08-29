@@ -9,15 +9,15 @@ use std::{
     sync::Arc,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use music_storage_local::{is_recognized_audio_path, LocalMusicStorage, LocalStorageError};
 use rec_core::{
     AssetLocation, AssetLocationFilter, AssetRepository, AssetType, CanonicalPlaylist,
-    CanonicalTrack, CatalogSource, CatalogSourceKind, ContentHash, HashAlgorithm, HealthStatus,
-    InventoryGeneration, InventoryGenerationAbort, InventoryGenerationAbortKind,
+    CanonicalTrack, CatalogSource, CatalogSourceKind, ContentHash, EmbeddedTags, HashAlgorithm,
+    HealthStatus, InventoryGeneration, InventoryGenerationAbort, InventoryGenerationAbortKind,
     InventoryGenerationKind, InventoryGenerationStart, InventoryMode, InventoryRequest,
-    InventoryStagingPage, MetadataField, MetadataFieldValue, MetadataProvenance, MetadataValue,
-    MusicAssetStore, MusicStorage, MusicStorageError, MusicStorageErrorKind, MusicStorageKind,
+    InventoryStagingPage, MetadataField, MetadataProvenance, MetadataValue, MusicAssetStore,
+    MusicStorage, MusicStorageError, MusicStorageErrorKind, MusicStorageKind,
     MusicStorageRepository, OriginalAsset, OriginalAssetFilter, OriginalAssetRole,
     PlaylistRepository, ReconciliationRepository, ReconciliationResolution,
     ReconciliationResolutionFilter, ReconciliationSuppression, RepositoryError,
@@ -313,14 +313,9 @@ impl LocalLibraryService {
                 MetadataValue::Integer(file.size_bytes as i64),
             );
             track.link_occurrence(occurrence.identity.clone());
-            ensure_filename_metadata(
-                &mut track,
-                &file.absolute_path,
-                source_id,
-                &file.external_id,
-            );
-            transaction.tracks().upsert(track.clone()).await?;
 
+            // The asset is settled first: tags are observations *of a file*, so they
+            // can only be recorded once it is known which asset was read.
             let mut originals = transaction
                 .assets()
                 .list_originals_for_track(track.id)
@@ -348,7 +343,22 @@ impl LocalLibraryService {
                 .unwrap_or("audio")
                 .to_owned();
             original.size_bytes = Some(file.size_bytes);
-            original.content_hash = Some(file.hash);
+            original.content_hash = Some(file.hash.clone());
+
+            // A file that moved is the same file under a new name; the title its old
+            // name gave it must go with the old name, not outrank the real one.
+            let superseded = prior
+                .map(|value| value.identity.external_id.as_str())
+                .filter(|external_id| *external_id != file.external_id);
+            record_observed_metadata(
+                &mut track,
+                &file,
+                source_id,
+                original.id(),
+                superseded,
+                Utc::now(),
+            );
+            transaction.tracks().upsert(track.clone()).await?;
             transaction.assets().upsert_original(original).await?;
             occurrences.push(occurrence);
         }
@@ -1453,6 +1463,8 @@ struct ScannedFile {
     external_id: String,
     size_bytes: u64,
     hash: ContentHash,
+    /// What the file's own tags say about it, read while walking the folder.
+    tags: EmbeddedTags,
 }
 
 fn scan_files(root: &Path) -> Result<Vec<ScannedFile>, LocalLibraryError> {
@@ -1489,6 +1501,11 @@ fn scan_directory(
             .map_err(|_| LocalLibraryError::InvalidRoot(path.display().to_string()))?;
         let relative_path = path_to_object_id(relative)?;
         let hash = hash_file(&path)?;
+        // A file that will not give up its tags is still a file worth cataloguing.
+        let tags = rec_core::read_embedded_tags(&path).unwrap_or_else(|error| {
+            tracing::debug!(path = %path.display(), %error, "could not read embedded tags");
+            EmbeddedTags::default()
+        });
         files.push(ScannedFile {
             absolute_path: path,
             external_id: filesystem_identity(&metadata)
@@ -1496,6 +1513,7 @@ fn scan_directory(
             relative_path,
             size_bytes: metadata.len(),
             hash,
+            tags,
         });
     }
     Ok(())
@@ -1605,25 +1623,81 @@ fn metadata_text<'a>(metadata: &'a BTreeMap<String, MetadataValue>, key: &str) -
     }
 }
 
-fn ensure_filename_metadata(
+/// Record what one scanned file says about its canonical track.
+///
+/// Every field the file carries is recorded, because a track whose length the catalog
+/// does not know cannot be seeked and a track whose artist it does not know cannot be
+/// found. Tags describe one asset, so they are recorded against that asset and restated
+/// on each scan: rescanning a folder updates what the file says instead of accumulating
+/// another copy of it, and a tag that has since been removed is withdrawn.
+///
+/// The filename is only a fallback title. It is recorded as the source's own
+/// observation when the file carries no title of its own, and withdrawn as soon as it
+/// does, so a real title is never shadowed by a path — including the name the file went
+/// by before it moved.
+fn record_observed_metadata(
     track: &mut CanonicalTrack,
-    path: &Path,
+    file: &ScannedFile,
     source_id: Uuid,
-    external_id: &str,
+    asset_id: Uuid,
+    superseded_external_id: Option<&str>,
+    observed_at: DateTime<Utc>,
 ) {
-    if track.metadata.preferred(&MetadataField::Title).is_some() {
-        return;
+    let tags = &file.tags;
+    let embedded = MetadataProvenance::embedded_tag(asset_id, None, observed_at);
+    let text = |value: &Option<String>| value.clone().map(MetadataValue::Text);
+    let count = |value: Option<u32>| value.map(|value| MetadataValue::Integer(value as i64));
+
+    for (field, value) in [
+        (MetadataField::Title, text(&tags.title)),
+        (MetadataField::Artist, text(&tags.artist)),
+        (MetadataField::Album, text(&tags.album)),
+        (MetadataField::AlbumArtist, text(&tags.album_artist)),
+        (MetadataField::Genre, text(&tags.genre)),
+        (MetadataField::MusicalKey, text(&tags.musical_key)),
+        (MetadataField::Isrc, text(&tags.isrc)),
+        (MetadataField::ReleaseYear, count(tags.year)),
+        (MetadataField::TrackNumber, count(tags.track_number)),
+        (MetadataField::DiscNumber, count(tags.disc_number)),
+        (
+            MetadataField::DurationMs,
+            tags.duration.and_then(|duration| {
+                i64::try_from(duration.as_millis())
+                    .ok()
+                    .map(MetadataValue::Integer)
+            }),
+        ),
+        (
+            MetadataField::Bpm,
+            tags.bpm.map(|bpm| MetadataValue::Decimal(bpm.to_string())),
+        ),
+    ] {
+        track
+            .metadata
+            .set_observation(field, value, embedded.clone());
     }
-    let title = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("Unknown track")
-        .to_owned();
-    track.metadata.add(MetadataFieldValue::new(
+
+    let filename_title = tags.title.is_none().then(|| {
+        MetadataValue::Text(
+            file.absolute_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("Unknown track")
+                .to_owned(),
+        )
+    });
+    track.metadata.set_observation(
         MetadataField::Title,
-        MetadataValue::Text(title),
-        MetadataProvenance::provider(source_id, external_id, Utc::now()),
-    ));
+        filename_title,
+        MetadataProvenance::provider(source_id, &file.external_id, observed_at),
+    );
+    if let Some(external_id) = superseded_external_id {
+        track.metadata.set_observation(
+            MetadataField::Title,
+            None,
+            MetadataProvenance::provider(source_id, external_id, observed_at),
+        );
+    }
 }
 
 fn preferred_text(track: &CanonicalTrack, field: MetadataField) -> Option<String> {
@@ -1672,6 +1746,7 @@ mod tests {
     use super::*;
     use rec_core::{MatchConfidence, ReconciliationRepository};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     struct TestSelector {
         selection: Mutex<Option<LocalSourceSelection>>,
@@ -1761,6 +1836,166 @@ mod tests {
             CopyAuthorization::Automatic
         )
         .is_ok());
+    }
+
+    /// Write a real, tagged audio file of a known length.
+    ///
+    /// A placeholder byte string would test nothing here: the point is what a scan reads
+    /// out of a file that genuinely carries tags and audio properties.
+    fn write_tagged_audio(path: &Path, length: Duration, tag: impl FnOnce(&mut rec_core::Track)) {
+        const SAMPLE_RATE: u32 = 44_100;
+        let samples = (length.as_secs_f64() * SAMPLE_RATE as f64).round() as u32;
+        let data_len = samples * 2;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.resize(44 + data_len as usize, 0);
+        fs::write(path, wav).unwrap();
+
+        let mut track = rec_core::Track::new_without_metadata(path.to_path_buf());
+        tag(&mut track);
+        track.save_metadata().unwrap();
+    }
+
+    fn preferred_value(track: &CanonicalTrack, field: MetadataField) -> Option<MetadataValue> {
+        track
+            .metadata
+            .preferred(&field)
+            .map(|candidate| candidate.value.clone())
+    }
+
+    /// A track whose length the catalog does not know cannot be seeked on a deck, so
+    /// what a file says about itself has to survive the scan.
+    #[tokio::test]
+    async fn a_scan_records_what_the_files_own_tags_say() {
+        let root = TempDirectory::new("tags");
+        write_tagged_audio(
+            &root.path().join("filename.wav"),
+            Duration::from_secs(3),
+            |track| {
+                track.title = "Tagged title".into();
+                track.artist = Some("Tagged artist".into());
+                track.album = Some("Tagged album".into());
+                track.genre = Some("Tagged genre".into());
+                track.year = Some(1999);
+            },
+        );
+        let service = service(None).await;
+        service
+            .register_local_source(LocalSourceSelection {
+                name: "Source".into(),
+                root: root.path().into(),
+                copy_policy: SourceCopyPolicy::AskBeforeCopying,
+            })
+            .await
+            .unwrap();
+
+        let track = service.list_tracks().await.unwrap().remove(0);
+
+        assert_eq!(
+            preferred_value(&track, MetadataField::DurationMs),
+            Some(MetadataValue::Integer(3_000)),
+            "the deck's trackbar spans this value; without it seeking is impossible"
+        );
+        assert_eq!(
+            preferred_value(&track, MetadataField::Title),
+            Some(MetadataValue::Text("Tagged title".into())),
+            "the file's own title outranks its filename"
+        );
+        assert_eq!(
+            preferred_value(&track, MetadataField::Artist),
+            Some(MetadataValue::Text("Tagged artist".into()))
+        );
+        assert_eq!(
+            preferred_value(&track, MetadataField::Album),
+            Some(MetadataValue::Text("Tagged album".into()))
+        );
+        assert_eq!(
+            preferred_value(&track, MetadataField::Genre),
+            Some(MetadataValue::Text("Tagged genre".into()))
+        );
+        assert_eq!(
+            preferred_value(&track, MetadataField::ReleaseYear),
+            Some(MetadataValue::Integer(1999))
+        );
+    }
+
+    /// A file with nothing to say still gets a name, and still gets a length.
+    #[tokio::test]
+    async fn an_untagged_file_falls_back_to_its_filename_but_keeps_its_length() {
+        let root = TempDirectory::new("untagged");
+        write_tagged_audio(
+            &root.path().join("Some Artist - Some Title.wav"),
+            Duration::from_secs(1),
+            |_| {},
+        );
+        let service = service(None).await;
+        service
+            .register_local_source(LocalSourceSelection {
+                name: "Source".into(),
+                root: root.path().into(),
+                copy_policy: SourceCopyPolicy::AskBeforeCopying,
+            })
+            .await
+            .unwrap();
+
+        let track = service.list_tracks().await.unwrap().remove(0);
+
+        assert_eq!(
+            preferred_value(&track, MetadataField::Title),
+            Some(MetadataValue::Text("Some Artist - Some Title".into()))
+        );
+        assert_eq!(
+            preferred_value(&track, MetadataField::DurationMs),
+            Some(MetadataValue::Integer(1_000))
+        );
+    }
+
+    /// Rescanning restates what a file says; it does not stack another copy of it.
+    #[tokio::test]
+    async fn rescanning_restates_a_files_tags_rather_than_accumulating_them() {
+        let root = TempDirectory::new("restate");
+        let file = root.path().join("track.wav");
+        write_tagged_audio(&file, Duration::from_secs(2), |track| {
+            track.title = "First".into();
+        });
+        let service = service(None).await;
+        let first = service
+            .register_local_source(LocalSourceSelection {
+                name: "Source".into(),
+                root: root.path().into(),
+                copy_policy: SourceCopyPolicy::AskBeforeCopying,
+            })
+            .await
+            .unwrap();
+
+        write_tagged_audio(&file, Duration::from_secs(2), |track| {
+            track.title = "Second".into();
+        });
+        service.scan_local_source(first.source_id).await.unwrap();
+
+        let track = service.list_tracks().await.unwrap().remove(0);
+        let titles: Vec<_> = track
+            .metadata
+            .values
+            .iter()
+            .filter(|candidate| candidate.field == MetadataField::Title)
+            .collect();
+        assert_eq!(titles.len(), 1, "one file says one thing about its title");
+        assert_eq!(
+            preferred_value(&track, MetadataField::Title),
+            Some(MetadataValue::Text("Second".into()))
+        );
     }
 
     #[tokio::test]

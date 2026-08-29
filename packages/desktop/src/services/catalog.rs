@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -291,13 +291,22 @@ impl Catalog {
             )));
         }
 
+        let mut track = catalog_track(
+            canonical,
+            entry.as_ref(),
+            analysis.as_ref(),
+            Some(resolved.path.clone()),
+        );
+        // A deck must know how long its file runs: the trackbar spans that length, so a
+        // track the catalog has no duration for cannot be seeked at all. The file itself
+        // is the answer, and it is right here. It stays on the loaded track rather than
+        // going back to the catalog, which only records what a scan observed.
+        if track.duration.is_none() {
+            track.duration = file_duration(&resolved.path).await;
+        }
+
         Ok(LoadedTrack {
-            track: catalog_track(
-                canonical,
-                entry.as_ref(),
-                analysis.as_ref(),
-                Some(resolved.path.clone()),
-            ),
+            track,
             path: resolved.path,
             cached: resolved.cached,
         })
@@ -434,6 +443,18 @@ impl Catalog {
             .map(|analysis| (analysis.track_id, analysis))
             .collect())
     }
+}
+
+/// How long the audio at `path` runs, according to the file itself.
+///
+/// Reading a file's properties is blocking work, so it runs off the async executor.
+/// A file that will not answer yields `None` rather than failing the load.
+async fn file_duration(path: &Path) -> Option<Duration> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || rec_core::read_embedded_tags(&path).ok()?.duration)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Project one canonical track into the record the interface renders.
@@ -578,9 +599,35 @@ mod tests {
         track
     }
 
+    /// A real, decodable audio file of a known length.
+    ///
+    /// The fixture has to be genuine audio: what a deck can seek through depends on how
+    /// long its file actually runs, so a placeholder would test nothing.
     fn temp_audio(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("rec-bag-catalog-{label}-{}", Uuid::new_v4()));
-        std::fs::write(&path, b"audio").unwrap();
+        temp_audio_of(label, Duration::from_secs(2))
+    }
+
+    fn temp_audio_of(label: &str, length: Duration) -> PathBuf {
+        const SAMPLE_RATE: u32 = 44_100;
+        let path =
+            std::env::temp_dir().join(format!("rec-bag-catalog-{label}-{}.wav", Uuid::new_v4()));
+        let samples = (length.as_secs_f64() * SAMPLE_RATE as f64).round() as u32;
+        let data_len = samples * 2;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // PCM header length
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.resize(44 + data_len as usize, 0);
+        std::fs::write(&path, wav).unwrap();
         path
     }
 
@@ -902,5 +949,120 @@ mod tests {
         assert_eq!(sources[0].uri, "/music");
         assert_eq!(sources[0].source_type, SourceType::Local);
         assert_eq!(sources[0].track_count, 0);
+    }
+
+    // ---- DJ-view seek probe ------------------------------------------------
+    //
+    // The DJ view hands `LoadedTrack::track` straight to `DeckControl`, whose Trackbar
+    // renders the seek slider as `min=0 max={duration_ms}`. A zero duration makes that
+    // slider a single point: it is the whole seek gesture, so it is asserted end to end.
+
+    mod probe {
+        use dioxus::prelude::*;
+        use rec_core::Track;
+
+        #[component]
+        pub fn SeekProbe(track: Option<Track>) -> Element {
+            rsx! {
+                ui::DeckControl {
+                    deck_number: 1,
+                    state: ui::DeckDisplayState::Stopped,
+                    track,
+                    position: std::time::Duration::ZERO,
+                    volume: 1.0,
+                    on_play: |_| {},
+                    on_pause: |_| {},
+                    on_stop: |_| {},
+                    on_volume_change: |_| {},
+                    on_seek: |_| {},
+                    on_file_drop: |_| {},
+                }
+            }
+        }
+    }
+    use probe::{SeekProbe, SeekProbeProps};
+
+    /// The largest position the rendered seek slider can be dragged to, in milliseconds.
+    fn seekable_range_ms(track: Track) -> u64 {
+        let mut dom = dioxus::prelude::VirtualDom::new_with_props(
+            SeekProbe,
+            SeekProbeProps { track: Some(track) },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        let slider = html
+            .split("<input")
+            .find(|tag| tag.contains("trackbar-slider"))
+            .and_then(|tag| tag.split('>').next())
+            .unwrap_or_else(|| panic!("no seek slider was rendered:\n{html}"));
+        assert!(
+            !slider.contains("disabled"),
+            "the seek slider rendered disabled:\n{slider}"
+        );
+        let max = slider
+            .split("max=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("the seek slider has no max:\n{slider}"));
+        max.parse().unwrap()
+    }
+
+    /// A length the catalog knows is the one the trackbar spans; the file is not consulted.
+    #[tokio::test]
+    async fn a_duration_the_catalog_knows_is_what_the_trackbar_spans() {
+        let mut track = canonical_track("Scanned track", "Scanned artist");
+        track.metadata.add(MetadataFieldValue::new(
+            MetadataField::DurationMs,
+            MetadataValue::Integer(240_000),
+            MetadataProvenance::new(MetadataOrigin::User, Utc::now()),
+        ));
+        // Two seconds of audio, four minutes claimed: what the catalog knows wins.
+        let file = temp_audio_of("seek-known", Duration::from_secs(2));
+        let paths = StubPaths::new(HashMap::from([(
+            track.id,
+            Ok(ResolvedPlaybackPath {
+                path: file,
+                cached: false,
+            }),
+        )]));
+        let (catalog, store) = catalog(paths).await;
+        TrackRepository::upsert(store.as_ref(), track.clone())
+            .await
+            .unwrap();
+
+        let loaded = catalog.load_track(track.id).await.unwrap();
+
+        assert_eq!(seekable_range_ms(loaded.track), 240_000);
+    }
+
+    /// The user's symptom: the seek slider on a loaded deck does nothing at all.
+    #[tokio::test]
+    async fn a_loaded_track_can_be_seeked_through_its_whole_length() {
+        // Exactly what a local folder scan writes: one title candidate, nothing else.
+        let track = canonical_track("Scanned track", "Scanned artist");
+        let file = temp_audio("seek");
+        let paths = StubPaths::new(HashMap::from([(
+            track.id,
+            Ok(ResolvedPlaybackPath {
+                path: file.clone(),
+                cached: false,
+            }),
+        )]));
+        let (catalog, store) = catalog(paths).await;
+        TrackRepository::upsert(store.as_ref(), track.clone())
+            .await
+            .unwrap();
+
+        let loaded = catalog.load_track(track.id).await.unwrap();
+
+        let span = seekable_range_ms(loaded.track);
+        assert!(
+            span > 0,
+            "the seek slider spans no time, so no drag can reach any position"
+        );
+        assert!(
+            (1_900..=2_100).contains(&span),
+            "the slider should span the file's own two seconds, but spans {span}ms"
+        );
     }
 }

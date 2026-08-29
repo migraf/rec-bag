@@ -106,6 +106,25 @@ impl Default for DeckSnapshot {
     }
 }
 
+
+// [DEBUG-4e77] Probe: what the refresh loop actually observes in the running app.
+pub(crate) fn debug_4e77(line: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/rec_bag_probe.log")
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+pub(crate) fn debug_4e77_every(counter: &std::sync::atomic::AtomicUsize, n: usize) -> bool {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n == 0
+}
+
+static DEBUG_4E77_REFRESH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// One playback channel that a Loaded Track occupies.
 #[derive(Clone, Copy)]
 pub struct Deck {
@@ -235,14 +254,26 @@ impl Deck {
     /// Skips the update when the audio output is busy, so a refresh never blocks the
     /// interface. Writing only on change keeps an idle deck from re-rendering.
     pub fn refresh(&self) {
+        let loud = self.index == 0 && debug_4e77_every(&DEBUG_4E77_REFRESH, 20);
         let observed = {
             let shared = self.audio.read().clone();
             let Ok(audio) = shared.try_lock() else {
+                if loud {
+                    debug_4e77("refresh: TRY_LOCK FAILED");
+                }
                 return;
             };
             observe(&*audio, self.index)
         };
-        if *self.live.read() != observed {
+        let current = self.live.read().clone();
+        let changed = current != observed;
+        if loud {
+            debug_4e77(&format!(
+                "refresh: observed={:?} state={:?} current={:?} changed={changed}",
+                observed.position, observed.state, current.position
+            ));
+        }
+        if changed {
             let mut live = self.live;
             live.set(observed);
         }
@@ -293,15 +324,15 @@ mod tests {
     /// An audio output that records what it was asked to do, so deck behaviour can be
     /// tested without an audio device.
     #[derive(Default)]
-    struct FakeAudio {
-        decks: Vec<FakeDeck>,
+    pub(super) struct FakeAudio {
+        pub(super) decks: Vec<FakeDeck>,
         calls: Vec<String>,
     }
 
     #[derive(Clone)]
-    struct FakeDeck {
+    pub(super) struct FakeDeck {
         state: DeckState,
-        position: Duration,
+        pub(super) position: Duration,
         volume: f32,
         finished: bool,
         refuse_load: bool,
@@ -322,7 +353,7 @@ mod tests {
     }
 
     impl FakeAudio {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 decks: vec![FakeDeck::default(); DECK_COUNT],
                 calls: Vec::new(),
@@ -513,5 +544,195 @@ mod tests {
             assert_eq!(decks[1].volume(), 0.25);
             assert_eq!(decks[0].volume(), 1.0);
         });
+    }
+}
+
+/// Does what a deck observes actually reach the interface?
+///
+/// The deck's own tests drive a `Deck` directly. These drive the whole seam the DJ view
+/// uses — a real `VirtualDom`, the real `DeckControl`, and a deck refreshed the way the
+/// refresh loop refreshes it — because a playhead that moves in a signal but not on
+/// screen is exactly the bug this catches.
+#[cfg(test)]
+mod view_tests {
+    use super::tests::FakeAudio;
+    use super::*;
+    use rec_core::Track;
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        /// Handed to the probe root, which must build its decks inside its own scope.
+        static PROBE_AUDIO: RefCell<Option<SharedAudio>> = const { RefCell::new(None) };
+        /// Handed back, so a test can drive the very decks the probe rendered.
+        static PROBE_DECKS: RefCell<Option<[Deck; DECK_COUNT]>> = const { RefCell::new(None) };
+    }
+
+    /// The DJ view's deck row, reduced to the parts that show playback.
+    #[component]
+    fn DeckRow() -> Element {
+        let decks = use_hook(|| {
+            let shared = PROBE_AUDIO
+                .with(|slot| slot.borrow().clone())
+                .expect("no probe audio was staged");
+            let audio = Signal::new(shared);
+            let decks: [Deck; DECK_COUNT] = std::array::from_fn(|index| Deck::new(audio, index));
+            PROBE_DECKS.with(|slot| *slot.borrow_mut() = Some(decks));
+            decks
+        });
+
+        rsx! {
+            for deck in decks {
+                ui::DeckControl {
+                    deck_number: deck.number(),
+                    state: deck.state(),
+                    track: deck.track(),
+                    position: deck.position(),
+                    volume: deck.volume(),
+                    on_play: move |_| deck.play(),
+                    on_pause: move |_| deck.pause(),
+                    on_stop: move |_| deck.stop(),
+                    on_volume_change: move |volume| deck.set_volume(volume),
+                    on_seek: move |position| deck.seek(position),
+                    on_file_drop: |_| {},
+                }
+            }
+        }
+    }
+
+    /// Where deck one's playhead is drawn, in milliseconds, as the markup reports it.
+    fn rendered_playhead(dom: &VirtualDom) -> u64 {
+        let html = dioxus_ssr::render(dom);
+        let slider = html
+            .split("<input")
+            .find(|tag| tag.contains("trackbar-slider"))
+            .and_then(|tag| tag.split('>').next())
+            .unwrap_or_else(|| panic!("no seek slider was rendered:\n{html}"));
+        slider
+            .split("value=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("the seek slider has no value:\n{slider}"))
+            .parse()
+            .unwrap()
+    }
+
+    fn a_four_minute_track() -> LoadedTrack {
+        let mut track = Track::new_without_metadata(PathBuf::new());
+        track.title = "Playing".into();
+        track.set_duration(Duration::from_secs(240));
+        LoadedTrack {
+            track,
+            path: PathBuf::from("/cache/playing.mp3"),
+            cached: true,
+        }
+    }
+
+    /// The DJ view's deck row *plus* the refresh loop that feeds it, as the running
+    /// application wires them together.
+    #[component]
+    fn RefreshingDeckRow() -> Element {
+        let decks = use_hook(|| {
+            let shared = PROBE_AUDIO
+                .with(|slot| slot.borrow().clone())
+                .expect("no probe audio was staged");
+            let audio = Signal::new(shared);
+            let decks: [Deck; DECK_COUNT] = std::array::from_fn(|index| Deck::new(audio, index));
+            PROBE_DECKS.with(|slot| *slot.borrow_mut() = Some(decks));
+            decks
+        });
+
+        // The application's one refresh loop, at a pace a test can wait for.
+        use_future(move || async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                for deck in decks {
+                    deck.refresh();
+                }
+            }
+        });
+
+        rsx! {
+            for deck in decks {
+                ui::DeckControl {
+                    deck_number: deck.number(),
+                    state: deck.state(),
+                    track: deck.track(),
+                    position: deck.position(),
+                    volume: deck.volume(),
+                    on_play: move |_| deck.play(),
+                    on_pause: move |_| deck.pause(),
+                    on_stop: move |_| deck.stop(),
+                    on_volume_change: move |volume| deck.set_volume(volume),
+                    on_seek: move |position| deck.seek(position),
+                    on_file_drop: |_| {},
+                }
+            }
+        }
+    }
+
+    /// The refresh loop is the only thing that moves a playhead while a track plays.
+    /// Nothing else in the application polls the audio output.
+    #[tokio::test]
+    async fn the_refresh_loop_carries_the_playhead_to_the_view() {
+        let fake = Arc::new(StdMutex::new(FakeAudio::new()));
+        PROBE_AUDIO.with(|slot| *slot.borrow_mut() = Some(fake.clone()));
+
+        let mut dom = VirtualDom::new(RefreshingDeckRow);
+        dom.rebuild_in_place();
+        let decks = PROBE_DECKS
+            .with(|slot| slot.borrow_mut().take())
+            .expect("the probe root did not publish its decks");
+        dom.in_runtime(|| {
+            decks[0].load(a_four_minute_track());
+            decks[0].play();
+        });
+        dom.render_immediate(&mut dioxus_core::NoOpMutations);
+
+        // The audio output moves on, and nothing tells the view about it but the loop.
+        fake.lock().unwrap().decks[0].position = Duration::from_secs(30);
+        for _ in 0..40 {
+            let _ = tokio::time::timeout(Duration::from_millis(25), dom.wait_for_work()).await;
+            dom.render_immediate(&mut dioxus_core::NoOpMutations);
+            if rendered_playhead(&dom) == 30_000 {
+                return;
+            }
+        }
+
+        panic!(
+            "the refresh loop never carried the playhead to the view; it is stuck at {}ms",
+            rendered_playhead(&dom)
+        );
+    }
+
+    /// The user's symptom: the audio moves, the trackbar does not.
+    #[test]
+    fn a_moving_playhead_moves_the_trackbar() {
+        let fake = Arc::new(StdMutex::new(FakeAudio::new()));
+        PROBE_AUDIO.with(|slot| *slot.borrow_mut() = Some(fake.clone()));
+
+        let mut dom = VirtualDom::new(DeckRow);
+        dom.rebuild_in_place();
+        let decks = PROBE_DECKS
+            .with(|slot| slot.borrow_mut().take())
+            .expect("the probe root did not publish its decks");
+
+        dom.in_runtime(|| {
+            decks[0].load(a_four_minute_track());
+            decks[0].play();
+        });
+        dom.render_immediate(&mut dioxus_core::NoOpMutations);
+        assert_eq!(rendered_playhead(&dom), 0, "playback starts at the beginning");
+
+        // The audio output has moved on, exactly as it does while a track plays.
+        fake.lock().unwrap().decks[0].position = Duration::from_secs(30);
+        dom.in_runtime(|| decks[0].refresh());
+        dom.render_immediate(&mut dioxus_core::NoOpMutations);
+
+        assert_eq!(
+            rendered_playhead(&dom),
+            30_000,
+            "the audio moved but the trackbar did not follow it"
+        );
     }
 }

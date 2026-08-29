@@ -38,6 +38,10 @@ _Avoid_: Master track, merged track, deduplicated track
 **Metadata Candidate**:
 One observed value for one metadata field, carrying its provenance. Canonical values are selected from competing candidates rather than overwritten.
 
+**Embedded Tags**:
+What one audio file's own tags and audio properties say about it, read off the file itself. Embedded tags are observed from an asset rather than reported by a source, so a scan turns them into metadata candidates and reconciliation decides which of them become canonical.
+_Avoid_: File metadata, ID3, tags (unqualified)
+
 **Library Entry**:
 The user's own record about a canonical track — rating, comment, play count, last played, and when it was added. A library entry is authored or accumulated locally; it is never observed from a provider and never reconciled against one.
 _Avoid_: User metadata, personal metadata, play stats

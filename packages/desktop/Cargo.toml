@@ -34,3 +34,6 @@ webbrowser = { version = "1", optional = true }
 default = []
 desktop = ["dioxus/desktop", "dep:keyring", "dep:reqwest", "dep:webbrowser"]
 server = ["dioxus/server", "ui/server"]
+
+[dev-dependencies]
+dioxus-ssr = "0.7"

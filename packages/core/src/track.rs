@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -236,90 +236,22 @@ impl Track {
 
     /// Try to load metadata, returning an error if it fails.
     fn try_load_metadata(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let tagged_file = Probe::open(&self.path)?.read()?;
-
-        // Get audio properties (duration, sample rate, bitrate)
-        let properties = tagged_file.properties();
-        self.duration = Some(properties.duration());
-        self.sample_rate = properties.sample_rate();
-        self.bitrate = properties.audio_bitrate();
-
-        // Get tags (try primary tag first, then any available)
-        if let Some(tag) = tagged_file
-            .primary_tag()
-            .or_else(|| tagged_file.first_tag())
-        {
-            // Title
-            if let Some(title) = tag.title() {
-                let title_str = title.to_string();
-                if !title_str.is_empty() {
-                    self.title = title_str;
-                }
-            }
-
-            // Artist
-            if let Some(artist) = tag.artist() {
-                let artist_str = artist.to_string();
-                if !artist_str.is_empty() {
-                    self.artist = Some(artist_str);
-                }
-            }
-
-            // Album
-            if let Some(album) = tag.album() {
-                let album_str = album.to_string();
-                if !album_str.is_empty() {
-                    self.album = Some(album_str);
-                }
-            }
-
-            // Genre
-            if let Some(genre) = tag.genre() {
-                let genre_str = genre.to_string();
-                if !genre_str.is_empty() {
-                    self.genre = Some(genre_str);
-                }
-            }
-
-            // Year
-            self.year = tag.year();
-
-            // Track number
-            self.track_number = tag.track();
-
-            // Comment
-            if let Some(comment) = tag.comment() {
-                let comment_str = comment.to_string();
-                if !comment_str.is_empty() {
-                    self.comment = Some(comment_str);
-                }
-            }
-
-            // Try to get BPM from various tag formats
-            self.bpm = self.extract_bpm(tag);
-
-            // Try to get musical key
-            self.key = self.extract_key(tag);
+        let tags = read_embedded_tags(&self.path)?;
+        self.sample_rate = tags.sample_rate;
+        self.bitrate = tags.bitrate;
+        self.duration = tags.duration.or(self.duration);
+        if let Some(title) = tags.title {
+            self.title = title;
         }
-
+        self.artist = tags.artist.or(self.artist.take());
+        self.album = tags.album.or(self.album.take());
+        self.genre = tags.genre.or(self.genre.take());
+        self.year = tags.year.or(self.year);
+        self.track_number = tags.track_number.or(self.track_number);
+        self.comment = tags.comment.or(self.comment.take());
+        self.bpm = tags.bpm.or(self.bpm);
+        self.key = tags.musical_key.or(self.key.take());
         Ok(())
-    }
-
-    /// Extract BPM from tag (stored in different ways by different software).
-    fn extract_bpm(&self, _tag: &dyn Accessor) -> Option<f32> {
-        // BPM is often stored as a custom tag
-        // Common tag names: TBPM (ID3v2), BPM, TEMPO
-        // lofty doesn't have direct BPM accessor, would need to check custom tags
-        // For now, return None - can be enhanced later
-        None
-    }
-
-    /// Extract musical key from tag.
-    fn extract_key(&self, _tag: &dyn Accessor) -> Option<String> {
-        // Key is often stored as TKEY (ID3v2) or INITIALKEY
-        // lofty doesn't have direct key accessor
-        // For now, return None - can be enhanced later
-        None
     }
 
     /// Create a track with title and artist (manual override).
@@ -381,6 +313,91 @@ impl Track {
 /// Analyze multiple tracks in parallel (for bulk imports).
 pub fn analyze_tracks(paths: Vec<PathBuf>) -> Vec<Track> {
     paths.into_iter().map(Track::new).collect()
+}
+
+/// What one audio file's own tags and audio properties say about it.
+///
+/// These are observations read off a single file, not a track's identity: a scan turns
+/// them into metadata candidates and reconciliation decides which ones win. A field is
+/// `None` when the file does not carry it, never a placeholder.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EmbeddedTags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub genre: Option<String>,
+    pub comment: Option<String>,
+    /// How long the audio runs, read from the file's properties rather than a tag.
+    pub duration: Option<Duration>,
+    pub year: Option<u32>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub bpm: Option<f32>,
+    pub musical_key: Option<String>,
+    pub isrc: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub bitrate: Option<u32>,
+}
+
+/// Read every tag embedded in `path`, plus the audio properties of the file itself.
+///
+/// This is the one place rec_bag reads a file's own metadata. Tempo and key are stored
+/// under different names by different software, so each is tried in turn rather than
+/// trusting a single tag format.
+pub fn read_embedded_tags(path: &Path) -> Result<EmbeddedTags, MetadataError> {
+    let tagged_file = Probe::open(path)
+        .map_err(|error| MetadataError::FileReadError(error.to_string()))?
+        .read()
+        .map_err(|error| MetadataError::FileReadError(error.to_string()))?;
+
+    let properties = tagged_file.properties();
+    let mut tags = EmbeddedTags {
+        duration: Some(properties.duration()),
+        sample_rate: properties.sample_rate(),
+        bitrate: properties.audio_bitrate(),
+        ..EmbeddedTags::default()
+    };
+
+    let Some(tag) = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+    else {
+        return Ok(tags);
+    };
+
+    fn present(value: Option<String>) -> Option<String> {
+        value.filter(|text| !text.trim().is_empty())
+    }
+
+    tags.title = present(tag.title().map(|value| value.to_string()));
+    tags.artist = present(tag.artist().map(|value| value.to_string()));
+    tags.album = present(tag.album().map(|value| value.to_string()));
+    tags.genre = present(tag.genre().map(|value| value.to_string()));
+    tags.comment = present(tag.comment().map(|value| value.to_string()));
+    tags.album_artist = present(
+        tag.get_string(&ItemKey::AlbumArtist)
+            .map(|value| value.to_string()),
+    );
+    tags.isrc = present(
+        tag.get_string(&ItemKey::Isrc)
+            .map(|value| value.to_string()),
+    );
+    tags.year = tag.year();
+    tags.track_number = tag.track();
+    tags.disc_number = tag.disk();
+    // Tempo lives in TBPM as an integer and in a free-text BPM item as a decimal.
+    tags.bpm = [ItemKey::IntegerBpm, ItemKey::Bpm]
+        .iter()
+        .find_map(|key| tag.get_string(key))
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|bpm| bpm.is_finite() && *bpm > 0.0);
+    tags.musical_key = present(
+        tag.get_string(&ItemKey::InitialKey)
+            .map(|value| value.to_string()),
+    );
+
+    Ok(tags)
 }
 
 /// Error type for metadata operations.
