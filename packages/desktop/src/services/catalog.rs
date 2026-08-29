@@ -8,7 +8,7 @@
 //! reads a path off a track: it asks [`Catalog::load_track`] for a [`LoadedTrack`], and
 //! that one function is the only place a concrete audio file is resolved.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -18,8 +18,9 @@ use std::time::Duration;
 use rec_core::{
     CanonicalPlaylist, CanonicalPlaylistEntry, CanonicalTrack, CatalogSource, CatalogSourceKind,
     LibraryEntry, LibraryEntryRepository, MetadataField, MetadataValue, MusicSource, Playlist,
-    PlaylistRepository, RepositoryPageRequest, Setting, SettingsRepository, SourceRepository,
-    SourceType, Track, TrackAnalysis, TrackAnalysisRepository, TrackRepository,
+    PlaylistRepository, RepositoryPage, RepositoryPageRequest, Setting, SettingsRepository,
+    SourceOccurrenceFilter, SourceRepository, SourceType, Track, TrackAnalysis,
+    TrackAnalysisRepository, TrackRepository,
 };
 use rec_persistence::TursoCatalog;
 use uuid::Uuid;
@@ -70,12 +71,25 @@ impl LoadedTrack {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogError {
     message: String,
+    /// Whether the same call is worth making again. A resolver or repository that was
+    /// momentarily unavailable is retryable; a track that is not in the catalog is not.
+    pub retryable: bool,
 }
 
 impl CatalogError {
+    /// An error the caller should not simply repeat.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// The same error, marked as worth retrying.
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
         }
     }
 }
@@ -91,12 +105,48 @@ impl std::error::Error for CatalogError {}
 type CatalogResult<T> = Result<T, CatalogError>;
 
 fn read_error(what: &str) -> impl FnOnce(rec_core::RepositoryError) -> CatalogError + '_ {
-    move |error| CatalogError::new(format!("could not read {what} from the catalog: {error}"))
+    move |error| repository_error(format!("could not read {what} from the catalog"), error)
 }
 
 fn write_error(what: &str) -> impl FnOnce(rec_core::RepositoryError) -> CatalogError + '_ {
-    move |error| CatalogError::new(format!("could not save {what} to the catalog: {error}"))
+    move |error| repository_error(format!("could not save {what} to the catalog"), error)
 }
+
+fn repository_error(context: String, error: rec_core::RepositoryError) -> CatalogError {
+    CatalogError {
+        message: format!("{context}: {error}"),
+        retryable: error.is_retryable(),
+    }
+}
+
+/// Read every page of a repository listing.
+///
+/// Repository listings are cursor-paged so no single query can grow unbounded. Callers
+/// projecting a whole catalog want the whole thing, and should not each re-implement the
+/// walk.
+async fn all_pages<T, F>(what: &str, mut page_of: F) -> CatalogResult<Vec<T>>
+where
+    F: AsyncFnMut(RepositoryPageRequest) -> Result<RepositoryPage<T>, rec_core::RepositoryError>,
+{
+    let mut items = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = page_of(RepositoryPageRequest {
+            cursor,
+            limit: Some(PAGE_SIZE),
+        })
+        .await
+        .map_err(read_error(what))?;
+        items.extend(page.items);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(items),
+        }
+    }
+}
+
+/// How many records to read per repository page.
+const PAGE_SIZE: u32 = 500;
 
 /// One Catalog over the canonical repositories.
 pub struct Catalog {
@@ -111,7 +161,7 @@ impl Catalog {
 
     /// Every canonical track, projected with the user's library entry, its cached
     /// analysis, and a local path when one is known.
-    pub async fn library(&self) -> CatalogResult<Vec<Track>> {
+    pub async fn tracks(&self) -> CatalogResult<Vec<Track>> {
         let canonical = self.canonical_tracks().await?;
         let entries = self.library_entries().await?;
         let analysis = self.analysis_by_track().await?;
@@ -125,13 +175,33 @@ impl Catalog {
             .into_iter()
             .map(|track| {
                 let id = track.id;
-                library_track(
+                catalog_track(
                     track,
                     entries.get(&id),
                     analysis.get(&id),
                     paths.get(&id).and_then(|paths| paths.first()).cloned(),
                 )
             })
+            .collect())
+    }
+
+    /// The canonical tracks a source has observed, by identity rather than by path.
+    pub async fn track_ids_for_source(&self, source_id: Uuid) -> CatalogResult<HashSet<Uuid>> {
+        let occurrences = all_pages("source occurrences", async |page| {
+            SourceRepository::list_occurrences(
+                self.store.as_ref(),
+                SourceOccurrenceFilter {
+                    source_id: Some(source_id),
+                    ..Default::default()
+                },
+                page,
+            )
+            .await
+        })
+        .await?;
+        Ok(occurrences
+            .into_iter()
+            .filter_map(|occurrence| occurrence.canonical_track_id)
             .collect())
     }
 
@@ -184,28 +254,16 @@ impl Catalog {
             .occurrence_counts_by_source()
             .await
             .map_err(read_error("source track counts"))?;
-        let mut sources = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = SourceRepository::list(
-                self.store.as_ref(),
-                RepositoryPageRequest {
-                    cursor,
-                    limit: Some(200),
-                },
-            )
-            .await
-            .map_err(read_error("sources"))?;
-            for source in page.items {
-                let count = counts.get(&source.id).copied().unwrap_or(0);
-                sources.push(music_source(source, count));
-            }
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-        Ok(sources)
+        Ok(all_pages("sources", async |page| {
+            SourceRepository::list(self.store.as_ref(), page).await
+        })
+        .await?
+        .into_iter()
+        .map(|source| {
+            let count = counts.get(&source.id).copied().unwrap_or(0);
+            music_source(source, count)
+        })
+        .collect())
     }
 
     /// Prepare a canonical track for a deck.
@@ -227,14 +285,14 @@ impl Catalog {
             .map_err(read_error("track analysis"))?;
         let resolved = self.paths.resolve(track_id).await?;
         if !resolved.path.is_file() {
-            return Err(CatalogError::new(format!(
+            return Err(CatalogError::retryable(format!(
                 "resolved playback path is not an available local file: {}",
                 resolved.path.display()
             )));
         }
 
         Ok(LoadedTrack {
-            track: library_track(
+            track: catalog_track(
                 canonical,
                 entry.as_ref(),
                 analysis.as_ref(),
@@ -264,7 +322,7 @@ impl Catalog {
             .ok_or_else(|| CatalogError::new(format!("track {track_id} is not in the catalog")))?;
         let now = chrono::Utc::now();
         for (field, value) in edits {
-            canonical.metadata.retain_user_edit(field, value, now);
+            canonical.metadata.set_user_value(field, value, now);
         }
         canonical.updated_at = now;
         TrackRepository::upsert(self.store.as_ref(), canonical)
@@ -353,25 +411,10 @@ impl Catalog {
     }
 
     async fn canonical_tracks(&self) -> CatalogResult<Vec<CanonicalTrack>> {
-        let mut tracks = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = TrackRepository::list(
-                self.store.as_ref(),
-                RepositoryPageRequest {
-                    cursor,
-                    limit: Some(500),
-                },
-            )
-            .await
-            .map_err(read_error("tracks"))?;
-            tracks.extend(page.items);
-            match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-        Ok(tracks)
+        all_pages("tracks", async |page| {
+            TrackRepository::list(self.store.as_ref(), page).await
+        })
+        .await
     }
 
     async fn library_entries(&self) -> CatalogResult<BTreeMap<Uuid, LibraryEntry>> {
@@ -398,7 +441,7 @@ impl Catalog {
 /// `path` is informational: it is where the track's audio is known to sit on disk, and
 /// it is empty for a track that only exists at a provider. Playback resolves its own
 /// path through [`Catalog::load_track`] and never reads this one.
-fn library_track(
+fn catalog_track(
     canonical: CanonicalTrack,
     entry: Option<&LibraryEntry>,
     analysis: Option<&TrackAnalysis>,
@@ -428,11 +471,7 @@ fn library_track(
         track.last_played = entry.last_played_at;
     }
     if let Some(analysis) = analysis {
-        track.waveform = analysis.waveform.clone();
-        track.freq_waveform = analysis.freq_waveform.clone();
-        track.beat_grid = analysis.beat_grid.clone();
-        track.bpm = track.bpm.or(analysis.bpm);
-        track.key = track.key.clone().or_else(|| analysis.key.clone());
+        analysis.apply_to(&mut track);
     }
     track
 }
@@ -442,11 +481,13 @@ fn music_source(source: CatalogSource, track_count: u32) -> MusicSource {
     MusicSource {
         id: source.id,
         name: source.name,
+        // The panel browses a local source's filesystem tree and summarizes any other
+        // kind, so calling a provider source local would mount a folder browser on
+        // something that has no folder.
         source_type: match source.kind {
             CatalogSourceKind::LocalFolder => SourceType::Local,
-            // The panel's type only decides an icon; a source it has no icon for is
-            // still shown rather than hidden.
-            _ => SourceType::Local,
+            CatalogSourceKind::SoundCloud => SourceType::SoundCloud,
+            CatalogSourceKind::Custom(_) => SourceType::WebDav,
         },
         uri: source.config.get("path").cloned().unwrap_or_default(),
         config: None,
@@ -575,7 +616,7 @@ mod tests {
         .await
         .unwrap();
 
-        let library = catalog.library().await.unwrap();
+        let library = catalog.tracks().await.unwrap();
 
         assert_eq!(library.len(), 1);
         let shown = &library[0];
@@ -592,6 +633,37 @@ mod tests {
         );
     }
 
+    /// Analysis is inferred; a tempo the user or a provider stated outranks it. The one
+    /// merge rule must hold wherever analysis meets a track — projection and deck alike.
+    #[tokio::test]
+    async fn analysis_fills_gaps_but_never_replaces_reconciled_metadata() {
+        let (catalog, store) = catalog(StubPaths::new(HashMap::new())).await;
+        let mut track = canonical_track("Stated", "Artist");
+        track.metadata.add(MetadataFieldValue::new(
+            MetadataField::Bpm,
+            MetadataValue::Decimal("124".into()),
+            MetadataProvenance::new(MetadataOrigin::User, Utc::now()),
+        ));
+        TrackRepository::upsert(store.as_ref(), track.clone())
+            .await
+            .unwrap();
+        TrackAnalysisRepository::upsert(
+            store.as_ref(),
+            TrackAnalysis {
+                bpm: Some(128.0),
+                key: Some("Am".into()),
+                ..TrackAnalysis::new(track.id)
+            },
+        )
+        .await
+        .unwrap();
+
+        let shown = catalog.tracks().await.unwrap().remove(0);
+
+        assert_eq!(shown.bpm, Some(124.0), "the stated tempo wins");
+        assert_eq!(shown.key.as_deref(), Some("Am"), "the empty key is filled");
+    }
+
     /// A canonical track has no path of its own. Nothing may invent one for it.
     #[tokio::test]
     async fn a_track_with_no_local_file_is_shown_without_a_path() {
@@ -601,7 +673,7 @@ mod tests {
             .await
             .unwrap();
 
-        let library = catalog.library().await.unwrap();
+        let library = catalog.tracks().await.unwrap();
 
         assert_eq!(library[0].path, PathBuf::new());
     }
@@ -629,7 +701,7 @@ mod tests {
         assert_eq!(loaded.path, cache);
         assert!(loaded.cached);
         // The catalog record is untouched: nothing wrote the cache path back.
-        assert_eq!(catalog.library().await.unwrap()[0].path, PathBuf::new());
+        assert_eq!(catalog.tracks().await.unwrap()[0].path, PathBuf::new());
         std::fs::remove_file(cache).unwrap();
     }
 
@@ -688,7 +760,7 @@ mod tests {
         .await
         .unwrap();
 
-        let library = catalog.library().await.unwrap();
+        let library = catalog.tracks().await.unwrap();
         let playlists = catalog.playlists(&library).await.unwrap();
 
         assert_eq!(playlists.len(), 1);
@@ -704,7 +776,7 @@ mod tests {
         TrackRepository::upsert(store.as_ref(), track.clone())
             .await
             .unwrap();
-        let library = catalog.library().await.unwrap();
+        let library = catalog.tracks().await.unwrap();
         let mut playlist = Playlist::new("Warmup");
         playlist.add_track(library[0].clone());
 
@@ -741,7 +813,7 @@ mod tests {
             .await
             .unwrap();
 
-        let library = catalog.library().await.unwrap();
+        let library = catalog.tracks().await.unwrap();
         assert_eq!(library[0].title, "Corrected title");
         assert_eq!(library[0].genre.as_deref(), Some("Dub"));
     }
@@ -782,7 +854,25 @@ mod tests {
             })
             .count();
         assert_eq!(user_titles, 1);
-        assert_eq!(catalog.library().await.unwrap()[0].title, "Third");
+        assert_eq!(catalog.tracks().await.unwrap()[0].title, "Third");
+    }
+
+    /// The panel mounts a filesystem browser on a local source and summarizes anything
+    /// else, so a provider source must not be projected as a local folder.
+    #[tokio::test]
+    async fn a_provider_source_is_not_projected_as_a_local_folder() {
+        let (catalog, store) = catalog(StubPaths::new(HashMap::new())).await;
+        SourceRepository::upsert(
+            store.as_ref(),
+            CatalogSource::new("SoundCloud", CatalogSourceKind::SoundCloud),
+        )
+        .await
+        .unwrap();
+
+        let sources = catalog.sources().await.unwrap();
+
+        assert_eq!(sources[0].source_type, SourceType::SoundCloud);
+        assert!(!sources[0].is_local());
     }
 
     #[tokio::test]

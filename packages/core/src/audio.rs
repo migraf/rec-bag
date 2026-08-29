@@ -146,11 +146,6 @@ impl Deck {
         self.state
     }
 
-    /// The file this deck last decoded.
-    pub fn source_path(&self) -> Option<&Path> {
-        self.source_path.as_deref()
-    }
-
     /// Check if the track has finished playing.
     /// This is different from is_empty - it only returns true if
     /// we had audio and it finished.
@@ -159,7 +154,7 @@ impl Deck {
     }
 
     /// Check if the deck has audio loaded.
-    pub fn has_track(&self) -> bool {
+    pub fn has_audio(&self) -> bool {
         self.source_path.is_some()
     }
 
@@ -243,7 +238,7 @@ impl AudioEngine {
     }
 
     /// Decode a file onto a specific deck.
-    pub fn load_track(&mut self, deck_index: usize, path: &Path) -> Result<(), AudioError> {
+    pub fn load_file(&mut self, deck_index: usize, path: &Path) -> Result<(), AudioError> {
         self.deck_mut(deck_index)?.load(path)
     }
 

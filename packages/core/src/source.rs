@@ -13,6 +13,8 @@ pub enum SourceType {
     /// Local filesystem folder
     #[default]
     Local,
+    /// SoundCloud account or public catalog connection
+    SoundCloud,
     /// Amazon S3 bucket (future)
     S3,
     /// Google Drive folder (future)
@@ -28,6 +30,7 @@ impl SourceType {
     pub fn as_str(&self) -> &'static str {
         match self {
             SourceType::Local => "local",
+            SourceType::SoundCloud => "soundcloud",
             SourceType::S3 => "s3",
             SourceType::GoogleDrive => "google_drive",
             SourceType::Dropbox => "dropbox",
@@ -39,6 +42,7 @@ impl SourceType {
     pub fn from_str(s: &str) -> Self {
         match s {
             "local" => SourceType::Local,
+            "soundcloud" => SourceType::SoundCloud,
             "s3" => SourceType::S3,
             "google_drive" => SourceType::GoogleDrive,
             "dropbox" => SourceType::Dropbox,

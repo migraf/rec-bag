@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     services::{
-        catalog::Catalog,
+        catalog::{Catalog, CatalogError},
         integration::{DesktopIntegration, DesktopStartup, OwnershipTakeoverOffer},
         playback_bridge::AssetPlaybackPaths,
         recovery::{RecoveryProgress, RestoreReport, SnapshotListing},
@@ -520,7 +520,9 @@ pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, Int
         spawn(async move {
             // The Catalog is composed here, from the runtime's own repositories and its
             // asset resolver, and handed to the application state as a value.
-            app_state.adopt_catalog(catalog_for(&runtime)).await;
+            if let Err(error) = app_state.adopt_catalog(catalog_for(&runtime)).await {
+                state.write().report_error(catalog_failure(error));
+            }
             if let Err(error) = runtime.start_background().await {
                 state.write().report_error(error);
                 return;
@@ -539,7 +541,9 @@ pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, Int
                     match view_runtime.initial_view().await {
                         Ok(view) => {
                             view_state.write().view = view;
-                            app_state.refresh_catalog().await;
+                            if let Err(error) = app_state.refresh_catalog().await {
+                                view_state.write().report_error(catalog_failure(error));
+                            }
                         }
                         Err(error) => view_state.write().report_error(error),
                     }
@@ -598,7 +602,10 @@ async fn run_slice(
                 Ok(outcome) => {
                     tracing::info!(request_id, ?slice, message = ?outcome.message, "integration request completed");
                     IntegrationController::complete(&mut state.write(), request_id, outcome);
-                    app_state.refresh_catalog().await;
+                    if let Err(error) = app_state.refresh_catalog().await {
+                        tracing::warn!(?slice, error = %error, "catalog refresh failed after integration request");
+                        state.write().report_error(catalog_failure(error));
+                    }
                 }
                 Err(error) => {
                     let retryable = error.retryable;
@@ -622,6 +629,17 @@ async fn run_slice(
             tracing::info!(?slice, "integration slice runner stopped");
             return;
         }
+    }
+}
+
+/// Report a Catalog failure through the same surface as integration failures, so a
+/// stale dashboard is never the only sign that a read did not happen.
+fn catalog_failure(error: CatalogError) -> IntegrationError {
+    IntegrationError {
+        request_id: None,
+        slice: None,
+        retryable: error.retryable,
+        message: error.to_string(),
     }
 }
 

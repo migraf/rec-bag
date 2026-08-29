@@ -7,7 +7,7 @@
 pub mod deck;
 pub mod integration;
 
-use crate::services::catalog::Catalog;
+use crate::services::catalog::{Catalog, CatalogError};
 use deck::{Deck, SharedAudio, DECK_COUNT};
 use dioxus::prelude::*;
 use rec_core::{
@@ -108,14 +108,12 @@ impl AppState {
     ///
     /// The integration runtime owns catalog startup, so this is the composition root's
     /// hand-off rather than something the application state opens for itself.
-    pub async fn adopt_catalog(mut self, catalog: Arc<Catalog>) {
+    pub async fn adopt_catalog(mut self, catalog: Arc<Catalog>) -> Result<(), CatalogError> {
         self.catalog.set(Some(catalog.clone()));
-        match catalog.setting("theme").await {
-            Ok(Some(theme)) => self.current_theme.set(theme),
-            Ok(None) => {}
-            Err(error) => eprintln!("Could not load the theme preference: {error}"),
+        if let Some(theme) = catalog.setting("theme").await? {
+            self.current_theme.set(theme);
         }
-        self.refresh_catalog().await;
+        self.refresh_catalog().await
     }
 
     /// The Catalog, if the integration runtime has opened it.
@@ -123,27 +121,19 @@ impl AppState {
         self.catalog.read().clone()
     }
 
-    /// Re-read the library, playlists, and sources from the Catalog.
-    pub async fn refresh_catalog(mut self) {
+    /// Re-read the tracks, playlists, and sources from the Catalog.
+    ///
+    /// A failure is returned rather than logged, because the caller is the integration
+    /// runner that shows the user retryable errors.
+    pub async fn refresh_catalog(mut self) -> Result<(), CatalogError> {
         let Some(catalog) = self.catalog() else {
-            return;
+            return Ok(());
         };
-        let tracks = match catalog.library().await {
-            Ok(tracks) => tracks,
-            Err(error) => {
-                eprintln!("Could not read the library from the catalog: {error}");
-                return;
-            }
-        };
-        match catalog.playlists(&tracks).await {
-            Ok(playlists) => self.playlists.set(playlists),
-            Err(error) => eprintln!("Could not read playlists from the catalog: {error}"),
-        }
-        match catalog.sources().await {
-            Ok(sources) => self.sources.set(sources),
-            Err(error) => eprintln!("Could not read sources from the catalog: {error}"),
-        }
+        let tracks = catalog.tracks().await?;
+        self.playlists.set(catalog.playlists(&tracks).await?);
+        self.sources.set(catalog.sources().await?);
         self.library_tracks.set(tracks);
+        Ok(())
     }
 
     /// Check if a track is currently being analyzed.
@@ -171,7 +161,7 @@ impl AppState {
         let Some(analysis) = analysis else {
             return;
         };
-        self.edit_track_everywhere(track_id, |track| apply_analysis(track, &analysis));
+        self.edit_track_everywhere(track_id, |track| analysis.apply_to(track));
 
         if let Some(catalog) = self.catalog() {
             if let Err(error) = catalog.save_analysis(analysis).await {
@@ -303,6 +293,49 @@ impl AppState {
         }
         drop(playlists);
         self.save_playlist(playlist_id);
+    }
+
+    /// Create a playlist holding every track a source has observed.
+    ///
+    /// Membership is selected by canonical identity through the source's occurrences,
+    /// never by matching a filesystem prefix: a canonical track has no path of its own.
+    pub async fn create_playlist_from_source(mut self, source_id: Uuid) -> Option<Uuid> {
+        let catalog = self.catalog()?;
+        let name = self
+            .sources
+            .read()
+            .iter()
+            .find(|source| source.id == source_id)
+            .map(|source| source.name.clone())?;
+        let track_ids = match catalog.track_ids_for_source(source_id).await {
+            Ok(track_ids) => track_ids,
+            Err(error) => {
+                eprintln!("Could not read the tracks of source {source_id}: {error}");
+                return None;
+            }
+        };
+        let tracks: Vec<Track> = self
+            .library_tracks
+            .read()
+            .iter()
+            .filter(|track| track_ids.contains(&track.id))
+            .cloned()
+            .collect();
+        if tracks.is_empty() {
+            return None;
+        }
+
+        let mut playlist = Playlist::new(name);
+        for track in tracks {
+            playlist.add_track(track);
+        }
+        let playlist_id = playlist.id;
+        if let Err(error) = catalog.save_playlist(&playlist).await {
+            eprintln!("Could not save playlist {playlist_id}: {error}");
+            return None;
+        }
+        self.playlists.write().push(playlist);
+        Some(playlist_id)
     }
 
     /// Persist one playlist's current membership.
@@ -577,9 +610,7 @@ impl AppState {
             return Err("Track not found".to_string());
         }
 
-        if comment.is_some() || rating.is_some() {
-            self.save_library_entry(track_id, comment.flatten(), rating.flatten());
-        }
+        self.save_library_entry(track_id, comment.clone(), rating);
         self.save_metadata_edits(
             track_id,
             metadata_edits(title, artist, album, genre, bpm, key, year, track_number),
@@ -655,7 +686,19 @@ impl AppState {
     }
 
     /// Persist the user's own record about a track.
-    fn save_library_entry(self, track_id: Uuid, comment: Option<String>, rating: Option<u8>) {
+    ///
+    /// Each argument is `None` when the editor did not touch that field and
+    /// `Some(None)` when the user cleared it, so editing a rating cannot silently
+    /// discard a comment.
+    fn save_library_entry(
+        self,
+        track_id: Uuid,
+        comment: Option<Option<String>>,
+        rating: Option<Option<u8>>,
+    ) {
+        if comment.is_none() && rating.is_none() {
+            return;
+        }
         let Some(catalog) = self.catalog() else {
             return;
         };
@@ -667,9 +710,7 @@ impl AppState {
                     LibraryEntry::new(track_id)
                 }
             };
-            entry.comment = comment;
-            entry.rating = rating;
-            entry.updated_at = chrono::Utc::now();
+            apply_entry_edits(&mut entry, comment, rating, chrono::Utc::now());
             if let Err(error) = catalog.save_library_entry(entry).await {
                 eprintln!("Could not save the library entry for {track_id}: {error}");
             }
@@ -807,6 +848,25 @@ impl AppState {
     }
 }
 
+/// Apply an editor submission to the user's own record about a track.
+///
+/// `None` means the editor did not touch the field; `Some(None)` means the user cleared
+/// it. Collapsing the two would make editing a rating erase a comment.
+fn apply_entry_edits(
+    entry: &mut LibraryEntry,
+    comment: Option<Option<String>>,
+    rating: Option<Option<u8>>,
+    edited_at: chrono::DateTime<chrono::Utc>,
+) {
+    if let Some(comment) = comment {
+        entry.comment = comment;
+    }
+    if let Some(rating) = rating {
+        entry.rating = rating;
+    }
+    entry.updated_at = edited_at;
+}
+
 /// Turn one metadata-editor submission into canonical metadata candidates.
 ///
 /// The outer `Option` is "the editor did not touch this field"; the inner one is "the
@@ -861,23 +921,6 @@ fn metadata_edits(
     .into_iter()
     .flatten()
     .collect()
-}
-
-/// Attach analysis results to a track, leaving values it already carries alone.
-fn apply_analysis(track: &mut Track, analysis: &TrackAnalysis) {
-    fn set<T>(slot: &mut Option<T>, value: &Option<T>)
-    where
-        T: Clone,
-    {
-        if slot.is_none() {
-            slot.clone_from(value);
-        }
-    }
-    set::<WaveformPeaks>(&mut track.waveform, &analysis.waveform);
-    set::<FrequencyWaveformData>(&mut track.freq_waveform, &analysis.freq_waveform);
-    set::<BeatGridData>(&mut track.beat_grid, &analysis.beat_grid);
-    set::<f32>(&mut track.bpm, &analysis.bpm);
-    set::<String>(&mut track.key, &analysis.key);
 }
 
 fn filtered(query: String, tracks: Vec<Track>) -> Vec<Track> {
@@ -985,4 +1028,73 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) 
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn an_entry() -> LibraryEntry {
+        let mut entry = LibraryEntry::new(Uuid::new_v4());
+        entry.comment = Some("keeper".into());
+        entry.rating = Some(4);
+        entry
+    }
+
+    #[test]
+    fn editing_only_the_rating_leaves_the_comment_alone() {
+        let mut entry = an_entry();
+
+        apply_entry_edits(&mut entry, None, Some(Some(5)), Utc::now());
+
+        assert_eq!(entry.rating, Some(5));
+        assert_eq!(entry.comment.as_deref(), Some("keeper"));
+    }
+
+    #[test]
+    fn editing_only_the_comment_leaves_the_rating_alone() {
+        let mut entry = an_entry();
+
+        apply_entry_edits(&mut entry, Some(Some("revised".into())), None, Utc::now());
+
+        assert_eq!(entry.comment.as_deref(), Some("revised"));
+        assert_eq!(entry.rating, Some(4));
+    }
+
+    /// Clearing is a real edit and must be distinguishable from not editing.
+    #[test]
+    fn clearing_a_field_removes_only_that_field() {
+        let mut entry = an_entry();
+
+        apply_entry_edits(&mut entry, Some(None), None, Utc::now());
+
+        assert_eq!(entry.comment, None);
+        assert_eq!(entry.rating, Some(4));
+    }
+
+    #[test]
+    fn a_metadata_edit_only_records_the_fields_the_editor_touched() {
+        let edits = metadata_edits(
+            Some("New title".into()),
+            None,
+            Some(None),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            edits,
+            vec![
+                (
+                    MetadataField::Title,
+                    Some(MetadataValue::Text("New title".into()))
+                ),
+                (MetadataField::Album, None),
+            ]
+        );
+    }
 }

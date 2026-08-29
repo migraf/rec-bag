@@ -162,6 +162,31 @@ fn stable_uuid(namespace: Uuid, value: &str) -> Uuid {
     Uuid::new_v5(&namespace, value.as_bytes())
 }
 
+/// The legacy track columns this migration reads, and their positions in that order.
+///
+/// Turso rows are read by position, so the projection and its indexes are declared
+/// together: reordering one without the other would silently mis-migrate every track.
+const LEGACY_TRACK_COLUMNS: &str = "id, path, title, artist, album, genre, key, bpm, \
+     duration_ms, year, track_number, rating, comment, play_count, last_played, added_at, \
+     waveform_json";
+const ID: usize = 0;
+const PATH: usize = 1;
+const TITLE: usize = 2;
+const ARTIST: usize = 3;
+const ALBUM: usize = 4;
+const GENRE: usize = 5;
+const KEY: usize = 6;
+const BPM: usize = 7;
+const DURATION_MS: usize = 8;
+const YEAR: usize = 9;
+const TRACK_NUMBER: usize = 10;
+const RATING: usize = 11;
+const COMMENT: usize = 12;
+const PLAY_COUNT: usize = 13;
+const LAST_PLAYED: usize = 14;
+const ADDED_AT: usize = 15;
+const WAVEFORM_JSON: usize = 16;
+
 fn legacy_text(row: &turso::Row, index: usize) -> Result<Option<MetadataValue>, MigrationError> {
     Ok(row
         .get::<Option<String>>(index)?
@@ -195,43 +220,47 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
         let mut migrated = Vec::new();
         let mut rows = connection
             .query(
-                "SELECT id, path, title, artist, album, genre, key, bpm, duration_ms, year, \
-                 track_number, rating, comment, play_count, last_played, added_at, waveform_json \
-                 FROM legacy_v1_tracks ORDER BY id",
+                &format!("SELECT {LEGACY_TRACK_COLUMNS} FROM legacy_v1_tracks ORDER BY id"),
                 (),
             )
             .await?;
         while let Some(row) = rows.next().await? {
-            let raw_id: String = row.get(0)?;
+            let raw_id: String = row.get(ID)?;
             let id = parse_uuid(&raw_id, "track")?;
-            let path: String = row.get(1)?;
-            let added_at = parse_time(&row.get::<String>(15)?, "track")?;
+            let path: String = row.get(PATH)?;
+            let added_at = parse_time(&row.get::<String>(ADDED_AT)?, "track")?;
 
             // Every legacy tag was authored or read locally, so it migrates as one User
-            // candidate per field rather than as a provider observation.
+            // candidate per field. Nothing here was reported by a provider.
             let mut metadata = CanonicalMetadata::new();
             let provenance = MetadataProvenance::new(MetadataOrigin::User, added_at);
-            let mut observe = |field: MetadataField, value: Option<MetadataValue>| {
+            let mut record_user_value = |field: MetadataField, value: Option<MetadataValue>| {
                 if let Some(value) = value {
                     metadata.add(MetadataFieldValue::new(field, value, provenance.clone()));
                 }
             };
-            observe(
+            record_user_value(
                 MetadataField::Title,
-                Some(MetadataValue::Text(row.get::<String>(2)?)),
+                Some(MetadataValue::Text(row.get::<String>(TITLE)?)),
             );
-            observe(MetadataField::Artist, legacy_text(&row, 3)?);
-            observe(MetadataField::Album, legacy_text(&row, 4)?);
-            observe(MetadataField::Genre, legacy_text(&row, 5)?);
-            observe(MetadataField::MusicalKey, legacy_text(&row, 6)?);
-            observe(
+            record_user_value(MetadataField::Artist, legacy_text(&row, ARTIST)?);
+            record_user_value(MetadataField::Album, legacy_text(&row, ALBUM)?);
+            record_user_value(MetadataField::Genre, legacy_text(&row, GENRE)?);
+            record_user_value(MetadataField::MusicalKey, legacy_text(&row, KEY)?);
+            record_user_value(
                 MetadataField::Bpm,
-                row.get::<Option<f64>>(7)?
+                row.get::<Option<f64>>(BPM)?
                     .map(|value| MetadataValue::Decimal(value.to_string())),
             );
-            observe(MetadataField::DurationMs, legacy_integer(&row, 8)?);
-            observe(MetadataField::ReleaseYear, legacy_integer(&row, 9)?);
-            observe(MetadataField::TrackNumber, legacy_integer(&row, 10)?);
+            record_user_value(
+                MetadataField::DurationMs,
+                legacy_integer(&row, DURATION_MS)?,
+            );
+            record_user_value(MetadataField::ReleaseYear, legacy_integer(&row, YEAR)?);
+            record_user_value(
+                MetadataField::TrackNumber,
+                legacy_integer(&row, TRACK_NUMBER)?,
+            );
 
             let track = CanonicalTrack {
                 id,
@@ -242,22 +271,22 @@ async fn migrate_legacy_schema(connection: &Connection) -> Result<(), MigrationE
             };
 
             // The user's own record is the only thing the path-keyed track still owned.
-            let mut entry = LibraryEntry::added_at(id, added_at);
+            let mut entry = LibraryEntry::added(id, added_at);
             entry.rating = row
-                .get::<Option<i64>>(11)?
+                .get::<Option<i64>>(RATING)?
                 .and_then(|value| u8::try_from(value).ok());
-            entry.comment = row.get::<Option<String>>(12)?;
+            entry.comment = row.get::<Option<String>>(COMMENT)?;
             entry.play_count = row
-                .get::<Option<i64>>(13)?
+                .get::<Option<i64>>(PLAY_COUNT)?
                 .and_then(|value| u32::try_from(value).ok())
                 .unwrap_or(0);
             entry.last_played_at = row
-                .get::<Option<String>>(14)?
+                .get::<Option<String>>(LAST_PLAYED)?
                 .map(|value| parse_time(&value, "track play"))
                 .transpose()?;
 
             let analysis = row
-                .get::<Option<String>>(16)?
+                .get::<Option<String>>(WAVEFORM_JSON)?
                 .map(|waveform| track_analysis(id, &waveform))
                 .transpose()?;
 

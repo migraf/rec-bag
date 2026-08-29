@@ -99,34 +99,9 @@ pub fn Library() -> Element {
     };
 
     let on_create_playlist_from_source = move |source_id: Uuid| {
-        let Some(root) = app_state
-            .sources
-            .read()
-            .iter()
-            .find(|source| source.id == source_id)
-            .and_then(|source| source.local_path().map(PathBuf::from))
-        else {
-            return;
-        };
-        let name = app_state
-            .sources
-            .read()
-            .iter()
-            .find(|source| source.id == source_id)
-            .map(|source| source.name.clone())
-            .unwrap_or_else(|| "Source".to_string());
-        let tracks: Vec<Track> = app_state
-            .library_tracks
-            .read()
-            .iter()
-            .filter(|track| track.path.starts_with(&root))
-            .cloned()
-            .collect();
-        if tracks.is_empty() {
-            return;
-        }
-        let playlist_id = app_state.create_playlist(name);
-        app_state.add_tracks_to_playlist(tracks, playlist_id);
+        spawn(async move {
+            app_state.create_playlist_from_source(source_id).await;
+        });
     };
 
     // Selection handler with shift/ctrl support

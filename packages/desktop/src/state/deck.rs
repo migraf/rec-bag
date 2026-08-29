@@ -37,7 +37,7 @@ pub trait DeckAudio {
 
 impl DeckAudio for AudioEngine {
     fn load(&mut self, index: usize, path: &Path) -> bool {
-        self.load_track(index, path).is_ok()
+        self.load_file(index, path).is_ok()
     }
 
     fn play(&mut self, index: usize) {
@@ -129,11 +129,6 @@ impl Deck {
     /// The deck's user-facing number, counting from one.
     pub fn number(&self) -> usize {
         self.index + 1
-    }
-
-    /// The Loaded Track, if this deck holds one.
-    pub fn loaded(&self) -> Option<LoadedTrack> {
-        self.loaded.read().clone()
     }
 
     /// The Loaded Track's catalog record, if this deck holds one.

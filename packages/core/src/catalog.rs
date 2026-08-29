@@ -1,8 +1,9 @@
 //! Provider-neutral catalog contracts.
 //!
 //! These models describe catalog sources, source-scoped track occurrences, external
-//! playlists, and canonical metadata without requiring a local audio-file path. They
-//! intentionally do not replace the existing `Track` model.
+//! playlists, canonical metadata, the user's own library entries, and cached analysis,
+//! all without requiring a local audio-file path. [`crate::track::Track`] is what an
+//! interface renders once these records are projected for display.
 
 use crate::asset::SourceCopyPolicy;
 use crate::track::{BeatGridData, FrequencyWaveformData, WaveformPeaks};
@@ -690,12 +691,12 @@ impl CanonicalMetadata {
         self.values.push(value);
     }
 
-    /// Record the user's own value for a field, replacing any value they gave before.
+    /// Set the user's own value for a field, replacing any value they gave before.
     ///
     /// Passing `None` withdraws the user's override rather than blanking the field, so
     /// what a source observed becomes canonical again. Candidates from other origins
     /// are never touched: this is a reconciled model, not a set of overwritable cells.
-    pub fn retain_user_edit(
+    pub fn set_user_value(
         &mut self,
         field: MetadataField,
         value: Option<MetadataValue>,
@@ -809,11 +810,11 @@ impl LibraryEntry {
     /// Create an empty entry that was added now.
     pub fn new(track_id: Uuid) -> Self {
         let now = Utc::now();
-        Self::added_at(track_id, now)
+        Self::added(track_id, now)
     }
 
     /// Create an empty entry added at a known time.
-    pub fn added_at(track_id: Uuid, added_at: DateTime<Utc>) -> Self {
+    pub fn added(track_id: Uuid, added_at: DateTime<Utc>) -> Self {
         Self {
             track_id,
             rating: None,
@@ -848,7 +849,8 @@ impl LibraryEntry {
 ///
 /// Analysis is reproducible from any original asset, so losing it loses nothing. It is
 /// cached in the catalog because recomputing it costs a full decode, and it is attached
-/// to a [`crate::track::Track`] only while that track is loaded on a deck.
+/// to a [`crate::track::Track`] by [`TrackAnalysis::apply_to`] when one is projected for
+/// display or prepared for a deck.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TrackAnalysis {
     /// Canonical track this analysis describes.
@@ -879,13 +881,22 @@ impl TrackAnalysis {
         }
     }
 
-    /// Whether anything has been derived for this track.
-    pub fn is_empty(&self) -> bool {
-        self.waveform.is_none()
-            && self.freq_waveform.is_none()
-            && self.beat_grid.is_none()
-            && self.bpm.is_none()
-            && self.key.is_none()
+    /// Attach what has been derived to a track, leaving values it already carries alone.
+    ///
+    /// This is the one merge rule. Reconciled canonical metadata is applied first and
+    /// therefore wins: a tempo the user or a provider stated is not replaced by a
+    /// detected one.
+    pub fn apply_to(&self, track: &mut crate::track::Track) {
+        fn fill<T: Clone>(slot: &mut Option<T>, value: &Option<T>) {
+            if slot.is_none() {
+                slot.clone_from(value);
+            }
+        }
+        fill(&mut track.waveform, &self.waveform);
+        fill(&mut track.freq_waveform, &self.freq_waveform);
+        fill(&mut track.beat_grid, &self.beat_grid);
+        fill(&mut track.bpm, &self.bpm);
+        fill(&mut track.key, &self.key);
     }
 }
 
