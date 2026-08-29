@@ -4,10 +4,10 @@ use crate::state::use_app_state;
 use dioxus::prelude::*;
 use rec_core::Track;
 use std::collections::HashSet;
-use std::time::Duration;
+
 use ui::{
-    ContextMenu, ContextMenuAction, ContextMenuEvent, DeckControl, DeckDisplayState,
-    PlaylistBrowser, PlaylistInfo, SearchBar, SelectionEvent, TrackList,
+    ContextMenu, ContextMenuAction, ContextMenuEvent, DeckControl, PlaylistBrowser, PlaylistInfo,
+    SearchBar, SelectionEvent, TrackList,
 };
 use uuid::Uuid;
 
@@ -15,14 +15,6 @@ use uuid::Uuid;
 #[component]
 pub fn DjView() -> Element {
     let mut app_state = use_app_state();
-
-    // Deck display states (local to this view - playback state)
-    let mut deck1_state = use_signal(|| DeckDisplayState::Empty);
-    let mut deck2_state = use_signal(|| DeckDisplayState::Empty);
-    let mut deck1_volume = use_signal(|| 1.0f32);
-    let mut deck2_volume = use_signal(|| 1.0f32);
-    let mut deck1_position = use_signal(|| Duration::ZERO);
-    let mut deck2_position = use_signal(|| Duration::ZERO);
 
     // Track selection (multi-selection)
     let mut selected_track_ids: Signal<HashSet<Uuid>> = use_signal(|| HashSet::new());
@@ -54,135 +46,6 @@ pub fn DjView() -> Element {
                 .collect()
         }
     });
-
-    // Update deck state when tracks are loaded (from any view)
-    let deck1_track = app_state.deck1_track;
-    let deck2_track = app_state.deck2_track;
-
-    use_effect(move || {
-        // Update deck 1 state based on whether a track is loaded
-        if deck1_track.read().is_some() {
-            if deck1_state() == DeckDisplayState::Empty {
-                deck1_state.set(DeckDisplayState::Stopped);
-            }
-        } else {
-            deck1_state.set(DeckDisplayState::Empty);
-        }
-
-        // Update deck 2 state based on whether a track is loaded
-        if deck2_track.read().is_some() {
-            if deck2_state() == DeckDisplayState::Empty {
-                deck2_state.set(DeckDisplayState::Stopped);
-            }
-        } else {
-            deck2_state.set(DeckDisplayState::Empty);
-        }
-    });
-
-    // Periodically update deck positions while playing
-    use_future(move || async move {
-        loop {
-            // Update every 200ms for smooth display
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
-            // Use try_lock to avoid blocking UI interactions
-            if let Ok(eng) = (app_state.engine)().try_lock() {
-                // Update deck 1 position
-                if let Ok(deck) = eng.deck(0) {
-                    deck1_position.set(deck.position());
-                    // Auto-update state if track finished
-                    if deck1_state() == DeckDisplayState::Playing && deck.is_finished() {
-                        deck1_state.set(DeckDisplayState::Stopped);
-                    }
-                }
-
-                // Update deck 2 position
-                if let Ok(deck) = eng.deck(1) {
-                    deck2_position.set(deck.position());
-                    // Auto-update state if track finished
-                    if deck2_state() == DeckDisplayState::Playing && deck.is_finished() {
-                        deck2_state.set(DeckDisplayState::Stopped);
-                    }
-                }
-            }
-        }
-    });
-
-    // Deck 1 controls
-    let on_deck1_play = move |_| {
-        if let Ok(mut eng) = (app_state.engine)().lock() {
-            let _ = eng.play(0);
-            deck1_state.set(DeckDisplayState::Playing);
-        }
-    };
-
-    let on_deck1_pause = move |_| {
-        if let Ok(mut eng) = (app_state.engine)().lock() {
-            let _ = eng.pause(0);
-            deck1_state.set(DeckDisplayState::Paused);
-        }
-    };
-
-    let on_deck1_stop = move |_| {
-        if let Ok(mut eng) = (app_state.engine)().lock() {
-            let _ = eng.stop(0);
-            deck1_state.set(DeckDisplayState::Stopped);
-        }
-    };
-
-    let on_deck1_volume = move |vol: f32| {
-        if let Ok(mut eng) = (app_state.engine)().lock() {
-            let _ = eng.set_volume(0, vol);
-            deck1_volume.set(vol);
-        }
-    };
-
-    let on_deck1_seek = move |pos: Duration| {
-        if let Ok(mut eng) = (app_state.engine)().lock() {
-            if let Ok(deck) = eng.deck_mut(0) {
-                let _ = deck.seek(pos);
-                deck1_position.set(pos);
-            }
-        }
-    };
-
-    // Deck 2 controls
-    let on_deck2_play = move |_| {
-        if let Ok(mut eng) = (app_state.engine)().lock() {
-            let _ = eng.play(1);
-            deck2_state.set(DeckDisplayState::Playing);
-        }
-    };
-
-    let on_deck2_pause = move |_| {
-        if let Ok(mut eng) = (app_state.engine)().lock() {
-            let _ = eng.pause(1);
-            deck2_state.set(DeckDisplayState::Paused);
-        }
-    };
-
-    let on_deck2_stop = move |_| {
-        if let Ok(mut eng) = (app_state.engine)().lock() {
-            let _ = eng.stop(1);
-            deck2_state.set(DeckDisplayState::Stopped);
-        }
-    };
-
-    let on_deck2_volume = move |vol: f32| {
-        if let Ok(mut eng) = (app_state.engine)().lock() {
-            let _ = eng.set_volume(1, vol);
-            deck2_volume.set(vol);
-        }
-    };
-
-    let on_deck2_seek = move |pos: Duration| {
-        if let Ok(mut eng) = (app_state.engine)().lock() {
-            if let Ok(deck) = eng.deck_mut(1) {
-                let _ = deck.seek(pos);
-                deck2_position.set(pos);
-            }
-        }
-    };
 
     // Playlist handlers
     let on_create_playlist = move |name: String| {
@@ -337,38 +200,23 @@ pub fn DjView() -> Element {
         "Library"
     };
 
-    // Read deck tracks from shared state
-    let deck1_track_value = app_state.deck1_track.read().clone();
-    let deck2_track_value = app_state.deck2_track.read().clone();
-
     rsx! {
         div { class: "dj-view",
             div { class: "decks-container",
-                DeckControl {
-                    deck_number: 1,
-                    state: deck1_state(),
-                    track: deck1_track_value.clone(),
-                    position: deck1_position(),
-                    volume: deck1_volume(),
-                    on_play: on_deck1_play,
-                    on_pause: on_deck1_pause,
-                    on_stop: on_deck1_stop,
-                    on_volume_change: on_deck1_volume,
-                    on_seek: on_deck1_seek,
-                    on_file_drop: |_| {}
-                }
-                DeckControl {
-                    deck_number: 2,
-                    state: deck2_state(),
-                    track: deck2_track_value.clone(),
-                    position: deck2_position(),
-                    volume: deck2_volume(),
-                    on_play: on_deck2_play,
-                    on_pause: on_deck2_pause,
-                    on_stop: on_deck2_stop,
-                    on_volume_change: on_deck2_volume,
-                    on_seek: on_deck2_seek,
-                    on_file_drop: |_| {}
+                for deck in app_state.decks() {
+                    DeckControl {
+                        deck_number: deck.number(),
+                        state: deck.state(),
+                        track: deck.track(),
+                        position: deck.position(),
+                        volume: deck.volume(),
+                        on_play: move |_| { deck.play() },
+                        on_pause: move |_| { deck.pause() },
+                        on_stop: move |_| { deck.stop() },
+                        on_volume_change: move |volume| { deck.set_volume(volume) },
+                        on_seek: move |position| { deck.seek(position) },
+                        on_file_drop: |_| {}
+                    }
                 }
             }
 

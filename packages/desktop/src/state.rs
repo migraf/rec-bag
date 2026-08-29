@@ -3,9 +3,11 @@
 //! Existing application behavior remains behind [`AppState`]. New Stage 3
 //! integration work belongs in the focused [`integration`] boundary.
 
+pub mod deck;
 pub mod integration;
 
 use crate::services::playback_bridge::resolve_track_path;
+use deck::{Deck, SharedAudio, DECK_COUNT};
 use dioxus::prelude::*;
 use rec_core::{
     analyze_track, AudioEngine, CanonicalTrack, Diagnosis, Doctor, Library, MetadataField,
@@ -78,8 +80,8 @@ pub type AnalysisReceiver = mpsc::Receiver<TrackAnalysisResult>;
 /// Global application state shared across all views.
 #[derive(Clone, Copy)]
 pub struct AppState {
-    /// Audio engine (wrapped in Arc<Mutex> for thread safety)
-    pub engine: Signal<Arc<StdMutex<AudioEngine>>>,
+    /// The playback decks, in deck order.
+    decks: [Deck; DECK_COUNT],
     /// SQLite storage backend
     pub storage: Signal<Option<Arc<SqliteStorage>>>,
     /// All playlists
@@ -109,10 +111,6 @@ pub struct AppState {
     pub analysis_tx: Signal<AnalysisSender>,
     /// Channel receiver for analysis results (wrapped in Arc<Mutex> for sharing)
     analysis_rx: Signal<Arc<StdMutex<AnalysisReceiver>>>,
-    /// Track loaded on deck 1 (shared across views)
-    pub deck1_track: Signal<Option<Track>>,
-    /// Track loaded on deck 2 (shared across views)
-    pub deck2_track: Signal<Option<Track>>,
     // ==================== Doctor State ====================
     /// Doctor instance for running diagnostics
     pub doctor: Signal<Arc<Doctor>>,
@@ -133,10 +131,12 @@ impl AppState {
     /// Create a new app state with initialized audio engine.
     pub fn new() -> Self {
         let engine = AudioEngine::two_deck().expect("Failed to initialize audio engine");
+        let audio: SharedAudio = Arc::new(StdMutex::new(engine));
+        let audio = Signal::new(audio);
         let (tx, rx) = mpsc::channel();
 
         Self {
-            engine: Signal::new(Arc::new(StdMutex::new(engine))),
+            decks: std::array::from_fn(|index| Deck::new(audio, index)),
             storage: Signal::new(None),
             playlists: Signal::new(Vec::new()),
             library_tracks: Signal::new(Vec::new()),
@@ -151,8 +151,6 @@ impl AppState {
             analyzing_tracks: Signal::new(HashSet::new()),
             analysis_tx: Signal::new(tx),
             analysis_rx: Signal::new(Arc::new(StdMutex::new(rx))),
-            deck1_track: Signal::new(None),
-            deck2_track: Signal::new(None),
             // Doctor state
             doctor: Signal::new(Arc::new(Doctor::new())),
             diagnoses: Signal::new(Vec::new()),
@@ -779,15 +777,35 @@ impl AppState {
 
     // ==================== Deck Operations ====================
 
+    /// Every deck, in deck order.
+    pub fn decks(&self) -> [Deck; DECK_COUNT] {
+        self.decks
+    }
+
+    /// The deck with the given user-facing number, counting from one.
+    pub fn deck(&self, number: usize) -> Option<Deck> {
+        number
+            .checked_sub(1)
+            .and_then(|index| self.decks.get(index))
+            .copied()
+    }
+
+    /// Re-read every deck's live state from the audio output.
+    pub fn refresh_decks(&self) {
+        for deck in self.decks {
+            deck.refresh();
+        }
+    }
+
     /// Queue a track for loading to deck 1 or 2.
     ///
     /// Canonical/provider assets are first materialized as verified local files. The
     /// resolved path is applied only to the clone sent to the audio engine; shared state
     /// retains the stable track identity and never persists a Drive cache path.
-    pub fn load_track_to_deck(mut self, mut track: Track, deck: usize) -> bool {
-        if !matches!(deck, 1 | 2) {
+    pub fn load_track_to_deck(self, mut track: Track, deck: usize) -> bool {
+        let Some(deck) = self.deck(deck) else {
             return false;
-        }
+        };
 
         let track_id = track.id;
 
@@ -816,22 +834,8 @@ impl AppState {
                 }
             };
 
-            let mut engine_track = track.clone();
-            engine_track.path = resolved.path.clone();
-            let loaded = if let Ok(mut engine) = (self.engine)().lock() {
-                engine.load_track(deck - 1, engine_track).is_ok()
-            } else {
-                false
-            };
-
-            if !loaded {
+            if !deck.load(track.clone(), resolved.path.clone()) {
                 return;
-            }
-
-            if deck == 1 {
-                self.deck1_track.set(Some(track.clone()));
-            } else {
-                self.deck2_track.set(Some(track.clone()));
             }
 
             if track.needs_analysis() {
@@ -844,7 +848,7 @@ impl AppState {
 
     /// Update deck track with analysis results (waveform, freq waveform, beat grid, BPM, key).
     pub fn update_deck_analysis(
-        mut self,
+        self,
         track_id: Uuid,
         peaks: Vec<f32>,
         freq_waveform: Option<FreqWaveformData>,
@@ -886,40 +890,12 @@ impl AppState {
             }
         }
 
-        // Update deck 1 if it has this track
-        let deck1_update = {
-            let track_opt = self.deck1_track.read().clone();
-            if let Some(mut track) = track_opt {
-                if track.id == track_id && track.needs_analysis() {
-                    apply_analysis(&mut track, &peaks, &freq_waveform, &beat_grid, bpm, &key);
-                    Some(track)
-                } else {
-                    None
+        for deck in self.decks {
+            deck.edit_track(track_id, |track| {
+                if track.needs_analysis() {
+                    apply_analysis(track, &peaks, &freq_waveform, &beat_grid, bpm, &key);
                 }
-            } else {
-                None
-            }
-        };
-        if let Some(track) = deck1_update {
-            self.deck1_track.set(Some(track));
-        }
-
-        // Update deck 2 if it has this track
-        let deck2_update = {
-            let track_opt = self.deck2_track.read().clone();
-            if let Some(mut track) = track_opt {
-                if track.id == track_id && track.needs_analysis() {
-                    apply_analysis(&mut track, &peaks, &freq_waveform, &beat_grid, bpm, &key);
-                    Some(track)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(track) = deck2_update {
-            self.deck2_track.set(Some(track));
+            });
         }
     }
 
@@ -1140,60 +1116,21 @@ impl AppState {
         drop(playlists);
 
         // Update deck tracks if loaded
-        let deck1_update = {
-            let deck1_track = self.deck1_track.read().clone();
-            if let Some(mut track) = deck1_track {
-                if track.id == track_id {
-                    track.update_metadata(
-                        title.clone(),
-                        artist.clone(),
-                        album.clone(),
-                        genre.clone(),
-                        bpm,
-                        key.clone(),
-                        year,
-                        track_number,
-                        comment.clone(),
-                        rating,
-                    );
-                    Some(track)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(track) = deck1_update {
-            self.deck1_track.set(Some(track));
-        }
-
-        let deck2_update = {
-            let deck2_track = self.deck2_track.read().clone();
-            if let Some(mut track) = deck2_track {
-                if track.id == track_id {
-                    track.update_metadata(
-                        title,
-                        artist,
-                        album,
-                        genre,
-                        bpm,
-                        key,
-                        year,
-                        track_number,
-                        comment,
-                        rating,
-                    );
-                    Some(track)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(track) = deck2_update {
-            self.deck2_track.set(Some(track));
+        for deck in self.decks {
+            deck.edit_track(track_id, |track| {
+                track.update_metadata(
+                    title.clone(),
+                    artist.clone(),
+                    album.clone(),
+                    genre.clone(),
+                    bpm,
+                    key.clone(),
+                    year,
+                    track_number,
+                    comment.clone(),
+                    rating,
+                );
+            });
         }
 
         self.mark_save_pending();
@@ -1340,18 +1277,12 @@ impl AppState {
             }
             drop(playlists);
 
-            for mut deck_track in [app_state.deck1_track, app_state.deck2_track] {
-                let should_clear = deck_track
-                    .read()
-                    .as_ref()
-                    .is_some_and(|track| track.id == track_id);
-                if should_clear {
-                    if let Some(track) = deck_track.write().as_mut() {
-                        track.waveform = None;
-                        track.freq_waveform = None;
-                        track.beat_grid = None;
-                    }
-                }
+            for deck in app_state.decks {
+                deck.edit_track(track_id, |track| {
+                    track.waveform = None;
+                    track.freq_waveform = None;
+                    track.beat_grid = None;
+                });
             }
 
             app_state.analyzing_tracks.write().remove(&track_id);
@@ -1491,7 +1422,14 @@ pub struct PlaylistRef {
 
 /// Provide the app state to the component tree.
 pub fn use_app_state_provider() {
-    use_context_provider(AppState::new);
+    let app_state = use_context_provider(AppState::new);
+    // One refresh loop feeds every view, so a deck reads the same wherever it is shown.
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            app_state.refresh_decks();
+        }
+    });
 }
 
 /// Get the app state from context.

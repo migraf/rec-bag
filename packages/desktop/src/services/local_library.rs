@@ -9,37 +9,33 @@ use std::{
     sync::Arc,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use music_storage_local::{is_recognized_audio_path, LocalMusicStorage, LocalStorageError};
 use rec_core::{
     AssetLocation, AssetLocationFilter, AssetRepository, AssetType, CanonicalPlaylist,
     CanonicalTrack, CatalogSource, CatalogSourceKind, ContentHash, HashAlgorithm, HealthStatus,
     InventoryGeneration, InventoryGenerationAbort, InventoryGenerationAbortKind,
     InventoryGenerationKind, InventoryGenerationStart, InventoryMode, InventoryRequest,
-    InventoryStagingPage, MatchCandidate, MetadataField, MetadataFieldValue, MetadataProvenance,
-    MetadataValue, MusicAssetStore, MusicStorage, MusicStorageError, MusicStorageErrorKind,
-    MusicStorageKind, MusicStorageRepository, OriginalAsset, OriginalAssetFilter,
-    OriginalAssetRole, PlaylistRepository, ReconciliationOutcome, ReconciliationRepository,
-    ReconciliationResolution, ReconciliationResolutionFilter, ReconciliationSuppression,
-    RepositoryError, RepositoryPageRequest, SourceAvailability, SourceCopyPolicy,
-    SourceOccurrenceFilter, SourceRepository, SourceTrackOccurrence, StorageObject,
-    StorageObjectTombstone, StorageRole, StorageVerificationStatus, SyncCheckpoint, SyncCursor,
-    SyncError, SyncErrorKind, SyncRun, SyncRunKind, SyncRunRepository, TrackRepository,
-    TrackStorageStatus, TransactionManager, UploadRequest,
+    InventoryStagingPage, MetadataField, MetadataFieldValue, MetadataProvenance, MetadataValue,
+    MusicAssetStore, MusicStorage, MusicStorageError, MusicStorageErrorKind, MusicStorageKind,
+    MusicStorageRepository, OriginalAsset, OriginalAssetFilter, OriginalAssetRole,
+    PlaylistRepository, ReconciliationRepository, ReconciliationResolution,
+    ReconciliationResolutionFilter, ReconciliationSuppression, RepositoryError,
+    RepositoryPageRequest, SourceAvailability, SourceCopyPolicy, SourceOccurrenceFilter,
+    SourceRepository, SourceTrackOccurrence, StorageObject, StorageObjectTombstone, StorageRole,
+    StorageVerificationStatus, SyncCheckpoint, SyncCursor, SyncError, SyncErrorKind, SyncRun,
+    SyncRunKind, SyncRunRepository, TrackRepository, TrackStorageStatus, TransactionManager,
+    UploadRequest,
 };
 use rec_persistence::TursoCatalog;
 use rec_sync::{
     reconcile, InventoryAvailability, ReconciliationInput, ReconciliationReport, StorageInventory,
 };
 use sha2::{Digest, Sha256};
-use ui::{
-    CompletenessView, ExternalChangeView, FailedReconciliationView, HealthTone, MatchCandidateView,
-    MusicManagementEvent, MusicManagementView, PlaylistCompletenessView, PrimaryConfigurationView,
-    ProviderChoice, SourceView, StorageRoleView, StorageView, TrackStorageStatusView,
-    TrackStorageView, UnknownPrimaryFileView,
-};
+use ui::{MusicManagementEvent, MusicManagementView, PrimaryConfigurationView, ProviderChoice};
 use uuid::Uuid;
 
+use super::catalog_projection::{CatalogViewBuilder, StorageProviders};
 use super::integration::{IntegrationFuture, IntegrationSliceHandler};
 use crate::state::integration::{
     IntegrationError, IntegrationOutcome, IntegrationRequest, IntegrationSlice,
@@ -1012,221 +1008,20 @@ impl LocalLibraryService {
         Err(LocalLibraryError::AssetNotFound(track_id))
     }
 
+    /// Reconcile the primary storage and project the whole catalog into the dashboard view.
+    ///
+    /// The projection covers every Catalog Source and Music Storage regardless of
+    /// provider; only storage health is limited to what this slice can probe.
     pub async fn project_view(&self) -> Result<MusicManagementView, LocalLibraryError> {
         let projection = self.reconcile_primary().await?;
-        let report = &projection.report;
-        let sources = self.list_sources().await?;
-        let storages = MusicStorageRepository::list(self.catalog.as_ref()).await?;
-        let tracks = self.list_tracks().await?;
-        let playlists = self.list_playlists().await?;
-        let track_by_id: HashMap<_, _> = tracks.iter().map(|track| (track.id, track)).collect();
-        let object_by_key: HashMap<_, _> = self
-            .all_storage_objects(&storages)
-            .await?
-            .into_iter()
-            .map(|object| ((object.storage_id, object.object_id.clone()), object))
-            .collect();
-        let active = self.catalog.get_active_primary().await?;
-        let mut source_views = Vec::new();
-        for source in sources {
-            let health = source_root(&source)
-                .ok()
-                .map(|path| {
-                    if path.is_dir() {
-                        HealthTone::Healthy
-                    } else {
-                        HealthTone::Offline
-                    }
-                })
-                .unwrap_or(HealthTone::Error);
-            source_views.push(SourceView {
-                id: source.id.to_string(),
-                provider: ProviderChoice::LocalFolder,
-                name: source.name,
-                account_identity: None,
-                detail: source.config.get(CONFIG_PATH).cloned().unwrap_or_default(),
-                health,
-                last_sync: source.last_synced_at.map(format_time),
-                next_sync: None,
-                progress: None,
-                warning: None,
-                error: None,
-                failed_sync_run_id: None,
-                collections: Vec::new(),
-                connected: true,
-            });
+        let providers = LocalStorageProviders;
+        Ok(CatalogViewBuilder {
+            catalog: self.catalog.as_ref(),
+            report: &projection.report,
+            providers: Some(&providers),
         }
-        let mut primary_storage = None;
-        let mut backup_storages = Vec::new();
-        let mut unassigned_storages = Vec::new();
-        for storage in storages
-            .iter()
-            .filter(|s| s.kind == MusicStorageKind::LocalDirectory)
-        {
-            let view = self.storage_view(storage).await;
-            match storage.role {
-                StorageRole::Primary if active.as_ref().is_some_and(|p| p.id == storage.id) => {
-                    primary_storage = Some(view)
-                }
-                StorageRole::Backup => backup_storages.push(view),
-                _ => unassigned_storages.push(view),
-            }
-        }
-        let status_by_track: HashMap<_, _> = report
-            .track_outcomes
-            .iter()
-            .map(|outcome| (outcome.track_id, outcome.status))
-            .collect();
-        let track_views = report
-            .track_outcomes
-            .iter()
-            .map(|outcome| {
-                let track = track_by_id.get(&outcome.track_id);
-                let status = status_view(outcome.status);
-                TrackStorageView {
-                    id: outcome.track_id.to_string(),
-                    title: track
-                        .and_then(|track| preferred_text(track, MetadataField::Title))
-                        .unwrap_or_else(|| "Unknown track".into()),
-                    artist: track
-                        .and_then(|track| preferred_text(track, MetadataField::Artist))
-                        .unwrap_or_else(|| "Unknown artist".into()),
-                    status,
-                    badges: vec![format!("{status:?}")],
-                    pinned_offline: false,
-                }
-            })
-            .collect();
-        let possible_matches = report
-            .candidates
-            .iter()
-            .map(|candidate| candidate_view(candidate, &track_by_id, &object_by_key))
-            .collect();
-        let unknown_primary_files = report
-            .results
-            .iter()
-            .filter(|result| result.outcome == ReconciliationOutcome::UntrackedStorageObject)
-            .map(|result| {
-                let object_id = result.storage_object_id.clone().unwrap_or_default();
-                let object = result
-                    .storage_id
-                    .and_then(|storage_id| object_by_key.get(&(storage_id, object_id.clone())));
-                UnknownPrimaryFileView {
-                    id: result.id.to_string(),
-                    filename: object
-                        .map(|value| value.name.clone())
-                        .unwrap_or_else(|| object_id.clone()),
-                    location: object
-                        .and_then(|value| value.display_path.clone())
-                        .unwrap_or(object_id),
-                    discovered_at: "Current inventory".into(),
-                }
-            })
-            .collect();
-        let external_changes = report
-            .results
-            .iter()
-            .filter(|result| result.outcome == ReconciliationOutcome::ChangedStorageObject)
-            .map(|result| ExternalChangeView {
-                result_id: result.id.to_string(),
-                name: result
-                    .storage_object_id
-                    .clone()
-                    .unwrap_or_else(|| "Changed object".into()),
-                detail: "The primary object changed outside rec_bag.".into(),
-            })
-            .collect();
-        let failed_reconciliations = report
-            .results
-            .iter()
-            .filter(|result| {
-                matches!(
-                    result.outcome,
-                    ReconciliationOutcome::Track(TrackStorageStatus::Error)
-                )
-            })
-            .map(|result| FailedReconciliationView {
-                result_id: result.id.to_string(),
-                name: result
-                    .track_id
-                    .and_then(|id| track_by_id.get(&id))
-                    .and_then(|track| preferred_text(track, MetadataField::Title))
-                    .unwrap_or_else(|| "Reconciliation failure".into()),
-                error: "Storage reconciliation failed".into(),
-            })
-            .collect();
-        let playlist_views = report
-            .playlist_outcomes
-            .iter()
-            .map(|outcome| {
-                let playlist = playlists
-                    .iter()
-                    .find(|playlist| playlist.id == outcome.playlist_id);
-                let needs_review = outcome
-                    .unique_track_ids
-                    .iter()
-                    .filter(|id| {
-                        status_by_track.get(id).is_some_and(|status| {
-                            matches!(
-                                status,
-                                TrackStorageStatus::PossibleMatch
-                                    | TrackStorageStatus::AmbiguousMatch
-                            )
-                        })
-                    })
-                    .count() as u32;
-                PlaylistCompletenessView {
-                    id: outcome.playlist_id.to_string(),
-                    name: playlist
-                        .map(|p| p.name.clone())
-                        .unwrap_or_else(|| "Playlist".into()),
-                    archived_tracks: outcome.summary.archived_tracks as u32,
-                    total_tracks: outcome.summary.archivable_tracks as u32,
-                    needs_review,
-                }
-            })
-            .collect();
-        let count = |status: TrackStorageStatus| {
-            report
-                .track_outcomes
-                .iter()
-                .filter(|outcome| outcome.status == status)
-                .count() as u32
-        };
-        Ok(MusicManagementView {
-            sources: source_views,
-            primary_storage,
-            backup_storages,
-            unassigned_storages,
-            completeness: CompletenessView {
-                canonical_tracks: report.summary.total_tracks as u32,
-                catalog_covered: report.summary.covered_tracks as u32,
-                verified_assets: report.summary.verified_assets as u32,
-                missing_obtainable: count(TrackStorageStatus::MissingObtainable),
-                streaming_only: count(TrackStorageStatus::NotAvailableForArchival),
-                restricted: count(TrackStorageStatus::Blocked)
-                    + count(TrackStorageStatus::Inaccessible),
-                possible_matches: count(TrackStorageStatus::PossibleMatch),
-                ambiguous_matches: count(TrackStorageStatus::AmbiguousMatch),
-                unknown_primary_files: report
-                    .results
-                    .iter()
-                    .filter(|result| {
-                        result.outcome == ReconciliationOutcome::UntrackedStorageObject
-                    })
-                    .count() as u32,
-                backup_gaps: 0,
-                provider_errors: count(TrackStorageStatus::Error)
-                    + count(TrackStorageStatus::StorageUnavailable),
-                playlists: playlist_views,
-            },
-            tracks: track_views,
-            possible_matches,
-            unknown_primary_files,
-            external_changes,
-            failed_reconciliations,
-            cleanup_candidates: Vec::new(),
-        })
+        .build()
+        .await?)
     }
 
     async fn reconciliation_input(
@@ -1313,35 +1108,6 @@ impl LocalLibraryService {
         }
         Ok(storage)
     }
-
-    async fn storage_view(&self, storage: &MusicStorage) -> StorageView {
-        let health = match local_adapter(storage) {
-            Ok(adapter) => adapter.health().await.ok(),
-            Err(_) => None,
-        };
-        StorageView {
-            id: storage.id.to_string(),
-            provider: ProviderChoice::LocalFolder,
-            name: storage.name.clone(),
-            location: storage.root_identifier.clone().unwrap_or_default(),
-            health: health
-                .as_ref()
-                .map(|health| health_tone(health.status))
-                .unwrap_or(HealthTone::Offline),
-            role: match storage.role {
-                StorageRole::Primary => StorageRoleView::Primary,
-                StorageRole::Backup => StorageRoleView::Backup,
-                StorageRole::Unassigned => StorageRoleView::Unassigned,
-            },
-            last_inventory: storage.last_inventory_at.map(format_time),
-            last_verified: None,
-            pending_jobs: 0,
-            failed_jobs: 0,
-            replication_mode: None,
-            retention_summary: None,
-        }
-    }
-
     async fn list_sources(&self) -> Result<Vec<CatalogSource>, RepositoryError> {
         let mut values = Vec::new();
         let mut cursor = None;
@@ -1544,17 +1310,6 @@ impl LocalLibraryService {
                 return Ok(values);
             }
         }
-    }
-
-    async fn all_storage_objects(
-        &self,
-        storages: &[MusicStorage],
-    ) -> Result<Vec<StorageObject>, RepositoryError> {
-        let mut values = Vec::new();
-        for storage in storages {
-            values.extend(self.list_storage_objects(storage.id).await?);
-        }
-        Ok(values)
     }
 }
 
@@ -1788,6 +1543,18 @@ fn source_root(source: &CatalogSource) -> Result<PathBuf, LocalLibraryError> {
         .ok_or_else(|| LocalLibraryError::InvalidRoot("local source has no path".into()))
 }
 
+/// Supplies stores for locally-backed Music Storages so the projection can probe
+/// their health. Storages of any other kind are left to the caller's fallback.
+struct LocalStorageProviders;
+
+impl StorageProviders for LocalStorageProviders {
+    fn store(&self, storage: &MusicStorage) -> Option<Arc<dyn MusicAssetStore>> {
+        local_adapter(storage)
+            .ok()
+            .map(|adapter| Arc::new(adapter) as Arc<dyn MusicAssetStore>)
+    }
+}
+
 fn local_adapter(storage: &MusicStorage) -> Result<LocalMusicStorage, LocalLibraryError> {
     if storage.kind != MusicStorageKind::LocalDirectory {
         return Err(LocalLibraryError::NotLocal);
@@ -1860,65 +1627,6 @@ fn enforce_copy_policy(
         _ => Ok(()),
     }
 }
-
-fn health_tone(status: HealthStatus) -> HealthTone {
-    match status {
-        HealthStatus::Healthy => HealthTone::Healthy,
-        HealthStatus::Degraded => HealthTone::Warning,
-        HealthStatus::Unavailable => HealthTone::Offline,
-        HealthStatus::AuthenticationRequired => HealthTone::Error,
-    }
-}
-
-fn status_view(status: TrackStorageStatus) -> TrackStorageStatusView {
-    match status {
-        TrackStorageStatus::StoredAndVerified => TrackStorageStatusView::StoredAndVerified,
-        TrackStorageStatus::MissingObtainable => TrackStorageStatusView::MissingObtainable,
-        TrackStorageStatus::PossibleMatch => TrackStorageStatusView::PossibleMatch,
-        TrackStorageStatus::AmbiguousMatch => TrackStorageStatusView::AmbiguousMatch,
-        TrackStorageStatus::NotAvailableForArchival => {
-            TrackStorageStatusView::NotAvailableForArchival
-        }
-        TrackStorageStatus::PreviewOnly => TrackStorageStatusView::PreviewOnly,
-        TrackStorageStatus::Blocked => TrackStorageStatusView::Blocked,
-        TrackStorageStatus::Removed => TrackStorageStatusView::Removed,
-        TrackStorageStatus::Inaccessible => TrackStorageStatusView::Inaccessible,
-        TrackStorageStatus::StorageUnavailable => TrackStorageStatusView::StorageUnavailable,
-        TrackStorageStatus::Error => TrackStorageStatusView::Error,
-        TrackStorageStatus::Ignored => TrackStorageStatusView::Ignored,
-    }
-}
-
-fn candidate_view(
-    candidate: &MatchCandidate,
-    tracks: &HashMap<Uuid, &CanonicalTrack>,
-    objects: &HashMap<(Uuid, String), StorageObject>,
-) -> MatchCandidateView {
-    let track_name = tracks
-        .get(&candidate.track_id)
-        .and_then(|track| preferred_text(track, MetadataField::Title))
-        .unwrap_or_else(|| "Unknown track".into());
-    let object = objects.get(&(candidate.storage_id, candidate.storage_object_id.clone()));
-    MatchCandidateView {
-        candidate_id: candidate.id.to_string(),
-        track_id: candidate.track_id.to_string(),
-        track_name,
-        candidate_name: object
-            .map(|value| value.name.clone())
-            .unwrap_or_else(|| candidate.storage_object_id.clone()),
-        evidence: candidate
-            .evidence
-            .iter()
-            .map(|evidence| format!("{:?}", evidence.method))
-            .collect::<Vec<_>>()
-            .join(", "),
-    }
-}
-
-fn format_time(value: DateTime<Utc>) -> String {
-    value.to_rfc3339()
-}
-
 fn parse_uuid(value: &str) -> Result<Uuid, LocalLibraryError> {
     Uuid::parse_str(value).map_err(|_| LocalLibraryError::InvalidIdentifier(value.into()))
 }

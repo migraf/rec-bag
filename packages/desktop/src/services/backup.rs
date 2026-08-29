@@ -54,6 +54,12 @@ pub struct BackupProviderRegistry {
     stores: RwLock<BTreeMap<Uuid, Arc<dyn MusicAssetStore>>>,
 }
 
+impl crate::services::catalog_projection::StorageProviders for BackupProviderRegistry {
+    fn store(&self, storage: &MusicStorage) -> Option<Arc<dyn MusicAssetStore>> {
+        self.get(storage.id).ok()
+    }
+}
+
 impl BackupProviderRegistry {
     pub fn register(
         &self,

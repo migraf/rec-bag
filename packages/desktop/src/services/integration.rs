@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use super::{
     backup::{BackupProviderRegistry, BackupService, RetentionReview},
+    catalog_projection::CatalogViewBuilder,
     google_drive::{
         DriveFolderSelection, DriveRuntimeFactory, DriveRuntimeRegistry, GoogleCredential,
         GoogleDriveFolderSelector, GoogleDrivePaths, GoogleDriveProvisioner, GoogleDriveService,
@@ -534,10 +535,9 @@ impl DesktopIntegration {
                 true,
             ));
         }
-        let mut view =
-            self.projector.project_view().await.map_err(|error| {
-                IntegrationError::for_request(&request, error.to_string(), true)
-            })?;
+        let mut view = self.project_catalog_view().await.map_err(|error| {
+            IntegrationError::for_request(&request, error.message, error.retryable)
+        })?;
         if matches!(
             request.event,
             ui::MusicManagementEvent::StartCleanupReview
@@ -762,10 +762,27 @@ impl DesktopIntegration {
     pub async fn initial_view(&self) -> Result<MusicManagementView, IntegrationError> {
         let _catalog_operation = self.catalog_operation_lock.lock().await;
         let _projection = self.projection_lock.lock().await;
-        self.projector
-            .project_view()
-            .await
-            .map_err(|error| startup_error(format!("Could not project the catalog: {error}")))
+        self.project_catalog_view().await
+    }
+
+    /// Project the catalog into the dashboard view.
+    ///
+    /// Reconciliation of the primary storage still belongs to the local slice, but the
+    /// view itself is provider-neutral: every Catalog Source and Music Storage is
+    /// included, and health is probed through each storage's registered store rather
+    /// than by asking one provider's slice to describe the others.
+    async fn project_catalog_view(&self) -> Result<MusicManagementView, IntegrationError> {
+        let projection = self.projector.reconcile_primary().await.map_err(|error| {
+            startup_error(format!("Could not reconcile the primary storage: {error}"))
+        })?;
+        CatalogViewBuilder {
+            catalog: self.catalog.as_ref(),
+            report: &projection.report,
+            providers: Some(self.backup_providers.as_ref()),
+        }
+        .build()
+        .await
+        .map_err(|error| startup_error(format!("Could not project the catalog: {error}")))
     }
 
     pub fn begin_shutdown(&self) {

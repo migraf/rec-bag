@@ -23,18 +23,17 @@ use music_storage_google_drive::{
 use music_storage_google_drive::{DriveHttpResponse, DriveTransportError};
 use rand::RngCore;
 use rec_core::{
-    AssetLocation, AssetLocationFilter, AssetRepository, BoxFuture, CatalogSourceKind, ContentHash,
-    DownloadRequest, HealthStatus, InventoryGenerationAbort, InventoryGenerationAbortKind,
-    InventoryGenerationKind, InventoryGenerationStart, InventoryMode, InventoryRequest,
-    InventoryStagingPage, MetadataField, MetadataValue, MusicAssetStore, MusicStorage,
-    MusicStorageError, MusicStorageErrorKind, MusicStorageKind, MusicStorageRepository,
-    OriginalAsset, OriginalAssetFilter, PlaylistRepository, ReconciliationOutcome,
+    AssetLocation, AssetLocationFilter, AssetRepository, BoxFuture, ContentHash, DownloadRequest,
+    HealthStatus, InventoryGenerationAbort, InventoryGenerationAbortKind, InventoryGenerationKind,
+    InventoryGenerationStart, InventoryMode, InventoryRequest, InventoryStagingPage,
+    MusicAssetStore, MusicStorage, MusicStorageError, MusicStorageErrorKind, MusicStorageKind,
+    MusicStorageRepository, OriginalAsset, OriginalAssetFilter, PlaylistRepository,
     ReconciliationRepository, ReconciliationResolutionFilter, RepositoryError, RepositoryErrorKind,
     RepositoryPageRequest, Setting, SettingsRepository, SourceOccurrenceFilter, SourceRepository,
     StorageCapabilities, StorageObject, StorageObjectTombstone, StorageRole,
     StorageVerificationStatus, SyncCheckpoint, SyncError, SyncErrorKind, SyncRun, SyncRunFilter,
-    SyncRunKind, SyncRunRepository, SyncStatus, TrackRepository, TrackStorageStatus,
-    TransactionManager, TransferCheckpoint, TransferStage, UploadRequest,
+    SyncRunKind, SyncRunRepository, SyncStatus, TrackRepository, TransactionManager,
+    TransferCheckpoint, TransferStage, UploadRequest,
 };
 use rec_persistence::TursoCatalog;
 use rec_sync::{
@@ -44,15 +43,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use ui::{
-    CompletenessView, ExternalChangeView, FailedReconciliationView, HealthTone, MatchCandidateView,
-    MusicManagementEvent, MusicManagementView, PlaylistCompletenessView, PrimaryConfigurationView,
-    ProviderChoice, SourceView, StorageRoleView, StorageView, TrackStorageStatusView,
-    TrackStorageView, UnknownPrimaryFileView,
-};
+use ui::{MusicManagementEvent, MusicManagementView, PrimaryConfigurationView, ProviderChoice};
 use url::Url;
 use uuid::Uuid;
 
+use super::catalog_projection::{CatalogViewBuilder, StorageProviders};
 use super::integration::{
     AssetFuture, AssetReference, AssetResolver, CredentialKey, CredentialStore, IntegrationFuture,
     IntegrationSliceHandler, ResolvedAsset, Secret,
@@ -784,6 +779,24 @@ pub trait DriveRuntimeFactory: Send + Sync {
     fn open<'a>(&'a self, storage: &'a MusicStorage) -> ServiceFuture<'a, Arc<dyn DriveRuntime>>;
 }
 
+/// Supplies stores for Drive-backed Music Storages so the projection can probe
+/// their health. Only already-opened runtimes are used, so projecting the view
+/// never triggers an authentication round-trip.
+struct DriveStorageProviders {
+    registry: Arc<DriveRuntimeRegistry>,
+}
+
+impl StorageProviders for DriveStorageProviders {
+    fn store(&self, storage: &MusicStorage) -> Option<Arc<dyn MusicAssetStore>> {
+        if storage.kind != MusicStorageKind::GoogleDrive {
+            return None;
+        }
+        self.registry
+            .get(storage.id)
+            .map(|runtime| runtime as Arc<dyn MusicAssetStore>)
+    }
+}
+
 pub struct DriveRuntimeRegistry {
     factory: Arc<dyn DriveRuntimeFactory>,
     runtimes: RwLock<BTreeMap<Uuid, Arc<dyn DriveRuntime>>>,
@@ -803,6 +816,11 @@ impl DriveRuntimeRegistry {
 
     pub fn remove(&self, storage_id: Uuid) {
         self.runtimes.write().unwrap().remove(&storage_id);
+    }
+
+    /// Runtime already opened for this storage, without opening one.
+    pub fn get(&self, storage_id: Uuid) -> Option<Arc<dyn DriveRuntime>> {
+        self.runtimes.read().unwrap().get(&storage_id).cloned()
     }
 
     pub async fn get_or_open(
@@ -1917,278 +1935,23 @@ impl GoogleDriveService {
         Ok(())
     }
 
+    /// Reconcile Drive storage and project the whole catalog into the dashboard view.
+    ///
+    /// The projection covers every Catalog Source and Music Storage regardless of
+    /// provider; only storage health is limited to what this slice can probe.
     pub async fn project_view(&self) -> Result<MusicManagementView, GoogleDriveServiceError> {
         let report = self.reconcile().await?;
-        let sources = self.list_sources().await?;
-        let storages = MusicStorageRepository::list(self.catalog.as_ref()).await?;
-        let active = MusicStorageRepository::get_active_primary(self.catalog.as_ref()).await?;
-        let tracks = self.list_tracks().await?;
-        let playlists = self.list_playlists().await?;
-        let track_by_id: BTreeMap<_, _> = tracks.iter().map(|track| (track.id, track)).collect();
-        let mut object_by_key = BTreeMap::new();
-        for storage in &storages {
-            for object in self.list_storage_objects(storage.id).await? {
-                object_by_key.insert((storage.id, object.object_id.clone()), object);
-            }
-        }
-        let source_views = sources
-            .into_iter()
-            .map(|source| SourceView {
-                id: source.id.to_string(),
-                provider: match source.kind {
-                    CatalogSourceKind::SoundCloud => ProviderChoice::SoundCloud,
-                    _ => ProviderChoice::LocalFolder,
-                },
-                name: source.name,
-                account_identity: None,
-                detail: source.config.values().next().cloned().unwrap_or_default(),
-                health: if source.enabled {
-                    HealthTone::Healthy
-                } else {
-                    HealthTone::Offline
-                },
-                last_sync: source.last_synced_at.map(format_time),
-                next_sync: None,
-                progress: None,
-                warning: None,
-                error: None,
-                failed_sync_run_id: None,
-                collections: Vec::new(),
-                connected: source.enabled,
-            })
-            .collect();
-        let mut primary_storage = None;
-        let mut backup_storages = Vec::new();
-        let mut unassigned_storages = Vec::new();
-        for storage in &storages {
-            let view = self.storage_view(storage).await;
-            match storage.role {
-                StorageRole::Primary
-                    if active.as_ref().is_some_and(|value| value.id == storage.id) =>
-                {
-                    primary_storage = Some(view)
-                }
-                StorageRole::Backup => backup_storages.push(view),
-                _ => unassigned_storages.push(view),
-            }
-        }
-        let status_by_track: BTreeMap<_, _> = report
-            .track_outcomes
-            .iter()
-            .map(|outcome| (outcome.track_id, outcome.status))
-            .collect();
-        let track_views = report
-            .track_outcomes
-            .iter()
-            .map(|outcome| {
-                let track = track_by_id.get(&outcome.track_id);
-                let status = status_view(outcome.status);
-                TrackStorageView {
-                    id: outcome.track_id.to_string(),
-                    title: track
-                        .and_then(|track| preferred_text(track, MetadataField::Title))
-                        .unwrap_or_else(|| "Unknown track".into()),
-                    artist: track
-                        .and_then(|track| preferred_text(track, MetadataField::Artist))
-                        .unwrap_or_else(|| "Unknown artist".into()),
-                    status,
-                    badges: vec![format!("{status:?}")],
-                    pinned_offline: false,
-                }
-            })
-            .collect();
-        let possible_matches = report
-            .candidates
-            .iter()
-            .map(|candidate| {
-                let object =
-                    object_by_key.get(&(candidate.storage_id, candidate.storage_object_id.clone()));
-                MatchCandidateView {
-                    candidate_id: candidate.id.to_string(),
-                    track_id: candidate.track_id.to_string(),
-                    track_name: track_by_id
-                        .get(&candidate.track_id)
-                        .and_then(|track| preferred_text(track, MetadataField::Title))
-                        .unwrap_or_else(|| "Unknown track".into()),
-                    candidate_name: object
-                        .map(|object| object.name.clone())
-                        .unwrap_or_else(|| candidate.storage_object_id.clone()),
-                    evidence: format!("{:?}", candidate.evidence),
-                }
-            })
-            .collect();
-        let unknown_primary_files = report
-            .results
-            .iter()
-            .filter(|result| result.outcome == ReconciliationOutcome::UntrackedStorageObject)
-            .map(|result| {
-                let object_id = result.storage_object_id.clone().unwrap_or_default();
-                let object = result
-                    .storage_id
-                    .and_then(|storage_id| object_by_key.get(&(storage_id, object_id.clone())));
-                UnknownPrimaryFileView {
-                    id: result.id.to_string(),
-                    filename: object
-                        .map(|object| object.name.clone())
-                        .unwrap_or_else(|| object_id.clone()),
-                    location: object
-                        .and_then(|object| object.display_path.clone())
-                        .unwrap_or(object_id),
-                    discovered_at: "Current inventory".into(),
-                }
-            })
-            .collect();
-        let external_changes = report
-            .results
-            .iter()
-            .filter(|result| result.outcome == ReconciliationOutcome::ChangedStorageObject)
-            .map(|result| ExternalChangeView {
-                result_id: result.id.to_string(),
-                name: result
-                    .storage_object_id
-                    .clone()
-                    .unwrap_or_else(|| "Changed object".into()),
-                detail: "The primary object changed outside rec_bag.".into(),
-            })
-            .collect();
-        let failed_reconciliations = report
-            .results
-            .iter()
-            .filter(|result| {
-                matches!(
-                    result.outcome,
-                    ReconciliationOutcome::Track(TrackStorageStatus::Error)
-                )
-            })
-            .map(|result| FailedReconciliationView {
-                result_id: result.id.to_string(),
-                name: result
-                    .track_id
-                    .and_then(|id| track_by_id.get(&id))
-                    .and_then(|track| preferred_text(track, MetadataField::Title))
-                    .unwrap_or_else(|| "Reconciliation failure".into()),
-                error: "Storage reconciliation failed".into(),
-            })
-            .collect();
-        let playlist_views = report
-            .playlist_outcomes
-            .iter()
-            .map(|outcome| PlaylistCompletenessView {
-                id: outcome.playlist_id.to_string(),
-                name: playlists
-                    .iter()
-                    .find(|playlist| playlist.id == outcome.playlist_id)
-                    .map(|playlist| playlist.name.clone())
-                    .unwrap_or_else(|| "Playlist".into()),
-                archived_tracks: outcome.summary.archived_tracks as u32,
-                total_tracks: outcome.summary.archivable_tracks as u32,
-                needs_review: outcome
-                    .unique_track_ids
-                    .iter()
-                    .filter(|id| {
-                        status_by_track.get(id).is_some_and(|status| {
-                            matches!(
-                                status,
-                                TrackStorageStatus::PossibleMatch
-                                    | TrackStorageStatus::AmbiguousMatch
-                            )
-                        })
-                    })
-                    .count() as u32,
-            })
-            .collect();
-        let count = |status| {
-            report
-                .track_outcomes
-                .iter()
-                .filter(|outcome| outcome.status == status)
-                .count() as u32
+        let providers = DriveStorageProviders {
+            registry: self.registry.clone(),
         };
-        Ok(MusicManagementView {
-            sources: source_views,
-            primary_storage,
-            backup_storages,
-            unassigned_storages,
-            completeness: CompletenessView {
-                canonical_tracks: report.summary.total_tracks as u32,
-                catalog_covered: report.summary.covered_tracks as u32,
-                verified_assets: report.summary.verified_assets as u32,
-                missing_obtainable: count(TrackStorageStatus::MissingObtainable),
-                streaming_only: count(TrackStorageStatus::NotAvailableForArchival),
-                restricted: count(TrackStorageStatus::Blocked)
-                    + count(TrackStorageStatus::Inaccessible),
-                possible_matches: count(TrackStorageStatus::PossibleMatch),
-                ambiguous_matches: count(TrackStorageStatus::AmbiguousMatch),
-                unknown_primary_files: report
-                    .results
-                    .iter()
-                    .filter(|result| {
-                        result.outcome == ReconciliationOutcome::UntrackedStorageObject
-                    })
-                    .count() as u32,
-                backup_gaps: 0,
-                provider_errors: count(TrackStorageStatus::Error)
-                    + count(TrackStorageStatus::StorageUnavailable),
-                playlists: playlist_views,
-            },
-            tracks: track_views,
-            possible_matches,
-            unknown_primary_files,
-            external_changes,
-            failed_reconciliations,
-            cleanup_candidates: Vec::new(),
-        })
-    }
-
-    async fn storage_view(&self, storage: &MusicStorage) -> StorageView {
-        let health = if storage.kind == MusicStorageKind::GoogleDrive {
-            match self.registry.get_or_open(storage).await {
-                Ok(runtime) => runtime
-                    .health()
-                    .await
-                    .ok()
-                    .map(|value| health_tone(value.status)),
-                Err(_) => None,
-            }
-        } else {
-            storage.enabled.then_some(HealthTone::Healthy)
-        };
-        StorageView {
-            id: storage.id.to_string(),
-            provider: if storage.kind == MusicStorageKind::GoogleDrive {
-                ProviderChoice::GoogleDrive
-            } else {
-                ProviderChoice::LocalFolder
-            },
-            name: storage.name.clone(),
-            location: storage
-                .config
-                .get(CONFIG_FOLDER_NAME)
-                .cloned()
-                .or_else(|| storage.root_identifier.clone())
-                .unwrap_or_default(),
-            health: health.unwrap_or(HealthTone::Offline),
-            role: match storage.role {
-                StorageRole::Primary => StorageRoleView::Primary,
-                StorageRole::Backup => StorageRoleView::Backup,
-                StorageRole::Unassigned => StorageRoleView::Unassigned,
-            },
-            last_inventory: storage.last_inventory_at.map(format_time),
-            last_verified: None,
-            pending_jobs: 0,
-            failed_jobs: 0,
-            replication_mode: (storage.role == StorageRole::Backup)
-                .then(|| format!("{:?}", storage.replication_mode)),
-            retention_summary: (storage.role == StorageRole::Backup).then(|| {
-                format!(
-                    "{} days / {} versions",
-                    storage.retention_policy.retention_days,
-                    storage.retention_policy.minimum_versions
-                )
-            }),
+        Ok(CatalogViewBuilder {
+            catalog: self.catalog.as_ref(),
+            report: &report,
+            providers: Some(&providers),
         }
+        .build()
+        .await?)
     }
-
     async fn storage(&self, id: Uuid) -> Result<MusicStorage, GoogleDriveServiceError> {
         let storage = MusicStorageRepository::get(self.catalog.as_ref(), id)
             .await?
@@ -2581,46 +2344,6 @@ fn parse_lifecycle_storage_id(value: &str) -> Result<Uuid, GoogleDriveServiceErr
         GoogleDriveServiceError::InvalidConfiguration(format!("invalid storage ID: {error}"))
     })
 }
-
-fn format_time(value: DateTime<Utc>) -> String {
-    value.format("%Y-%m-%d %H:%M UTC").to_string()
-}
-
-fn preferred_text(track: &rec_core::CanonicalTrack, field: MetadataField) -> Option<String> {
-    match &track.metadata.preferred(&field)?.value {
-        MetadataValue::Text(value) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn health_tone(status: HealthStatus) -> HealthTone {
-    match status {
-        HealthStatus::Healthy => HealthTone::Healthy,
-        HealthStatus::Degraded => HealthTone::Warning,
-        HealthStatus::AuthenticationRequired => HealthTone::Warning,
-        HealthStatus::Unavailable => HealthTone::Offline,
-    }
-}
-
-fn status_view(status: TrackStorageStatus) -> TrackStorageStatusView {
-    match status {
-        TrackStorageStatus::StoredAndVerified => TrackStorageStatusView::StoredAndVerified,
-        TrackStorageStatus::MissingObtainable => TrackStorageStatusView::MissingObtainable,
-        TrackStorageStatus::PossibleMatch => TrackStorageStatusView::PossibleMatch,
-        TrackStorageStatus::AmbiguousMatch => TrackStorageStatusView::AmbiguousMatch,
-        TrackStorageStatus::NotAvailableForArchival => {
-            TrackStorageStatusView::NotAvailableForArchival
-        }
-        TrackStorageStatus::PreviewOnly => TrackStorageStatusView::PreviewOnly,
-        TrackStorageStatus::Blocked => TrackStorageStatusView::Blocked,
-        TrackStorageStatus::Removed => TrackStorageStatusView::Removed,
-        TrackStorageStatus::Inaccessible => TrackStorageStatusView::Inaccessible,
-        TrackStorageStatus::StorageUnavailable => TrackStorageStatusView::StorageUnavailable,
-        TrackStorageStatus::Error => TrackStorageStatusView::Error,
-        TrackStorageStatus::Ignored => TrackStorageStatusView::Ignored,
-    }
-}
-
 fn verified_location(
     existing: Option<AssetLocation>,
     original: &OriginalAsset,

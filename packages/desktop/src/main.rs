@@ -8,7 +8,9 @@ use std::time::Duration;
 use services::integration::{DesktopIntegration, DesktopStartup};
 #[cfg(feature = "desktop")]
 use state::integration::IntegrationError;
-use state::{integration::use_integration_state_provider, use_app_state, use_app_state_provider};
+use state::{
+    deck::Deck, integration::use_integration_state_provider, use_app_state, use_app_state_provider,
+};
 use ui::{BeatGrid, DeckInfo, FrequencyWaveform, PlaybackBar, BASE_CSS};
 use views::{DjView, DoctorView, Library, MusicManagement};
 
@@ -148,9 +150,7 @@ fn DesktopNavbar() -> Element {
 
     // Check if any deck has a track for the playback bar
     // Don't show playback bar on DJ view since it has full deck controls
-    let deck1_track = app_state.deck1_track.read().clone();
-    let deck2_track = app_state.deck2_track.read().clone();
-    let has_any_track = deck1_track.is_some() || deck2_track.is_some();
+    let has_any_track = app_state.decks().iter().any(|deck| deck.track().is_some());
     let show_playback_bar = has_any_track && !is_dj;
 
     rsx! {
@@ -215,126 +215,45 @@ fn DesktopNavbar() -> Element {
     }
 }
 
-/// Wrapper component for the playback bar with reactive position updates.
+/// The playback bar, driven by the decks rather than by the audio engine directly.
 #[component]
 fn PlaybackBarWrapper() -> Element {
     let app_state = use_app_state();
-
-    // Reactive signals for deck positions
-    let mut deck1_position = use_signal(|| Duration::ZERO);
-    let mut deck2_position = use_signal(|| Duration::ZERO);
-    let mut deck1_playing = use_signal(|| false);
-    let mut deck2_playing = use_signal(|| false);
-
-    // Periodically update positions (every 50ms for smooth display)
-    use_future(move || async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-
-            if let Ok(eng) = app_state.engine.read().lock() {
-                // Update deck 1
-                if let Ok(deck) = eng.deck(0) {
-                    deck1_position.set(deck.position());
-                    deck1_playing.set(deck.state() == rec_core::DeckState::Playing);
-                }
-                // Update deck 2
-                if let Ok(deck) = eng.deck(1) {
-                    deck2_position.set(deck.position());
-                    deck2_playing.set(deck.state() == rec_core::DeckState::Playing);
-                }
-            }
-        }
-    });
-
-    // Build deck info from track state
-    let deck1_track = app_state.deck1_track.read().clone();
-    let deck2_track = app_state.deck2_track.read().clone();
-
-    let deck1_info = deck1_track
-        .map(|t| DeckInfo {
-            title: t.title.clone(),
-            artist: t.artist.clone(),
-            position: deck1_position(),
-            duration: t.duration.unwrap_or(Duration::ZERO),
-            is_playing: deck1_playing(),
-            waveform_peaks: t.waveform.as_ref().map(|w| w.peaks.clone()),
-            freq_waveform: t.freq_waveform.as_ref().map(|fw| FrequencyWaveform {
-                low: fw.low.clone(),
-                mid: fw.mid.clone(),
-                high: fw.high.clone(),
-            }),
-            beat_grid: t.beat_grid.as_ref().map(|bg| BeatGrid {
-                beats: bg.beats.clone(),
-            }),
-            bpm: t.bpm,
-        })
-        .unwrap_or_default();
-
-    let deck2_info = deck2_track
-        .map(|t| DeckInfo {
-            title: t.title.clone(),
-            artist: t.artist.clone(),
-            position: deck2_position(),
-            duration: t.duration.unwrap_or(Duration::ZERO),
-            is_playing: deck2_playing(),
-            waveform_peaks: t.waveform.as_ref().map(|w| w.peaks.clone()),
-            freq_waveform: t.freq_waveform.as_ref().map(|fw| FrequencyWaveform {
-                low: fw.low.clone(),
-                mid: fw.mid.clone(),
-                high: fw.high.clone(),
-            }),
-            beat_grid: t.beat_grid.as_ref().map(|bg| BeatGrid {
-                beats: bg.beats.clone(),
-            }),
-            bpm: t.bpm,
-        })
-        .unwrap_or_default();
+    let decks = app_state.decks();
 
     rsx! {
         PlaybackBar {
-            deck1: deck1_info,
-            deck2: deck2_info,
-            on_deck1_play_pause: move |_| {
-                if let Ok(mut eng) = app_state.engine.read().lock() {
-                    let is_playing = eng
-                        .deck(0)
-                        .map(|d| d.state() == rec_core::DeckState::Playing)
-                        .unwrap_or(false);
-                    if is_playing {
-                        let _ = eng.pause(0);
-                    } else {
-                        let _ = eng.play(0);
-                    }
-                }
-            },
-            on_deck2_play_pause: move |_| {
-                if let Ok(mut eng) = app_state.engine.read().lock() {
-                    let is_playing = eng
-                        .deck(1)
-                        .map(|d| d.state() == rec_core::DeckState::Playing)
-                        .unwrap_or(false);
-                    if is_playing {
-                        let _ = eng.pause(1);
-                    } else {
-                        let _ = eng.play(1);
-                    }
-                }
-            },
-            on_deck1_seek: move |pos: Duration| {
-                if let Ok(mut eng) = app_state.engine.read().lock() {
-                    let _ = eng.deck_mut(0).map(|d| d.seek(pos));
-                }
-                // Immediately update position signal for responsive UI
-                deck1_position.set(pos);
-            },
-            on_deck2_seek: move |pos: Duration| {
-                if let Ok(mut eng) = app_state.engine.read().lock() {
-                    let _ = eng.deck_mut(1).map(|d| d.seek(pos));
-                }
-                // Immediately update position signal for responsive UI
-                deck2_position.set(pos);
-            },
+            deck1: deck_info(&decks[0]),
+            deck2: deck_info(&decks[1]),
+            on_deck1_play_pause: move |_| { decks[0].toggle() },
+            on_deck2_play_pause: move |_| { decks[1].toggle() },
+            on_deck1_seek: move |position| { decks[0].seek(position) },
+            on_deck2_seek: move |position| { decks[1].seek(position) },
         }
+    }
+}
+
+/// Describe a deck's Loaded Track for the playback bar.
+fn deck_info(deck: &Deck) -> DeckInfo {
+    let Some(track) = deck.track() else {
+        return DeckInfo::default();
+    };
+    DeckInfo {
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        position: deck.position(),
+        duration: track.duration.unwrap_or(Duration::ZERO),
+        is_playing: deck.is_playing(),
+        waveform_peaks: track.waveform.as_ref().map(|w| w.peaks.clone()),
+        freq_waveform: track.freq_waveform.as_ref().map(|fw| FrequencyWaveform {
+            low: fw.low.clone(),
+            mid: fw.mid.clone(),
+            high: fw.high.clone(),
+        }),
+        beat_grid: track.beat_grid.as_ref().map(|bg| BeatGrid {
+            beats: bg.beats.clone(),
+        }),
+        bpm: track.bpm,
     }
 }
 
