@@ -285,568 +285,6 @@ async fn source_sync_and_refresh_metadata_commit_or_rollback_together() {
 }
 
 #[tokio::test]
-async fn snapshot_round_trip_and_integrity_rejection() {
-    let source_catalog = TursoCatalog::in_memory().await.unwrap();
-    let track = CanonicalTrack::new();
-    TrackRepository::upsert(&source_catalog, track.clone())
-        .await
-        .unwrap();
-    let mut playlist = CanonicalPlaylist::new("set");
-    playlist.replace_tracks([track.id, track.id]);
-    PlaylistRepository::upsert(&source_catalog, playlist.clone())
-        .await
-        .unwrap();
-    let source = CatalogSource::local_folder("crate", "/crate");
-    SourceRepository::upsert(&source_catalog, source.clone())
-        .await
-        .unwrap();
-    let mut occurrence = SourceTrackOccurrence::new(source.id, "external");
-    occurrence.canonical_track_id = Some(track.id);
-    source_catalog
-        .upsert_occurrences(vec![occurrence.clone()])
-        .await
-        .unwrap();
-    let snapshot = source_catalog.export_snapshot().await.unwrap();
-    source_catalog.put(snapshot.clone()).await.unwrap();
-
-    let restored = TursoCatalog::in_memory().await.unwrap();
-    restored.import_snapshot(&snapshot).await.unwrap();
-    assert_eq!(
-        TrackRepository::get(&restored, track.id).await.unwrap(),
-        Some(track)
-    );
-    assert_eq!(
-        PlaylistRepository::get(&restored, playlist.id)
-            .await
-            .unwrap(),
-        Some(playlist)
-    );
-    assert_eq!(
-        restored
-            .get_occurrence(source.id, "external".into())
-            .await
-            .unwrap(),
-        Some(occurrence)
-    );
-
-    let mut serialized = serde_json::to_value(&snapshot).unwrap();
-    serialized["payload"] = Value::Array(vec![Value::from(0)]);
-    let tampered: CatalogSnapshot = serde_json::from_value(serialized).unwrap();
-    assert!(!tampered.verify_integrity());
-    assert!(restored.import_snapshot(&tampered).await.is_err());
-    assert!(restored.put(tampered).await.is_err());
-}
-
-#[tokio::test]
-async fn replacement_import_removes_new_rows_and_restores_authority_and_owned_tables() {
-    let catalog = TursoCatalog::in_memory().await.unwrap();
-    let track = CanonicalTrack::new();
-    TrackRepository::upsert(&catalog, track.clone())
-        .await
-        .unwrap();
-    let primary = MusicStorage::new(
-        "primary",
-        MusicStorageKind::LocalDirectory,
-        StorageRole::Unassigned,
-        StorageCapabilities::default(),
-    );
-    MusicStorageRepository::upsert(&catalog, primary.clone())
-        .await
-        .unwrap();
-    catalog
-        .switch_active_primary(None, Some(primary.id))
-        .await
-        .unwrap();
-    let candidate = MatchCandidate::new(track.id, None, primary.id, "object", Vec::new());
-    let result = ReconciliationResult::new(ReconciliationOutcome::UntrackedStorageObject)
-        .with_track(track.id)
-        .with_storage_object(primary.id, "object")
-        .with_candidate(candidate.clone());
-    catalog.upsert_result(result.clone()).await.unwrap();
-    let resolution =
-        ReconciliationResolution::new(result.id, ReconciliationDecision::RejectCandidate)
-            .for_candidate(candidate.id);
-    let suppression = ReconciliationSuppression::from_resolution(&resolution).unwrap();
-    catalog
-        .record_resolution(resolution.clone(), Some(suppression.clone()))
-        .await
-        .unwrap();
-    let run = SyncRun::new(SyncRunKind::CatalogSync, None, None);
-    let job = SyncJob::new(
-        run.id,
-        SyncJobPayload::FetchCatalogPage {
-            version: SYNC_JOB_PAYLOAD_VERSION,
-            source_id: Uuid::new_v4(),
-            collection_key: "likes".into(),
-            sync_cursor: None,
-            page_cursor: None,
-        },
-    );
-    catalog
-        .create_run_with_jobs(run.clone(), vec![job.clone()])
-        .await
-        .unwrap();
-    catalog
-        .append_event(rec_sync::JobEvent {
-            id: Uuid::new_v4(),
-            job_id: Some(job.id),
-            run_id: run.id,
-            kind: rec_sync::JobEventKind::Planned,
-            at: Utc::now(),
-            message: None,
-            progress: None,
-            issue: None,
-        })
-        .await
-        .unwrap();
-    let trigger = SnapshotTrigger {
-        id: Uuid::new_v4(),
-        source_run_id: Some(run.id),
-        reason: "recovery".into(),
-        requested_at: Utc::now(),
-        completed_snapshot_id: None,
-    };
-    catalog.put_snapshot_trigger(trigger.clone()).await.unwrap();
-    let approval = CleanupApproval {
-        id: Uuid::new_v4(),
-        storage_id: primary.id,
-        object_id: "old-version".into(),
-        reason: Some("approved".into()),
-        approved_at: Utc::now(),
-        expires_at: None,
-        consumed_at: None,
-    };
-    catalog
-        .put_cleanup_approval(approval.clone())
-        .await
-        .unwrap();
-    let mut library_entry = LibraryEntry::new(track.id);
-    library_entry.rating = Some(5);
-    library_entry.record_play(Utc::now());
-    LibraryEntryRepository::upsert(&catalog, library_entry.clone())
-        .await
-        .unwrap();
-    let analysis = TrackAnalysis {
-        waveform: Some(WaveformPeaks {
-            peaks: vec![0.25, 0.5],
-        }),
-        bpm: Some(128.0),
-        ..TrackAnalysis::new(track.id)
-    };
-    TrackAnalysisRepository::upsert(&catalog, analysis.clone())
-        .await
-        .unwrap();
-    SettingsRepository::set(
-        &catalog,
-        Setting {
-            key: "snapshot-owned".into(),
-            value: Value::String("restored".into()),
-            updated_at: Utc::now(),
-        },
-    )
-    .await
-    .unwrap();
-
-    let historical = catalog.export_snapshot().await.unwrap();
-    let recovery = catalog.export_snapshot().await.unwrap();
-    let post_snapshot_track = CanonicalTrack::new();
-    TrackRepository::upsert(&catalog, post_snapshot_track.clone())
-        .await
-        .unwrap();
-    let replacement_primary = MusicStorage::new(
-        "later-primary",
-        MusicStorageKind::LocalDirectory,
-        StorageRole::Unassigned,
-        StorageCapabilities::default(),
-    );
-    MusicStorageRepository::upsert(&catalog, replacement_primary.clone())
-        .await
-        .unwrap();
-    catalog
-        .switch_active_primary(Some(primary.id), Some(replacement_primary.id))
-        .await
-        .unwrap();
-    SettingsRepository::set(
-        &catalog,
-        Setting {
-            key: "post-snapshot".into(),
-            value: Value::Bool(true),
-            updated_at: Utc::now(),
-        },
-    )
-    .await
-    .unwrap();
-
-    catalog.replace_from_snapshot(&recovery).await.unwrap();
-    assert!(TrackRepository::get(&catalog, post_snapshot_track.id)
-        .await
-        .unwrap()
-        .is_none());
-    assert!(SettingsRepository::get(&catalog, "post-snapshot".into())
-        .await
-        .unwrap()
-        .is_none());
-    assert_eq!(
-        catalog.get_active_primary().await.unwrap().unwrap().id,
-        primary.id
-    );
-    assert_eq!(catalog.load_job(job.id).await.unwrap(), Some(job));
-    assert_eq!(catalog.list_events(run.id).await.unwrap().len(), 1);
-    assert_eq!(
-        catalog.list_snapshot_triggers().await.unwrap(),
-        vec![trigger]
-    );
-    assert_eq!(
-        catalog
-            .get_cleanup_approval(primary.id, "old-version")
-            .await
-            .unwrap(),
-        Some(approval)
-    );
-    assert_eq!(
-        LibraryEntryRepository::get(&catalog, track.id)
-            .await
-            .unwrap(),
-        Some(library_entry)
-    );
-    assert_eq!(
-        TrackAnalysisRepository::get(&catalog, track.id)
-            .await
-            .unwrap(),
-        Some(analysis)
-    );
-    assert_eq!(
-        catalog.get_resolution(resolution.id).await.unwrap(),
-        Some(resolution)
-    );
-    assert_eq!(
-        catalog
-            .list_suppressions(
-                ReconciliationResolutionFilter::default(),
-                RepositoryPageRequest::default(),
-            )
-            .await
-            .unwrap()
-            .items,
-        vec![suppression]
-    );
-    let snapshots = CatalogSnapshotRepository::list(&catalog, RepositoryPageRequest::default())
-        .await
-        .unwrap();
-    assert_eq!(snapshots.items, vec![historical]);
-}
-
-#[tokio::test]
-async fn replacement_import_late_failure_rolls_back_the_exact_pre_restore_state() {
-    let catalog = TursoCatalog::in_memory().await.unwrap();
-    let snapshot_track = CanonicalTrack::new();
-    TrackRepository::upsert(&catalog, snapshot_track.clone())
-        .await
-        .unwrap();
-    let recovery = catalog.export_snapshot().await.unwrap();
-
-    let existing_track = CanonicalTrack::new();
-    TrackRepository::upsert(&catalog, existing_track.clone())
-        .await
-        .unwrap();
-    let storage = MusicStorage::new(
-        "current-primary",
-        MusicStorageKind::LocalDirectory,
-        StorageRole::Unassigned,
-        StorageCapabilities::default(),
-    );
-    MusicStorageRepository::upsert(&catalog, storage.clone())
-        .await
-        .unwrap();
-    catalog
-        .switch_active_primary(None, Some(storage.id))
-        .await
-        .unwrap();
-    SettingsRepository::set(
-        &catalog,
-        Setting {
-            key: "pre-restore".into(),
-            value: Value::String("must-survive".into()),
-            updated_at: Utc::now(),
-        },
-    )
-    .await
-    .unwrap();
-    let snapshot_count_before =
-        CatalogSnapshotRepository::list(&catalog, RepositoryPageRequest::default())
-            .await
-            .unwrap()
-            .items
-            .len();
-
-    let mut payload: Value = serde_json::from_slice(recovery.payload()).unwrap();
-    payload["active_primary_storage_id"] = Value::String(Uuid::new_v4().to_string());
-    let invalid = CatalogSnapshot::new(
-        SNAPSHOT_FORMAT_VERSION,
-        SNAPSHOT_CONTENT_TYPE,
-        serde_json::to_vec(&payload).unwrap(),
-    );
-    assert!(catalog.replace_from_snapshot(&invalid).await.is_err());
-    assert_eq!(
-        TrackRepository::get(&catalog, existing_track.id)
-            .await
-            .unwrap(),
-        Some(existing_track)
-    );
-    assert_eq!(
-        catalog.get_active_primary().await.unwrap().unwrap().id,
-        storage.id
-    );
-    assert_eq!(
-        SettingsRepository::get(&catalog, "pre-restore".into())
-            .await
-            .unwrap()
-            .unwrap()
-            .value,
-        Value::String("must-survive".into())
-    );
-    assert_eq!(
-        CatalogSnapshotRepository::list(&catalog, RepositoryPageRequest::default())
-            .await
-            .unwrap()
-            .items
-            .len(),
-        snapshot_count_before
-    );
-}
-
-#[tokio::test]
-async fn interrupted_replace_transaction_rolls_back_and_legacy_documents_still_import() {
-    let catalog = TursoCatalog::in_memory().await.unwrap();
-    let track = CanonicalTrack::new();
-    TrackRepository::upsert(&catalog, track.clone())
-        .await
-        .unwrap();
-    let transaction = catalog.begin_catalog_transaction().await.unwrap();
-    crate::repositories::clear_snapshot_owned_tables(transaction.as_ref())
-        .await
-        .unwrap();
-    transaction.rollback().await.unwrap();
-    assert_eq!(
-        TrackRepository::get(&catalog, track.id).await.unwrap(),
-        Some(track.clone())
-    );
-
-    let current = catalog.export_snapshot().await.unwrap();
-    let mut legacy: Value = serde_json::from_slice(current.payload()).unwrap();
-    for field in [
-        "active_primary_storage_id",
-        "catalog_snapshots",
-        "snapshot_triggers",
-        "cleanup_approvals",
-        "library_entries",
-        "track_analysis",
-    ] {
-        legacy.as_object_mut().unwrap().remove(field);
-    }
-    let compatible = CatalogSnapshot::new(
-        SNAPSHOT_FORMAT_VERSION,
-        SNAPSHOT_CONTENT_TYPE,
-        serde_json::to_vec(&legacy).unwrap(),
-    );
-    let restored = TursoCatalog::in_memory().await.unwrap();
-    restored.import_snapshot(&compatible).await.unwrap();
-    assert_eq!(
-        TrackRepository::get(&restored, track.id).await.unwrap(),
-        Some(track)
-    );
-    assert!(restored.get_active_primary().await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn snapshot_export_policy_excludes_secrets_capability_urls_and_transient_state() {
-    const TOKEN: &str = "token-value-MUST-NOT-EXPORT";
-    const CODE: &str = "authorization-code-MUST-NOT-EXPORT";
-    const VERIFIER: &str = "pkce-verifier-MUST-NOT-EXPORT";
-    const AUTHORIZATION: &str = "Authorization: Bearer header-MUST-NOT-EXPORT";
-    const SESSION_URI: &str = "https://upload.example/upload/session/capability-MUST-NOT-EXPORT";
-    const LOCAL_PATH: &str = "/tmp/private-staging-MUST-NOT-EXPORT.flac";
-    const MESSAGE: &str = "provider said Bearer message-MUST-NOT-EXPORT";
-
-    let catalog = TursoCatalog::in_memory().await.unwrap();
-    let mut source = CatalogSource::local_folder("source", "/music");
-    source.config.insert("access_token".into(), TOKEN.into());
-    source
-        .config
-        .insert("diagnostic_header".into(), AUTHORIZATION.into());
-    SourceRepository::upsert(&catalog, source.clone())
-        .await
-        .unwrap();
-
-    let mut storage = MusicStorage::new(
-        "storage",
-        MusicStorageKind::Other("test".into()),
-        StorageRole::Unassigned,
-        StorageCapabilities::default(),
-    );
-    storage
-        .config
-        .insert("session_uri".into(), SESSION_URI.into());
-    storage
-        .config
-        .insert("safe_region".into(), "eu-central".into());
-    MusicStorageRepository::upsert(&catalog, storage.clone())
-        .await
-        .unwrap();
-
-    for (key, value) in [
-        ("oauth.token", Value::String(TOKEN.into())),
-        ("oauth.code", Value::String(CODE.into())),
-        ("pkce.verifier", Value::String(VERIFIER.into())),
-        ("http.Authorization", Value::String(AUTHORIZATION.into())),
-        (
-            "google_drive.upload.storage.asset.operation",
-            serde_json::json!({ "session_uri": SESSION_URI }),
-        ),
-        (
-            "backup.retention_review.v1",
-            serde_json::json!({ "status": "safe-retention" }),
-        ),
-    ] {
-        catalog
-            .set(Setting {
-                key: key.into(),
-                value,
-                updated_at: Utc::now(),
-            })
-            .await
-            .unwrap();
-    }
-
-    let mut run = SyncRun::new(SyncRunKind::CatalogSync, Some(source.id), None);
-    run.checkpoint = Some(SyncCheckpoint::new(0).with_last_item(LOCAL_PATH));
-    run.error = Some(SyncError::new(
-        SyncErrorKind::Provider,
-        "provider_error",
-        MESSAGE,
-        true,
-    ));
-    run.issues.push(SyncIssue::new(
-        SyncIssueSeverity::Warning,
-        SyncErrorKind::Provider,
-        "provider_warning",
-        AUTHORIZATION,
-        true,
-    ));
-    let local_job = SyncJob::new(
-        run.id,
-        SyncJobPayload::UploadAsset {
-            version: SYNC_JOB_PAYLOAD_VERSION,
-            asset_id: Uuid::new_v4(),
-            source_path: LOCAL_PATH.into(),
-            destination_storage_id: storage.id,
-            destination_object_key: "music/file.flac".into(),
-        },
-    );
-    let mut safe_job = SyncJob::new(
-        run.id,
-        SyncJobPayload::FetchCatalogPage {
-            version: SYNC_JOB_PAYLOAD_VERSION,
-            source_id: source.id,
-            collection_key: "likes".into(),
-            sync_cursor: None,
-            page_cursor: None,
-        },
-    );
-    safe_job.checkpoint = Some(SyncCheckpoint::new(0).with_last_item(LOCAL_PATH));
-    safe_job.error = Some(SyncError::new(
-        SyncErrorKind::Authentication,
-        "auth_failed",
-        MESSAGE,
-        false,
-    ));
-    safe_job.issues.push(SyncIssue::new(
-        SyncIssueSeverity::Error,
-        SyncErrorKind::Authentication,
-        "auth_issue",
-        AUTHORIZATION,
-        false,
-    ));
-    catalog
-        .create_run_with_jobs(run.clone(), vec![local_job.clone(), safe_job.clone()])
-        .await
-        .unwrap();
-    catalog
-        .append_event(rec_sync::JobEvent {
-            id: Uuid::new_v4(),
-            job_id: Some(safe_job.id),
-            run_id: run.id,
-            kind: rec_sync::JobEventKind::Failed,
-            at: Utc::now(),
-            message: Some(MESSAGE.into()),
-            progress: None,
-            issue: Some(SyncIssue::new(
-                SyncIssueSeverity::Error,
-                SyncErrorKind::Authorization,
-                "authorization",
-                AUTHORIZATION,
-                false,
-            )),
-        })
-        .await
-        .unwrap();
-
-    let snapshot = catalog.export_snapshot().await.unwrap();
-    let payload = String::from_utf8(snapshot.payload().to_vec()).unwrap();
-    for forbidden in [
-        TOKEN,
-        CODE,
-        VERIFIER,
-        AUTHORIZATION,
-        SESSION_URI,
-        LOCAL_PATH,
-        MESSAGE,
-    ] {
-        assert!(!payload.contains(forbidden), "snapshot leaked {forbidden}");
-    }
-    assert!(payload.contains("safe-retention"));
-    assert!(payload.contains("eu-central"));
-
-    let restored = TursoCatalog::in_memory().await.unwrap();
-    restored.import_snapshot(&snapshot).await.unwrap();
-    assert!(SettingsRepository::get(&restored, "oauth.token".into())
-        .await
-        .unwrap()
-        .is_none());
-    assert!(SettingsRepository::get(
-        &restored,
-        "google_drive.upload.storage.asset.operation".into(),
-    )
-    .await
-    .unwrap()
-    .is_none());
-    assert!(
-        SettingsRepository::get(&restored, "backup.retention_review.v1".into())
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(restored.load_job(local_job.id).await.unwrap().is_none());
-    let restored_job = restored.load_job(safe_job.id).await.unwrap().unwrap();
-    assert!(restored_job.checkpoint.is_none());
-    assert_eq!(
-        restored_job.error.unwrap().message,
-        crate::repositories::SNAPSHOT_REDACTED_MESSAGE
-    );
-    assert_eq!(restored.list_events(run.id).await.unwrap().len(), 1);
-    let restored_source = SourceRepository::get(&restored, source.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!restored_source.config.contains_key("access_token"));
-    let restored_storage = MusicStorageRepository::get(&restored, storage.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!restored_storage.config.contains_key("session_uri"));
-}
-
-#[tokio::test]
 async fn setting_delete_supports_transient_lifecycle_cleanup() {
     let catalog = TursoCatalog::in_memory().await.unwrap();
     catalog
@@ -910,8 +348,6 @@ async fn source_provider_deletion_preserves_canonical_tracks_and_owned_assets() 
     SyncRunRepository::upsert(&catalog, run.clone())
         .await
         .unwrap();
-    catalog.export_snapshot().await.unwrap();
-
     catalog
         .delete_source_provider_data(source.id)
         .await
@@ -946,13 +382,6 @@ async fn source_provider_deletion_preserves_canonical_tracks_and_owned_assets() 
         MetadataOrigin::User
     );
     assert_eq!(catalog.get_original(asset.id()).await.unwrap(), Some(asset));
-    assert!(
-        CatalogSnapshotRepository::list(&catalog, RepositoryPageRequest::default())
-            .await
-            .unwrap()
-            .items
-            .is_empty()
-    );
 }
 
 #[tokio::test]
@@ -1034,8 +463,6 @@ async fn storage_provider_deletion_preserves_owned_assets_and_canonical_tracks()
     )
     .await
     .unwrap();
-    catalog.export_snapshot().await.unwrap();
-
     catalog
         .delete_storage_provider_data(storage.id)
         .await
@@ -1071,13 +498,6 @@ async fn storage_provider_deletion_preserves_owned_assets_and_canonical_tracks()
         .await
         .unwrap()
         .is_none());
-    assert!(
-        CatalogSnapshotRepository::list(&catalog, RepositoryPageRequest::default())
-            .await
-            .unwrap()
-            .items
-            .is_empty()
-    );
 }
 
 #[tokio::test]
@@ -1627,33 +1047,7 @@ async fn cancellation_requests_and_terminal_events_are_semantically_idempotent()
 }
 
 #[tokio::test]
-async fn logical_snapshot_fingerprint_excludes_timestamps_and_job_churn() {
-    let first = TursoCatalog::in_memory().await.unwrap();
-    let second = TursoCatalog::in_memory().await.unwrap();
-    let mut track_a = CanonicalTrack::new();
-    let mut track_b = track_a.clone();
-    track_a.updated_at = track_a.updated_at + chrono::Duration::hours(1);
-    track_b.updated_at = track_b.updated_at + chrono::Duration::hours(2);
-    TrackRepository::upsert(&first, track_a).await.unwrap();
-    TrackRepository::upsert(&second, track_b).await.unwrap();
-    let run = SyncRun::new(SyncRunKind::CatalogSync, None, None);
-    first.create_run_with_jobs(run, Vec::new()).await.unwrap();
-    let snapshot_a = first.export_snapshot().await.unwrap();
-    let snapshot_b = second.export_snapshot().await.unwrap();
-    assert_eq!(
-        first
-            .logical_snapshot_fingerprint(snapshot_a.id)
-            .await
-            .unwrap(),
-        second
-            .logical_snapshot_fingerprint(snapshot_b.id)
-            .await
-            .unwrap()
-    );
-}
-
-#[tokio::test]
-async fn snapshot_triggers_and_cleanup_approvals_are_persisted() {
+async fn cleanup_approvals_are_persisted() {
     let catalog = TursoCatalog::in_memory().await.unwrap();
     let storage = MusicStorage::new(
         "storage",
@@ -1664,18 +1058,6 @@ async fn snapshot_triggers_and_cleanup_approvals_are_persisted() {
     MusicStorageRepository::upsert(&catalog, storage.clone())
         .await
         .unwrap();
-    let trigger = SnapshotTrigger {
-        id: Uuid::new_v4(),
-        source_run_id: None,
-        reason: "before cleanup".into(),
-        requested_at: Utc::now(),
-        completed_snapshot_id: None,
-    };
-    catalog.put_snapshot_trigger(trigger.clone()).await.unwrap();
-    assert_eq!(
-        catalog.list_snapshot_triggers().await.unwrap(),
-        vec![trigger]
-    );
     let approval = CleanupApproval {
         id: Uuid::new_v4(),
         storage_id: storage.id,
@@ -1696,4 +1078,207 @@ async fn snapshot_triggers_and_cleanup_approvals_are_persisted() {
             .unwrap(),
         Some(approval)
     );
+}
+
+/// A track finishing analysis while a background slice is writing must not lose its
+/// result. Turso rejects overlapping use of one connection outright, so before the
+/// catalog gated its operations this failed with `concurrent use forbidden`, and the
+/// multi-statement writes could interleave halfway through a `BEGIN IMMEDIATE` block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_operations_never_share_a_connection() {
+    let directory = tempfile::tempdir().unwrap();
+    let catalog = std::sync::Arc::new(
+        TursoCatalog::open(directory.path().join("catalog.db"))
+            .await
+            .unwrap(),
+    );
+
+    let track_ids: Vec<Uuid> = (0..24).map(|_| Uuid::new_v4()).collect();
+    for id in &track_ids {
+        let mut track = CanonicalTrack::new();
+        track.id = *id;
+        TrackRepository::upsert(catalog.as_ref(), track)
+            .await
+            .unwrap();
+    }
+
+    let mut handles = Vec::new();
+    for (index, track_id) in track_ids.into_iter().enumerate() {
+        let catalog = catalog.clone();
+        handles.push(tokio::spawn(async move {
+            match index % 4 {
+                // The reported failure: saving an analysis result off the analysis thread.
+                0 => {
+                    TrackAnalysisRepository::upsert(catalog.as_ref(), TrackAnalysis::new(track_id))
+                        .await
+                }
+                // A multi-statement write, which brackets itself in BEGIN IMMEDIATE.
+                1 => {
+                    PlaylistRepository::upsert(
+                        catalog.as_ref(),
+                        CanonicalPlaylist {
+                            id: Uuid::new_v4(),
+                            name: format!("playlist {index}"),
+                            description: None,
+                            entries: vec![CanonicalPlaylistEntry {
+                                position: 0,
+                                track_id,
+                            }],
+                            created_at: Utc::now(),
+                            updated_at: Utc::now(),
+                        },
+                    )
+                    .await
+                }
+                // An explicit transaction, which runs on a connection of its own.
+                2 => {
+                    let transaction = catalog.begin().await?;
+                    transaction
+                        .library_entries()
+                        .upsert(LibraryEntry::new(track_id))
+                        .await?;
+                    transaction.commit().await
+                }
+                // A read racing all of the above.
+                _ => TrackRepository::get(catalog.as_ref(), track_id)
+                    .await
+                    .map(|_| ()),
+            }
+        }));
+    }
+
+    let mut failures = Vec::new();
+    for handle in handles {
+        if let Err(error) = handle.await.unwrap() {
+            failures.push(error.to_string());
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "catalog operations failed: {failures:#?}"
+    );
+}
+
+/// Every gated operation holds the catalog gate for its whole body, and the gate is not
+/// reentrant: one gated operation calling another waits forever on a gate it is already
+/// holding, and the catalog never serves anything again. The mistake is invisible at the
+/// call site — `upsert_result` calling `upsert_candidate` reads perfectly well — so the
+/// rule is checked here rather than left to review.
+///
+/// A gated operation reaches another one's work through the shared free helpers instead
+/// (`get_payload`, `upsert_match_candidate`, `upsert_music_storage`, and friends), which
+/// take the backend and issue SQL without touching the gate. So the two shapes banned
+/// here are the two that reach a gated method: `self.method(...)` and
+/// `SomeRepository::method(self, ...)`.
+#[test]
+fn gated_operations_never_call_one_another() {
+    let source = include_str!("repositories.rs");
+    let macro_body = source
+        .split_once("macro_rules! impl_repositories {")
+        .expect("the repository macro")
+        .1;
+
+    let identifier_before = |text: &str| -> String {
+        text.chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect()
+    };
+
+    let mut offenders = Vec::new();
+    for method in macro_body.split("Box::pin(async move{").skip(1) {
+        // A gated body opens with the gate; anything else in the macro is a free helper.
+        let Some(body) = method.strip_prefix(" let _gate = self.enter().await;") else {
+            continue;
+        };
+        let body = &body[..body.find("})}").unwrap_or(body.len())];
+
+        // `SomeRepository::method(self, ...)` — a trait method, and so gated.
+        for (index, _) in body.match_indices("(self,") {
+            let callee = identifier_before(&body[..index]);
+            if callee.contains("::") {
+                offenders.push(callee);
+            }
+        }
+        // `self.method(...)`, except the two the gating itself uses.
+        for (index, _) in body.match_indices("self.") {
+            let rest = &body[index + "self.".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if rest[name.len()..].starts_with('(') && name != "db" && name != "enter" {
+                offenders.push(name);
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these gated repository operations call another gated operation and would deadlock: {offenders:?}"
+    );
+}
+
+/// A catalog carrying the retired snapshot tables loses them, and the snapshot runs with
+/// them: `SyncRunKind::CatalogSnapshot` no longer exists, so leaving those rows behind
+/// would break every later read of `sync_runs`.
+#[tokio::test]
+async fn opening_a_v3_catalog_retires_its_snapshot_tables_and_runs() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("v3.db");
+    let database = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE catalog_schema_version(singleton INTEGER PRIMARY KEY,version INTEGER NOT NULL,updated_at TEXT NOT NULL);\
+             INSERT INTO catalog_schema_version VALUES(1,3,'2026-01-01T00:00:00Z');\
+             CREATE TABLE sync_runs(id TEXT PRIMARY KEY,payload TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);\
+             CREATE TABLE catalog_snapshots(id TEXT PRIMARY KEY,content_hash TEXT NOT NULL UNIQUE,logical_fingerprint TEXT,created_at TEXT NOT NULL,payload TEXT NOT NULL);\
+             CREATE TABLE snapshot_triggers(id TEXT PRIMARY KEY,source_run_id TEXT,requested_at TEXT NOT NULL,completed_snapshot_id TEXT,payload TEXT NOT NULL);\
+             INSERT INTO catalog_snapshots VALUES('a','hash-a',NULL,'2026-01-01T00:00:00Z','{\"huge\":true}');\
+             INSERT INTO snapshot_triggers VALUES('t',NULL,'2026-01-01T00:00:00Z',NULL,'{}');",
+        )
+        .await
+        .unwrap();
+    let retired_run_id = Uuid::new_v4();
+    connection
+        .execute(
+            "INSERT INTO sync_runs VALUES(?1,?2,?3,?4)",
+            (
+                retired_run_id.to_string(),
+                r#"{"id":"00000000-0000-0000-0000-000000000000","kind":"catalog_snapshot"}"#,
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        .await
+        .unwrap();
+    drop(connection);
+
+    let catalog = TursoCatalog::open(&path).await.unwrap();
+    for table in ["catalog_snapshots", "snapshot_triggers"] {
+        let mut rows = catalog
+            .connection()
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_none(),
+            "{table} should have been dropped"
+        );
+    }
+    // The read would fail outright if a catalog_snapshot run had survived.
+    assert!(SyncRunRepository::get(&catalog, retired_run_id)
+        .await
+        .unwrap()
+        .is_none());
 }

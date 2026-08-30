@@ -33,7 +33,6 @@ pub enum ScheduledTask {
     ScheduledBackup,
     DailyVerification,
     MonthlyInventory,
-    DailySnapshot,
 }
 
 /// Result of one bounded task invocation.
@@ -254,24 +253,6 @@ where
                         made_progress: matches!(
                             outcome,
                             BackupSchedulerOutcome::VerificationRun(Some(_))
-                        ),
-                        next_due: None,
-                    })
-                }
-                ScheduledTask::DailySnapshot => {
-                    let outcome = self
-                        .backup
-                        .handle_scheduler_hook(
-                            BackupSchedulerHook::DailySnapshot,
-                            &self.worker_id,
-                            now,
-                        )
-                        .await
-                        .map_err(map_backup_error)?;
-                    Ok(TaskOutcome {
-                        made_progress: matches!(
-                            outcome,
-                            BackupSchedulerOutcome::SnapshotRun(Some(_))
                         ),
                         next_due: None,
                     })
@@ -561,7 +542,6 @@ impl Schedule {
             due.insert(ScheduledTask::ScheduledBackup, now);
         }
         due.insert(ScheduledTask::DailyVerification, now);
-        due.insert(ScheduledTask::DailySnapshot, now);
         due.insert(
             ScheduledTask::MonthlyInventory,
             next_month_boundary(now, true),
@@ -623,9 +603,7 @@ impl Schedule {
                             .scheduled_backup_interval
                             .expect("disabled tasks are not scheduled")
                     }
-                    ScheduledTask::DailyVerification | ScheduledTask::DailySnapshot => {
-                        next_day_boundary(now)
-                    }
+                    ScheduledTask::DailyVerification => next_day_boundary(now),
                     ScheduledTask::MonthlyInventory => next_month_boundary(now, false),
                 };
                 self.due
@@ -694,14 +672,7 @@ mod tests {
             Ok(TaskOutcome::IDLE),
             &config,
         );
-        schedule.complete(
-            ScheduledTask::DailySnapshot,
-            now,
-            Ok(TaskOutcome::IDLE),
-            &config,
-        );
         assert_eq!(schedule.due[&ScheduledTask::SoundCloudSync], at(14, 16));
-        assert_eq!(schedule.due[&ScheduledTask::DailySnapshot], at(15, 0));
         assert_eq!(
             schedule.due[&ScheduledTask::MonthlyInventory],
             Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).single().unwrap()

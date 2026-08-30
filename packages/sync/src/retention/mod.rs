@@ -9,8 +9,6 @@ use rec_core::{RetentionPolicy, StorageObjectVersion};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
-use crate::snapshots::SnapshotTrigger;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionStatus {
     /// Policy could be evaluated; cleanup candidates are review-only.
@@ -103,7 +101,6 @@ pub struct CleanupPlan {
     pub candidates: Vec<CleanupCandidate>,
     pub approved: bool,
     pub approval_error: Option<String>,
-    pub required_snapshot_trigger: SnapshotTrigger,
 }
 
 impl CleanupCandidate {
@@ -112,9 +109,9 @@ impl CleanupCandidate {
     }
 }
 
-/// Converts review candidates into a provider-neutral cleanup plan. Persistence
-/// must record the approval and successful pre-cleanup snapshot before invoking
-/// any provider-specific destructive implementation.
+/// Converts review candidates into a provider-neutral cleanup plan. Persistence must
+/// record the explicit approval before invoking any provider-specific destructive
+/// implementation.
 pub fn plan_cleanup(
     evaluations: &[RetentionEvaluation],
     approval: Option<&CleanupApproval>,
@@ -140,7 +137,6 @@ pub fn plan_cleanup(
         approved: approval_error.is_none(),
         approval_error,
         candidates,
-        required_snapshot_trigger: SnapshotTrigger::BeforeRetentionCleanup,
     }
 }
 
@@ -269,10 +265,6 @@ mod tests {
         };
         let review = plan_cleanup(&[evaluation.clone()], None);
         assert!(!review.approved);
-        assert_eq!(
-            review.required_snapshot_trigger,
-            SnapshotTrigger::BeforeRetentionCleanup
-        );
         let approved = plan_cleanup(
             &[evaluation],
             Some(&CleanupApproval {

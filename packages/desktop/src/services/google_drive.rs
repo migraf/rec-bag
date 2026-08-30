@@ -1577,9 +1577,6 @@ impl GoogleDriveService {
         }
         self.assert_destination_complete(destination_storage_id, &self.list_originals().await?)
             .await?;
-        // The exported snapshot is persisted before the compare-and-swap so the
-        // catalog can be restored to the exact pre-migration authority assignment.
-        self.catalog.export_snapshot().await?;
         MusicStorageRepository::switch_active_primary(
             self.catalog.as_ref(),
             Some(source_storage_id),
@@ -2802,8 +2799,8 @@ mod tests {
     };
 
     use rec_core::{
-        CanonicalTrack, CatalogSnapshotRepository, DownloadResult, InventoryPage,
-        OriginalAssetRole, StorageHealth, StorageVersionPage, StorageVersionRequest,
+        CanonicalTrack, DownloadResult, InventoryPage, OriginalAssetRole, StorageHealth,
+        StorageVersionPage, StorageVersionRequest,
     };
 
     #[derive(Default)]
@@ -3691,7 +3688,6 @@ mod tests {
             .join("audio");
         std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
         std::fs::write(&cache_file, b"cached").unwrap();
-        catalog.export_snapshot().await.unwrap();
 
         service
             .forget_provider_catalog_data(storage.id)
@@ -3737,10 +3733,6 @@ mod tests {
             runtime.objects.lock().unwrap().get("one").cloned(),
             Some(object)
         );
-        assert!(CatalogSnapshotRepository::latest(catalog.as_ref())
-            .await
-            .unwrap()
-            .is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3982,10 +3974,6 @@ mod tests {
                 .role,
             StorageRole::Backup
         );
-        assert!(CatalogSnapshotRepository::latest(catalog.as_ref())
-            .await
-            .unwrap()
-            .is_some());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4058,10 +4046,6 @@ mod tests {
             .insert("source-song".into(), b"abc".to_vec());
         registry.register(source.id, source_runtime);
 
-        assert!(CatalogSnapshotRepository::latest(catalog.as_ref())
-            .await
-            .unwrap()
-            .is_none());
         let outcome = service
             .handle(IntegrationRequest {
                 id: 9,
@@ -4081,10 +4065,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(active.id, source.id);
-        assert!(CatalogSnapshotRepository::latest(catalog.as_ref())
-            .await
-            .unwrap()
-            .is_some());
         assert_eq!(
             outcome.view.unwrap().primary_storage.unwrap().id,
             active.id.to_string()

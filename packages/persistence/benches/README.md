@@ -5,8 +5,6 @@ This harness generates deterministic catalogs at runtime; no large fixtures are 
 - legacy v1 migration/import into the current schema;
 - cursor-paginated track repository reads;
 - reconciliation-input reads (source occurrences, original assets, and storage inventory);
-- snapshot serialization, SHA-256 fingerprinting, logical fingerprinting, and export;
-- snapshot import into a fresh catalog;
 - atomic durable job claims.
 
 ## Running
@@ -37,10 +35,9 @@ Configuration:
 Each result is emitted as a stable, grep-friendly line:
 
 ```text
-PERF metric=snapshot_import total_ms=123.456 units=200 rate_per_sec=1620.3 threshold_ms=30000 status=pass
 ```
 
-`units` is the number of records/items processed (snapshot bytes are reported separately by the normal smoke test). Thresholds intentionally detect catastrophic regressions rather than compare machines precisely:
+`units` is the number of records/items processed. Thresholds intentionally detect catastrophic regressions rather than compare machines precisely:
 
 | Metric | Smoke threshold | Full threshold |
 | --- | ---: | ---: |

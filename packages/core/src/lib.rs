@@ -74,17 +74,16 @@ pub use reconciliation::{
     ReconciliationSuppression, TrackStorageOutcome, TrackStorageStatus,
 };
 pub use repository::{
-    AssetLocationFilter, AssetRepository, CatalogSnapshot, CatalogSnapshotRepository,
-    ExternalPlaylistEntryStagingScope, ExternalPlaylistFilter, InventoryGeneration,
-    InventoryGenerationAbort, InventoryGenerationAbortKind, InventoryGenerationKind,
-    InventoryGenerationStart, InventoryGenerationStatus, InventoryStagingPage,
-    LibraryEntryRepository, MatchCandidateFilter, MusicStorageRepository, OriginalAssetFilter,
-    PlaylistRepository, ReconciliationRepository, ReconciliationResolutionFilter,
-    ReconciliationResultFilter, RepositoryCursor, RepositoryError, RepositoryErrorKind,
-    RepositoryPage, RepositoryPageRequest, RepositoryResult, RepositoryTransaction, Setting,
-    SettingsRepository, SourceCollectionRelationshipFilter, SourceOccurrenceFilter,
-    SourceRepository, StorageObjectTombstone, SyncRunFilter, SyncRunRepository,
-    TrackAnalysisRepository, TrackRepository, TransactionManager,
+    AssetLocationFilter, AssetRepository, ExternalPlaylistEntryStagingScope,
+    ExternalPlaylistFilter, InventoryGeneration, InventoryGenerationAbort,
+    InventoryGenerationAbortKind, InventoryGenerationKind, InventoryGenerationStart,
+    InventoryGenerationStatus, InventoryStagingPage, LibraryEntryRepository, MatchCandidateFilter,
+    MusicStorageRepository, OriginalAssetFilter, PlaylistRepository, ReconciliationRepository,
+    ReconciliationResolutionFilter, ReconciliationResultFilter, RepositoryCursor, RepositoryError,
+    RepositoryErrorKind, RepositoryPage, RepositoryPageRequest, RepositoryResult,
+    RepositoryTransaction, Setting, SettingsRepository, SourceCollectionRelationshipFilter,
+    SourceOccurrenceFilter, SourceRepository, StorageObjectTombstone, SyncRunFilter,
+    SyncRunRepository, TrackAnalysisRepository, TrackRepository, TransactionManager,
 };
 pub use schema::{
     CatalogSchemaVersion, CatalogSchemaVersionError, MigrationPlan, MigrationPlanError,

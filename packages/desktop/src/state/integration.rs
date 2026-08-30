@@ -4,15 +4,14 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
 };
 
 use crate::{
     services::{
+        backup::DatabaseBackup,
         catalog::{Catalog, CatalogError},
         integration::{DesktopIntegration, DesktopStartup, OwnershipTakeoverOffer},
         playback_bridge::AssetPlaybackPaths,
-        recovery::{RecoveryProgress, RestoreReport, SnapshotListing},
     },
     state::AppState,
 };
@@ -116,19 +115,19 @@ pub enum IntegrationEvent {
     TakeoverCompleted,
     RuntimeStarted,
     SchedulerStarted,
-    RecoveryStarted(RecoveryAction),
-    RecoveryCompleted {
-        action: RecoveryAction,
-        progress: Vec<RecoveryProgress>,
+    DatabaseBackupStarted(DatabaseBackupAction),
+    DatabaseBackupCompleted {
+        action: DatabaseBackupAction,
+        /// Where a restored database waits for the next start, when one was staged.
+        staged: Option<PathBuf>,
     },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecoveryAction {
-    RefreshSnapshots,
-    DryRun,
+pub enum DatabaseBackupAction {
+    Refresh,
+    Back,
     Restore,
-    Rollback,
 }
 
 /// State projected into the provider-independent dashboard.
@@ -138,8 +137,9 @@ pub struct IntegrationState {
     pub selected_filter: TrackFilter,
     pub events: Vec<IntegrationEvent>,
     pub errors: Vec<IntegrationError>,
-    pub recovery_snapshots: Vec<SnapshotListing>,
-    pub last_pre_restore_snapshot: Option<PathBuf>,
+    pub database_backups: Vec<DatabaseBackup>,
+    /// Set once a restore has been staged; it takes effect on the next start.
+    pub staged_restore: Option<PathBuf>,
     pub ownership_blocked_by: Option<String>,
     pending: VecDeque<IntegrationRequest>,
     in_flight: BTreeMap<u64, IntegrationRequest>,
@@ -154,8 +154,8 @@ impl Default for IntegrationState {
             selected_filter: TrackFilter::All,
             events: Vec::new(),
             errors: Vec::new(),
-            recovery_snapshots: Vec::new(),
-            last_pre_restore_snapshot: None,
+            database_backups: Vec::new(),
+            staged_restore: None,
             ownership_blocked_by: None,
             pending: VecDeque::new(),
             in_flight: BTreeMap::new(),
@@ -355,62 +355,60 @@ impl IntegrationContext {
         }
     }
 
-    pub async fn refresh_recovery_snapshots(&mut self) {
-        self.state
-            .write()
-            .events
-            .push(IntegrationEvent::RecoveryStarted(
-                RecoveryAction::RefreshSnapshots,
-            ));
+    /// Reloads the list of database copies held by the configured backup storages.
+    pub async fn refresh_database_backups(&mut self) {
+        self.push_backup_started(DatabaseBackupAction::Refresh);
         let Some(runtime) = self.runtime() else {
             return;
         };
-        match runtime.recovery_snapshots() {
-            Ok(snapshots) => {
-                self.state.write().recovery_snapshots = snapshots;
-                self.state
-                    .write()
-                    .events
-                    .push(IntegrationEvent::RecoveryCompleted {
-                        action: RecoveryAction::RefreshSnapshots,
-                        progress: Vec::new(),
-                    });
+        match runtime.database_backups().await {
+            Ok(backups) => {
+                self.state.write().database_backups = backups;
+                self.push_backup_completed(DatabaseBackupAction::Refresh, None);
             }
             Err(error) => self.state.write().report_error(error),
         }
     }
 
-    pub async fn run_recovery(&mut self, action: RecoveryAction, path: PathBuf) {
-        self.state
-            .write()
-            .events
-            .push(IntegrationEvent::RecoveryStarted(action));
+    /// Copies the catalog database to every configured backup storage.
+    pub async fn back_up_database(&mut self) {
+        self.push_backup_started(DatabaseBackupAction::Back);
         let Some(runtime) = self.runtime() else {
             return;
         };
-        let result = match action {
-            RecoveryAction::DryRun => runtime.dry_run_restore(path).await,
-            RecoveryAction::Restore => runtime.restore_snapshot(path, false).await,
-            RecoveryAction::Rollback => runtime.rollback_restore(path).await,
-            RecoveryAction::RefreshSnapshots => return,
-        };
-        match result {
-            Ok(report) => self.complete_recovery(action, report),
+        match runtime.back_up_database().await {
+            Ok(_) => self.push_backup_completed(DatabaseBackupAction::Back, None),
             Err(error) => self.state.write().report_error(error),
         }
     }
 
-    fn complete_recovery(&mut self, action: RecoveryAction, report: RestoreReport) {
-        if !report.pre_restore_snapshot.as_os_str().is_empty() {
-            self.state.write().last_pre_restore_snapshot = Some(report.pre_restore_snapshot);
+    /// Stages one backup to replace the catalog on the next start.
+    pub async fn restore_database_backup(&mut self, backup: DatabaseBackup) {
+        self.push_backup_started(DatabaseBackupAction::Restore);
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
+        match runtime.restore_database_backup(&backup).await {
+            Ok(staged) => {
+                self.state.write().staged_restore = Some(staged.clone());
+                self.push_backup_completed(DatabaseBackupAction::Restore, Some(staged));
+            }
+            Err(error) => self.state.write().report_error(error),
         }
+    }
+
+    fn push_backup_started(&mut self, action: DatabaseBackupAction) {
         self.state
             .write()
             .events
-            .push(IntegrationEvent::RecoveryCompleted {
-                action,
-                progress: report.progress,
-            });
+            .push(IntegrationEvent::DatabaseBackupStarted(action));
+    }
+
+    fn push_backup_completed(&mut self, action: DatabaseBackupAction, staged: Option<PathBuf>) {
+        self.state
+            .write()
+            .events
+            .push(IntegrationEvent::DatabaseBackupCompleted { action, staged });
     }
 }
 
@@ -455,6 +453,8 @@ pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, Int
     // happen back on the UI thread.
     #[cfg(feature = "desktop")]
     {
+        use std::time::Duration;
+
         let needs_open = startup.is_none();
         use_future(move || async move {
             if !needs_open {
@@ -465,7 +465,7 @@ pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, Int
             let startup_result = tokio::select! {
                 result = &mut startup => result,
                 _ = tokio::time::sleep(Duration::from_secs(45)) => {
-                    tracing::warn!("desktop integration startup has exceeded 45 seconds; allowing catalog recovery to continue");
+                    tracing::warn!("desktop integration startup has exceeded 45 seconds; still waiting");
                     startup.await
                 }
             };
@@ -1040,10 +1040,10 @@ mod tests {
             IntegrationEvent::TakeoverCompleted,
             IntegrationEvent::RuntimeStarted,
             IntegrationEvent::SchedulerStarted,
-            IntegrationEvent::RecoveryStarted(RecoveryAction::DryRun),
-            IntegrationEvent::RecoveryCompleted {
-                action: RecoveryAction::DryRun,
-                progress: Vec::new(),
+            IntegrationEvent::DatabaseBackupStarted(DatabaseBackupAction::Back),
+            IntegrationEvent::DatabaseBackupCompleted {
+                action: DatabaseBackupAction::Back,
+                staged: None,
             },
         ]);
 
@@ -1055,9 +1055,9 @@ mod tests {
                 IntegrationEvent::TakeoverCompleted,
                 IntegrationEvent::RuntimeStarted,
                 IntegrationEvent::SchedulerStarted,
-                IntegrationEvent::RecoveryStarted(RecoveryAction::DryRun),
-                IntegrationEvent::RecoveryCompleted {
-                    action: RecoveryAction::DryRun,
+                IntegrationEvent::DatabaseBackupStarted(DatabaseBackupAction::Back),
+                IntegrationEvent::DatabaseBackupCompleted {
+                    action: DatabaseBackupAction::Back,
                     ..
                 },
             ]

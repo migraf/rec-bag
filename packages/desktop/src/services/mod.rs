@@ -11,6 +11,5 @@ pub mod local_library;
 pub mod playback_bridge;
 pub mod profile_manager;
 pub mod reconciliation_actions;
-pub mod recovery;
 pub mod scheduler;
 pub mod soundcloud_catalog;

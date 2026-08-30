@@ -111,7 +111,6 @@ pub struct PrimaryMigrationResult {
     pub active_primary_id: Uuid,
     pub inventory_generation_id: Uuid,
     pub reconciliation_run_id: Uuid,
-    pub snapshot_id: Uuid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -903,9 +902,6 @@ impl LocalLibraryService {
         if unverified != 0 {
             return Err(LocalLibraryError::MigrationIncomplete(unverified));
         }
-        // PreparePrimaryMigration is the final user-confirmed action. The recovery
-        // snapshot must be durable before the active-primary compare-and-swap begins.
-        let snapshot = self.catalog.export_snapshot().await?;
         let previous = self.catalog.get_active_primary().await?;
         let transaction = self.catalog.begin().await?;
         let selected = transaction
@@ -928,7 +924,6 @@ impl LocalLibraryService {
             active_primary_id: selected.id,
             inventory_generation_id: inventory.generation.id,
             reconciliation_run_id: reconciliation.run_id,
-            snapshot_id: snapshot.id,
         })
     }
 
@@ -1421,12 +1416,7 @@ impl IntegrationSliceHandler for LocalLibraryService {
                     MusicManagementEvent::PreparePrimaryMigration(plan) => self
                         .migrate_primary(&plan.destination, plan.keep_old_as_backup)
                         .await
-                        .map(|result| {
-                            format!(
-                                "Migrated primary to {} after snapshot {}",
-                                result.active_primary_id, result.snapshot_id
-                            )
-                        }),
+                        .map(|result| format!("Migrated primary to {}", result.active_primary_id)),
                     other => Err(LocalLibraryError::UnsupportedEvent(format!("{other:?}"))),
                 }
             }
@@ -2377,64 +2367,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.message.contains("distinct and non-nested"));
-    }
-
-    #[tokio::test]
-    async fn prepare_primary_migration_event_snapshots_before_final_cas() {
-        let source_root = TempDirectory::new("event-migrate-source");
-        let old_root = TempDirectory::new("event-migrate-old");
-        let new_root = TempDirectory::new("event-migrate-new");
-        fs::write(source_root.path().join("track.mp3"), b"audio").unwrap();
-        let service = service(None).await;
-        service
-            .register_local_source(LocalSourceSelection {
-                name: "Source".into(),
-                root: source_root.path().into(),
-                copy_policy: SourceCopyPolicy::AutomaticallyCopyEligibleFiles,
-            })
-            .await
-            .unwrap();
-        let old = service
-            .configure_local_storage(&primary_view(old_root.path()))
-            .await
-            .unwrap();
-        service
-            .catalog
-            .switch_active_primary(None, Some(old.id))
-            .await
-            .unwrap();
-
-        let outcome = service
-            .handle(IntegrationRequest {
-                id: 24,
-                slice: IntegrationSlice::LocalLibrary,
-                event: MusicManagementEvent::PreparePrimaryMigration(
-                    ui::PrimaryMigrationPlanView {
-                        destination: primary_view(new_root.path()),
-                        verify_checksums: true,
-                        keep_old_as_backup: true,
-                    },
-                ),
-            })
-            .await
-            .unwrap();
-
-        assert!(outcome.message.unwrap().contains("after snapshot"));
-        let snapshot = rec_core::CatalogSnapshotRepository::latest(service.catalog.as_ref())
-            .await
-            .unwrap();
-        assert!(snapshot.is_some());
-        let active = service.catalog.get_active_primary().await.unwrap().unwrap();
-        assert_eq!(
-            PathBuf::from(active.root_identifier.unwrap()),
-            fs::canonicalize(new_root.path()).unwrap()
-        );
-        let old = MusicStorageRepository::get(service.catalog.as_ref(), old.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(old.role, StorageRole::Backup);
-        assert_eq!(outcome.view.unwrap().completeness.verified_assets, 1);
     }
 
     #[tokio::test]

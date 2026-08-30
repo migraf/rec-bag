@@ -2341,7 +2341,7 @@ mod tests {
         );
     }
     use rec_core::{
-        CatalogSnapshotRepository, MetadataOrigin, SourceAccount, SourceCollectionRelationship,
+        MetadataOrigin, SourceAccount, SourceCollectionRelationship,
         SourceCollectionRelationshipIdentity, SourceSyncPage, SyncCursor,
     };
 
@@ -2899,7 +2899,6 @@ mod tests {
         AssetRepository::upsert_original(service.catalog.as_ref(), asset.clone())
             .await
             .unwrap();
-        service.catalog.export_snapshot().await.unwrap();
 
         let view = service
             .forget_provider_catalog_data(source.id)
@@ -2950,10 +2949,6 @@ mod tests {
             .tracks
             .iter()
             .all(|track| !track.badges.iter().any(|badge| badge == "SoundCloud")));
-        assert!(CatalogSnapshotRepository::latest(service.catalog.as_ref())
-            .await
-            .unwrap()
-            .is_none());
     }
 
     #[tokio::test]

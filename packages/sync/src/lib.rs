@@ -10,7 +10,6 @@
 pub mod jobs;
 pub mod replication;
 pub mod retention;
-pub mod snapshots;
 pub mod verification;
 
 pub use jobs::{
@@ -26,7 +25,6 @@ pub use retention::{
     evaluate_retention, plan_cleanup, plan_primary_deletion_retention, CleanupApproval,
     CleanupCandidate, CleanupPlan, PrimaryDeletionDecision, RetentionEvaluation, RetentionStatus,
 };
-pub use snapshots::{SnapshotDebouncer, SnapshotTrigger};
 pub use verification::{
     VerificationCadence, VerificationPlan, VerificationPlanner, VerificationRequest,
 };

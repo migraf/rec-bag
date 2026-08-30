@@ -72,10 +72,11 @@ pub async fn migrate(
     connection.execute_batch("BEGIN IMMEDIATE;").await?;
     let result = async {
         match from_version {
-            0 | 2 => install_current_schema(connection).await?,
+            0 | 2 | 3 => install_current_schema(connection).await?,
             1 => migrate_legacy_schema(connection).await?,
             _ => unreachable!(),
         }
+        retire_catalog_snapshots(connection).await?;
         connection.execute_batch("COMMIT;").await?;
         Ok::<(), MigrationError>(())
     }
@@ -129,6 +130,28 @@ async fn create_wal_safe_backup(
         fs::copy(path, &backup)?;
     }
     Ok(backup)
+}
+
+/// Drops the retired catalog-snapshot tables and the work that fed them.
+///
+/// Snapshots wrote the whole catalog into a row of the very table they exported, so each
+/// one embedded every earlier snapshot and the file grew about fourfold per run. Backups
+/// now copy the database file itself, and these rows are dead weight — the largest thing
+/// in most existing catalogs. The runs and jobs go too: their kinds no longer deserialize.
+async fn retire_catalog_snapshots(connection: &Connection) -> Result<(), MigrationError> {
+    connection
+        .execute_batch(
+            r#"
+DROP INDEX IF EXISTS idx_snapshots_latest;
+DROP INDEX IF EXISTS idx_snapshots_logical_fingerprint;
+DROP TABLE IF EXISTS snapshot_triggers;
+DROP TABLE IF EXISTS catalog_snapshots;
+DELETE FROM sync_runs WHERE payload LIKE '%"kind":"catalog_snapshot"%';
+DELETE FROM sync_jobs WHERE kind='create_catalog_snapshot';
+"#,
+        )
+        .await?;
+    Ok(())
 }
 
 async fn table_exists(connection: &Connection, name: &str) -> Result<bool, MigrationError> {
@@ -604,10 +627,8 @@ CREATE TABLE IF NOT EXISTS reconciliation_result_candidates(result_id TEXT NOT N
 CREATE TABLE IF NOT EXISTS reconciliation_resolutions(id TEXT PRIMARY KEY,result_id TEXT NOT NULL,candidate_id TEXT,decision TEXT NOT NULL,decided_at TEXT NOT NULL,payload TEXT NOT NULL,FOREIGN KEY(result_id) REFERENCES reconciliation_results(id) ON DELETE CASCADE,FOREIGN KEY(candidate_id) REFERENCES match_candidates(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS reconciliation_suppressions(id TEXT PRIMARY KEY,resolution_id TEXT NOT NULL UNIQUE,result_id TEXT NOT NULL,candidate_id TEXT,decision TEXT NOT NULL,expires_at TEXT,payload TEXT NOT NULL,FOREIGN KEY(resolution_id) REFERENCES reconciliation_resolutions(id) ON DELETE CASCADE,FOREIGN KEY(result_id) REFERENCES reconciliation_results(id) ON DELETE CASCADE,FOREIGN KEY(candidate_id) REFERENCES match_candidates(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS transfer_results(idempotency_key TEXT PRIMARY KEY,job_id TEXT NOT NULL UNIQUE,asset_id TEXT NOT NULL,storage_id TEXT,object_id TEXT,completed_at TEXT NOT NULL,payload TEXT NOT NULL,FOREIGN KEY(job_id) REFERENCES sync_jobs(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS snapshot_triggers(id TEXT PRIMARY KEY,source_run_id TEXT,requested_at TEXT NOT NULL,completed_snapshot_id TEXT,payload TEXT NOT NULL,FOREIGN KEY(source_run_id) REFERENCES sync_runs(id),FOREIGN KEY(completed_snapshot_id) REFERENCES catalog_snapshots(id));
 CREATE TABLE IF NOT EXISTS cleanup_approvals(id TEXT PRIMARY KEY,storage_id TEXT NOT NULL,object_id TEXT NOT NULL,approved_at TEXT NOT NULL,expires_at TEXT,consumed_at TEXT,payload TEXT NOT NULL,UNIQUE(storage_id,object_id),FOREIGN KEY(storage_id) REFERENCES music_storages(id));
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,payload TEXT NOT NULL,updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS catalog_snapshots(id TEXT PRIMARY KEY,content_hash TEXT NOT NULL UNIQUE,logical_fingerprint TEXT,created_at TEXT NOT NULL,payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS library_entries(track_id TEXT PRIMARY KEY,payload TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS track_analysis(track_id TEXT PRIMARY KEY,payload TEXT NOT NULL,FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS idx_tracks_updated ON tracks(updated_at,id);
@@ -625,9 +646,8 @@ CREATE INDEX IF NOT EXISTS idx_sync_jobs_run ON sync_jobs(run_id,id);
 CREATE INDEX IF NOT EXISTS idx_sync_job_events_run ON sync_job_events(run_id,at,id);
 
 CREATE INDEX IF NOT EXISTS idx_tombstones_storage ON storage_object_tombstones(storage_id,object_id);
-CREATE INDEX IF NOT EXISTS idx_snapshots_latest ON catalog_snapshots(created_at DESC,id DESC);
 INSERT INTO profile_storage_settings(singleton,active_primary_storage_id) VALUES(1,NULL) ON CONFLICT(singleton) DO NOTHING;
-INSERT INTO catalog_schema_version(singleton,version,updated_at) VALUES(1,3,'1970-01-01T00:00:00Z') ON CONFLICT(singleton) DO UPDATE SET version=excluded.version,updated_at=excluded.updated_at;
+INSERT INTO catalog_schema_version(singleton,version,updated_at) VALUES(1,4,'1970-01-01T00:00:00Z') ON CONFLICT(singleton) DO UPDATE SET version=excluded.version,updated_at=excluded.updated_at;
 "#).await?;
     // Version 3 existed briefly during Stage 2A development. Additive guards make opening
     // those catalogs safe without requiring a destructive schema rebuild.
@@ -643,11 +663,6 @@ INSERT INTO catalog_schema_version(singleton,version,updated_at) VALUES(1,3,'197
         ("sync_jobs", "idempotency_key", "idempotency_key TEXT"),
         ("sync_job_events", "kind", "kind TEXT NOT NULL DEFAULT ''"),
         ("sync_job_events", "semantic_key", "semantic_key TEXT"),
-        (
-            "catalog_snapshots",
-            "logical_fingerprint",
-            "logical_fingerprint TEXT",
-        ),
         ("inventory_generations", "run_id", "run_id TEXT"),
         ("inventory_generations", "kind", "kind TEXT"),
         ("inventory_generations", "started_at", "started_at TEXT"),
@@ -685,7 +700,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_job_events_semantic ON sync_job_event
 CREATE INDEX IF NOT EXISTS idx_result_candidates_candidate ON reconciliation_result_candidates(candidate_id,result_id);
 CREATE INDEX IF NOT EXISTS idx_reconciliation_resolutions_filter ON reconciliation_resolutions(result_id,candidate_id,decision,id);
 CREATE INDEX IF NOT EXISTS idx_reconciliation_suppressions_filter ON reconciliation_suppressions(result_id,candidate_id,decision,id);
-CREATE INDEX IF NOT EXISTS idx_snapshots_logical_fingerprint ON catalog_snapshots(logical_fingerprint,created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_inventory_latest ON inventory_generations(storage_id,status,finished_at DESC);
 "#).await?;
     Ok(())

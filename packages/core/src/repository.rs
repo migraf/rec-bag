@@ -4,9 +4,7 @@
 //! values where practical so their boxed futures remain straightforward and
 //! dynamically dispatchable.
 
-use crate::asset::{
-    AssetLocation, ContentHash, DerivedAsset, MusicStorage, OriginalAsset, StorageObject,
-};
+use crate::asset::{AssetLocation, DerivedAsset, MusicStorage, OriginalAsset, StorageObject};
 use crate::catalog::{
     CanonicalPlaylist, CanonicalTrack, CatalogSource, ExternalPlaylist, ExternalPlaylistEntry,
     LibraryEntry, SourceAccount, SourceCollection, SourceCollectionRelationship,
@@ -21,7 +19,6 @@ use crate::sync::{SyncJob, SyncRun, SyncRunKind, SyncStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 use uuid::Uuid;
@@ -100,54 +97,6 @@ pub struct Setting {
     pub key: String,
     pub value: Value,
     pub updated_at: DateTime<Utc>,
-}
-
-/// A versioned, integrity-addressed catalog recovery snapshot.
-///
-/// The payload must contain no credentials or access tokens. Its encoding is
-/// identified by `content_type` and versioned independently from database schema.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatalogSnapshot {
-    pub id: Uuid,
-    pub format_version: u32,
-    pub created_at: DateTime<Utc>,
-    pub content_type: String,
-    content_hash: ContentHash,
-    payload: Vec<u8>,
-}
-
-impl CatalogSnapshot {
-    /// Create a snapshot whose integrity hash is derived from its serialized payload.
-    pub fn new(format_version: u32, content_type: impl Into<String>, payload: Vec<u8>) -> Self {
-        let digest = Sha256::digest(&payload);
-        let hash = format!("{digest:x}");
-        let content_hash = ContentHash::sha256(hash)
-            .expect("SHA-256 formatting always produces a valid canonical digest");
-
-        Self {
-            id: Uuid::new_v4(),
-            format_version,
-            created_at: Utc::now(),
-            content_type: content_type.into(),
-            content_hash,
-            payload,
-        }
-    }
-
-    pub fn content_hash(&self) -> &ContentHash {
-        &self.content_hash
-    }
-
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    /// Recompute and compare the payload hash before restore or replication.
-    pub fn verify_integrity(&self) -> bool {
-        let digest = Sha256::digest(&self.payload);
-        let hash = format!("{digest:x}");
-        ContentHash::sha256(hash).is_ok_and(|actual| actual == self.content_hash)
-    }
 }
 
 /// Filters durable source collection relationships while retaining source scope as a
@@ -713,22 +662,6 @@ pub trait SettingsRepository: Send + Sync {
     fn set(&self, setting: Setting) -> BoxFuture<'_, RepositoryResult<()>>;
 }
 
-/// Persistence operations for catalog recovery snapshots.
-pub trait CatalogSnapshotRepository: Send + Sync {
-    fn get(&self, id: Uuid) -> BoxFuture<'_, RepositoryResult<Option<CatalogSnapshot>>>;
-
-    fn latest(&self) -> BoxFuture<'_, RepositoryResult<Option<CatalogSnapshot>>>;
-
-    fn list(
-        &self,
-        page: RepositoryPageRequest,
-    ) -> BoxFuture<'_, RepositoryResult<RepositoryPage<CatalogSnapshot>>>;
-
-    /// Stores a snapshot idempotently by its identifier or content hash.
-    /// Implementations must reject snapshots for which `verify_integrity()` is false.
-    fn put(&self, snapshot: CatalogSnapshot) -> BoxFuture<'_, RepositoryResult<()>>;
-}
-
 /// Repository views bound to one persistence transaction.
 ///
 /// This unit-of-work shape makes applying a provider page and advancing its sync
@@ -744,7 +677,6 @@ pub trait RepositoryTransaction: Send + Sync {
     fn music_storages(&self) -> &dyn MusicStorageRepository;
     fn sync_runs(&self) -> &dyn SyncRunRepository;
     fn settings(&self) -> &dyn SettingsRepository;
-    fn catalog_snapshots(&self) -> &dyn CatalogSnapshotRepository;
 
     fn commit<'a>(self: Box<Self>) -> BoxFuture<'a, RepositoryResult<()>>
     where
@@ -774,7 +706,6 @@ mod tests {
     fn accepts_music_storage_repository(_: &dyn MusicStorageRepository) {}
     fn accepts_sync_run_repository(_: &dyn SyncRunRepository) {}
     fn accepts_settings_repository(_: &dyn SettingsRepository) {}
-    fn accepts_catalog_snapshot_repository(_: &dyn CatalogSnapshotRepository) {}
     fn accepts_repository_transaction(_: &dyn RepositoryTransaction) {}
     fn accepts_transaction_manager(_: &dyn TransactionManager) {}
 
@@ -790,7 +721,6 @@ mod tests {
         let _ = accepts_music_storage_repository;
         let _ = accepts_sync_run_repository;
         let _ = accepts_settings_repository;
-        let _ = accepts_catalog_snapshot_repository;
         let _ = accepts_repository_transaction;
         let _ = accepts_transaction_manager;
     }
@@ -801,14 +731,5 @@ mod tests {
         let json = serde_json::to_string(&error).unwrap();
         let decoded: RepositoryError = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, error);
-    }
-
-    #[test]
-    fn catalog_snapshot_hashes_and_verifies_its_payload() {
-        let snapshot = CatalogSnapshot::new(1, "application/json", br#"{"tracks":[]}"#.to_vec());
-
-        assert!(snapshot.content_hash().is_canonical_sha256());
-        assert!(snapshot.verify_integrity());
-        assert_eq!(snapshot.payload(), br#"{"tracks":[]}"#);
     }
 }

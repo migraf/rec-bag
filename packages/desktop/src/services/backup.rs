@@ -1,4 +1,4 @@
-//! Backup replication, snapshots, retention review, and verification orchestration.
+//! Backup replication, database backups, retention review, and verification orchestration.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -8,8 +8,8 @@ use std::{
 
 use chrono::{DateTime, Duration, Utc};
 use rec_core::{
-    AssetLocation, AssetRepository, AssetType, BoxFuture, CatalogSnapshotRepository, ContentHash,
-    DownloadRequest, HealthStatus, InventoryMode, InventoryRequest, MusicAssetStore, MusicStorage,
+    AssetLocation, AssetRepository, AssetType, BoxFuture, ContentHash, DownloadRequest,
+    HealthStatus, InventoryMode, InventoryRequest, MusicAssetStore, MusicStorage,
     MusicStorageError, MusicStorageErrorKind, MusicStorageRepository, OriginalAsset,
     OriginalAssetFilter, RepositoryError, RepositoryErrorKind, RepositoryPageRequest,
     RetentionPolicy, Setting, SettingsRepository, StorageObject, StorageObjectVersion, StorageRole,
@@ -18,22 +18,19 @@ use rec_core::{
     TransferStage, UploadRequest, SYNC_JOB_PAYLOAD_VERSION,
 };
 use rec_persistence::{
-    CleanupApproval as PersistedCleanupApproval, DurableTransferResult, SnapshotTrigger,
-    TursoCatalog, SNAPSHOT_CONTENT_TYPE,
+    CleanupApproval as PersistedCleanupApproval, DurableTransferResult, TursoCatalog,
 };
 use rec_sync::{
     evaluate_retention, BackupAvailability, BackupTarget, CancellationRequest, JobCompletion,
     JobEngine, JobEvent, JobEventKind, JobExecutor, JobPlanner, JobStep, JobStore, JobStoreError,
     ReplicationDecision, ReplicationError, ReplicationExecutor, ReplicationPlanner,
     ReplicationRequest, ReplicationStage, ReplicationStep, ReplicationTrigger, RetentionEvaluation,
-    SnapshotTrigger as SnapshotReason, StagedReplicationRequest, VerificationPlan,
-    VerificationPlanner, VerificationRequest,
+    StagedReplicationRequest, VerificationPlan, VerificationPlanner, VerificationRequest,
 };
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::Mutex;
 use ui::{BackupPolicyView, MusicManagementEvent, ProviderChoice};
 use uuid::Uuid;
 
@@ -43,8 +40,8 @@ use crate::state::integration::{
 };
 
 const DEFAULT_DEFER: Duration = Duration::minutes(15);
-const DEFAULT_DEBOUNCE: Duration = Duration::minutes(5);
-const SNAPSHOT_DIRECTORY: &str = ".rec_bag/catalog-snapshots/v1";
+/// Where a backup storage keeps copies of the catalog database.
+const DATABASE_BACKUP_DIRECTORY: &str = ".rec_bag/database-backups/v1";
 const CLEANUP_KEY_SEPARATOR: char = '|';
 
 /// Runtime registry for configured local and Google Drive stores. Both adapters are
@@ -252,17 +249,40 @@ impl RetentionReview {
     }
 }
 
+/// One copy of the catalog database held by a backup storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseBackup {
+    pub storage_id: Uuid,
+    pub storage_name: String,
+    pub object_id: String,
+    pub size_bytes: u64,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Where a downloaded backup waits for startup to move it into place.
+pub fn staged_restore_path(catalog_path: &Path) -> PathBuf {
+    catalog_path.with_extension("db.incoming")
+}
+
+async fn hash_file(path: &Path) -> Result<ContentHash, SyncError> {
+    let bytes = tokio::fs::read(path).await.map_err(io_sync_error)?;
+    let digest = Sha256::digest(&bytes);
+    ContentHash::sha256(format!("{digest:x}")).map_err(|error| {
+        sync_error(
+            SyncErrorKind::Integrity,
+            "backup.hash",
+            error.to_string(),
+            false,
+        )
+    })
+}
+
 /// Scheduler-facing hooks owned by Slice 4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackupSchedulerHook {
     WorkerWake,
     VerifiedPrimaryWrite(ReplicationRequest),
     ScheduledReplication(ReplicationRequest),
-    Snapshot {
-        reason: SnapshotReason,
-        source_run_id: Option<Uuid>,
-    },
-    DailySnapshot,
     Verification {
         requests: Vec<VerificationRequest>,
         sample_modulus: u64,
@@ -276,8 +296,6 @@ pub enum BackupSchedulerOutcome {
     Idle,
     JobEvent(JobEvent),
     Replication(PlannedReplication),
-    SnapshotRecorded(Uuid),
-    SnapshotRun(Option<Uuid>),
     VerificationRun(Option<Uuid>),
     Retention(RetentionReview),
 }
@@ -288,8 +306,6 @@ pub struct BackupService {
     providers: Arc<BackupProviderRegistry>,
     engine: JobEngine<CatalogJobStore>,
     staging_root: PathBuf,
-    debounce_window: Duration,
-    snapshot_lock: Mutex<()>,
 }
 
 impl BackupService {
@@ -304,14 +320,7 @@ impl BackupService {
             providers,
             engine: JobEngine::new(store),
             staging_root: staging_root.into(),
-            debounce_window: DEFAULT_DEBOUNCE,
-            snapshot_lock: Mutex::new(()),
         }
-    }
-
-    pub fn with_debounce_window(mut self, debounce_window: Duration) -> Self {
-        self.debounce_window = debounce_window.max(Duration::zero());
-        self
     }
 
     pub fn providers(&self) -> &Arc<BackupProviderRegistry> {
@@ -512,26 +521,7 @@ impl BackupService {
         let event = self.engine.run_once(worker_id, now, &executor).await?;
         if let Some(event) = &event {
             if matches!(event.kind, JobEventKind::Succeeded | JobEventKind::Skipped) {
-                let completed_replication = if let Some(job_id) = event.job_id {
-                    self.engine
-                        .store()
-                        .load_job(job_id)
-                        .await?
-                        .is_some_and(|job| {
-                            matches!(job.payload, SyncJobPayload::ReplicateAsset { .. })
-                        })
-                } else {
-                    false
-                };
                 self.reconcile_terminal_receipt(event, now).await?;
-                if event.kind == JobEventKind::Succeeded && completed_replication {
-                    self.record_snapshot_trigger(
-                        SnapshotReason::SuccessfulSync,
-                        Some(event.run_id),
-                        now,
-                    )
-                    .await?;
-                }
             }
         }
         Ok(event)
@@ -600,117 +590,33 @@ impl BackupService {
         })
     }
 
-    pub async fn record_snapshot_trigger(
-        &self,
-        reason: SnapshotReason,
-        source_run_id: Option<Uuid>,
-        now: DateTime<Utc>,
-    ) -> Result<Uuid, BackupError> {
-        let reason = snapshot_reason_key(reason);
-        let id = deterministic_uuid(&format!(
-            "snapshot-trigger:{reason}:{}:{}",
-            source_run_id.map_or_else(|| "none".into(), |id| id.to_string()),
-            now.timestamp() / self.debounce_window.num_seconds().max(1)
-        ));
-        self.catalog
-            .put_snapshot_trigger(SnapshotTrigger {
-                id,
-                source_run_id,
-                reason: reason.into(),
-                requested_at: now,
-                completed_snapshot_id: None,
-            })
-            .await?;
-        Ok(id)
-    }
-
-    /// Exports one logical snapshot and queues immutable delivery to every enabled backup.
-    pub async fn create_due_snapshot(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Result<Option<Uuid>, BackupError> {
-        let _guard = self.snapshot_lock.lock().await;
-        let mut triggers: Vec<_> = self
-            .catalog
-            .list_snapshot_triggers()
-            .await?
-            .into_iter()
-            .filter(|trigger| trigger.completed_snapshot_id.is_none())
-            .collect();
-        if triggers.is_empty() {
-            return Ok(None);
-        }
-        triggers.sort_by_key(|trigger| (trigger.requested_at, trigger.id));
-        let immediate = triggers.iter().any(|trigger| {
-            matches!(
-                trigger.reason.as_str(),
-                "before_primary_migration" | "before_retention_cleanup"
-            )
-        });
-        if !immediate && now < triggers[0].requested_at + self.debounce_window {
-            return Ok(None);
-        }
-
-        let previous = CatalogSnapshotRepository::latest(self.catalog.as_ref()).await?;
-        let snapshot = self.catalog.export_snapshot().await?;
-        let fingerprint = self
-            .catalog
-            .logical_snapshot_fingerprint(snapshot.id)
-            .await?
-            .ok_or_else(|| BackupError::InvalidRequest("snapshot fingerprint missing".into()))?;
-        let unchanged = if let Some(previous) = &previous {
-            self.catalog
-                .logical_snapshot_fingerprint(previous.id)
-                .await?
-                .as_deref()
-                == Some(fingerprint.as_str())
-        } else {
-            false
-        };
-        let effective_snapshot_id = if unchanged {
-            previous.as_ref().map_or(snapshot.id, |value| value.id)
-        } else {
-            snapshot.id
-        };
-
-        if unchanged {
-            complete_snapshot_triggers(self.catalog.as_ref(), &mut triggers, effective_snapshot_id)
-                .await?;
-            return Ok(None);
-        }
-
-        let run = SyncRun::at(SyncRunKind::CatalogSnapshot, None, None, now);
+    /// Copies the catalog database to every enabled backup storage.
+    ///
+    /// The database file *is* the backup, so there is nothing to coalesce or compare:
+    /// asking for one makes one. Delivery runs through the same durable jobs as asset
+    /// replication, so a partial upload resumes rather than starting over.
+    pub async fn back_up_database(&self, now: DateTime<Utc>) -> Result<Option<Uuid>, BackupError> {
+        let run = SyncRun::at(SyncRunKind::DatabaseBackup, None, None, now);
+        let stamp = now.format("%Y%m%dT%H%M%SZ");
         let mut jobs = Vec::new();
         for storage in MusicStorageRepository::list(self.catalog.as_ref()).await? {
             if storage.role != StorageRole::Backup || !storage.enabled {
                 continue;
             }
-            let object_key = format!(
-                "{SNAPSHOT_DIRECTORY}/{}-{}.json",
-                snapshot.created_at.format("%Y%m%dT%H%M%SZ"),
-                snapshot.content_hash().value()
-            );
-            let key = format!(
-                "snapshot:{}:{}:{}",
-                snapshot.content_hash().value(),
-                storage.id,
-                object_key
-            );
-            if self.catalog.get_transfer_result(&key).await?.is_some()
-                || self
-                    .catalog
-                    .find_active_job_by_idempotency_key(&key)
-                    .await?
-                    .is_some()
+            let object_key = format!("{DATABASE_BACKUP_DIRECTORY}/library-{stamp}.db");
+            let key = format!("database-backup:{}:{object_key}", storage.id);
+            if self
+                .catalog
+                .find_active_job_by_idempotency_key(&key)
+                .await?
+                .is_some()
             {
                 continue;
             }
             jobs.push(SyncJob::with_retry_policy_at(
                 run.id,
-                SyncJobPayload::CreateCatalogSnapshot {
+                SyncJobPayload::BackUpDatabase {
                     version: SYNC_JOB_PAYLOAD_VERSION,
-                    snapshot_id: snapshot.id,
-                    source_id: None,
                     destination_storage_id: storage.id,
                     destination_object_key: object_key,
                 },
@@ -720,12 +626,88 @@ impl BackupService {
             ));
         }
         if jobs.is_empty() {
-            complete_snapshot_triggers(self.catalog.as_ref(), &mut triggers, snapshot.id).await?;
             return Ok(None);
         }
         self.engine.persist_plan(run.clone(), jobs).await?;
-        complete_snapshot_triggers(self.catalog.as_ref(), &mut triggers, snapshot.id).await?;
         Ok(Some(run.id))
+    }
+
+    /// Every catalog database copy held by an enabled backup storage, newest first.
+    pub async fn list_database_backups(&self) -> Result<Vec<DatabaseBackup>, BackupError> {
+        let mut backups = Vec::new();
+        for storage in MusicStorageRepository::list(self.catalog.as_ref()).await? {
+            if storage.role != StorageRole::Backup || !storage.enabled {
+                continue;
+            }
+            let Ok(provider) = self.providers.get(storage.id) else {
+                continue;
+            };
+            let mut cursor = None;
+            loop {
+                let page = provider
+                    .inventory_page(InventoryRequest {
+                        mode: InventoryMode::Full,
+                        page_cursor: cursor.clone(),
+                        page_size: None,
+                        prefix: Some(DATABASE_BACKUP_DIRECTORY.into()),
+                        include_checksums: false,
+                    })
+                    .await
+                    .map_err(BackupError::Storage)?;
+                for object in page.objects {
+                    if !object.name.ends_with(".db") {
+                        continue;
+                    }
+                    backups.push(DatabaseBackup {
+                        storage_id: storage.id,
+                        storage_name: storage.name.clone(),
+                        object_id: object.object_id,
+                        size_bytes: object.size_bytes,
+                        created_at: object.modified_at,
+                    });
+                }
+                cursor = page.next_page_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+        backups.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        Ok(backups)
+    }
+
+    /// Downloads one backup and stages it to replace the catalog on the next start.
+    ///
+    /// The running process holds the live database open, so the swap cannot happen now.
+    /// Staging it and letting startup do the move keeps the exchange to one rename
+    /// against a database nothing has opened yet.
+    pub async fn restore_database(
+        &self,
+        backup: &DatabaseBackup,
+        catalog_path: &Path,
+    ) -> Result<PathBuf, BackupError> {
+        let provider = self.providers.get(backup.storage_id)?;
+        let staged = staged_restore_path(catalog_path);
+        ensure_staging_parent(&staged)
+            .await
+            .map_err(|error| BackupError::InvalidRequest(error.to_string()))?;
+        provider
+            .download(DownloadRequest {
+                object_id: backup.object_id.clone(),
+                destination_path: staged.clone(),
+                range: None,
+                expected_checksum: None,
+                overwrite: true,
+            })
+            .await
+            .map_err(BackupError::Storage)?;
+        // A file that will not open as a catalog must never displace the live one.
+        TursoCatalog::open(&staged).await.map_err(|error| {
+            BackupError::InvalidRequest(format!(
+                "the downloaded backup is not a usable catalog: {error}"
+            ))
+        })?;
+        Ok(staged)
     }
 
     pub async fn review_retention(
@@ -840,8 +822,6 @@ impl BackupService {
             }
             validated.push((key, storage_id));
         }
-        self.record_snapshot_trigger(SnapshotReason::BeforeRetentionCleanup, None, now)
-            .await?;
         for (key, storage_id) in validated {
             self.catalog
                 .put_cleanup_approval(PersistedCleanupApproval {
@@ -923,20 +903,6 @@ impl BackupService {
                 request.trigger = ReplicationTrigger::Schedule;
                 Ok(BackupSchedulerOutcome::Replication(
                     self.plan_replication(request, now).await?,
-                ))
-            }
-            BackupSchedulerHook::Snapshot {
-                reason,
-                source_run_id,
-            } => Ok(BackupSchedulerOutcome::SnapshotRecorded(
-                self.record_snapshot_trigger(reason, source_run_id, now)
-                    .await?,
-            )),
-            BackupSchedulerHook::DailySnapshot => {
-                self.record_snapshot_trigger(SnapshotReason::Daily, None, now)
-                    .await?;
-                Ok(BackupSchedulerOutcome::SnapshotRun(
-                    self.create_due_snapshot(now).await?,
                 ))
             }
             BackupSchedulerHook::Verification {
@@ -1063,15 +1029,13 @@ impl JobExecutor for BackupExecutor {
                     )
                     .await
                 }
-                SyncJobPayload::CreateCatalogSnapshot {
-                    snapshot_id,
+                SyncJobPayload::BackUpDatabase {
                     destination_storage_id,
                     destination_object_key,
                     ..
                 } => {
-                    self.execute_snapshot(
+                    self.execute_database_backup(
                         &job,
-                        snapshot_id,
                         destination_storage_id,
                         destination_object_key,
                     )
@@ -1298,110 +1262,120 @@ impl BackupExecutor {
         }))
     }
 
-    async fn execute_snapshot(
+    /// Copies the catalog database into staging, uploads it, then verifies the copy.
+    ///
+    /// The staged file is hashed once and that hash drives both the upload and the
+    /// read-back, so a backup that arrives corrupted fails the job instead of passing as
+    /// a usable restore point.
+    async fn execute_database_backup(
         &self,
         job: &SyncJob,
-        snapshot_id: Uuid,
         destination_storage_id: Uuid,
         destination_object_key: String,
     ) -> Result<JobStep, SyncError> {
-        let snapshot = CatalogSnapshotRepository::get(self.catalog.as_ref(), snapshot_id)
-            .await
-            .map_err(repository_sync_error)?
-            .ok_or_else(|| {
-                sync_error(
-                    SyncErrorKind::NotFound,
-                    "snapshot.not_found",
-                    format!("catalog snapshot {snapshot_id} was not found"),
-                    false,
-                )
-            })?;
-        if !snapshot.verify_integrity() {
-            return Err(sync_error(
-                SyncErrorKind::Integrity,
-                "snapshot.integrity_failed",
-                "catalog snapshot failed its integrity check",
-                false,
-            ));
-        }
         let destination = self
             .providers
             .get(destination_storage_id)
             .map_err(backup_sync_error)?;
-        let expected = snapshot.content_hash().clone();
-        let path = staging_path(&self.staging_root, job.id, "snapshot.json");
+        let path = staging_path(&self.staging_root, job.id, "library.db");
         ensure_staging_parent(&path).await.map_err(io_sync_error)?;
-        let transfer = checkpoint_for(job, expected.clone(), None)?;
-        match transfer.stage {
-            TransferStage::PendingDownload => {
-                tokio::fs::write(&path, snapshot.payload())
+
+        let checkpoint = job
+            .checkpoint
+            .as_ref()
+            .and_then(|value| value.transfer.clone());
+        match checkpoint {
+            // A retry before the copy landed re-copies: the live database has moved on,
+            // so the previous attempt's checksum describes a file that no longer exists.
+            None
+            | Some(TransferCheckpoint {
+                stage: TransferStage::PendingDownload,
+                ..
+            }) => {
+                let bytes = self
+                    .catalog
+                    .copy_database_to(&path)
                     .await
-                    .map_err(io_sync_error)?;
+                    .map_err(repository_sync_error)?;
+                let hash = hash_file(&path).await?;
                 checkpoint_step(
                     job,
-                    transfer,
+                    TransferCheckpoint::new(hash.clone(), None),
                     TransferStage::DownloadVerified,
-                    &expected,
+                    &hash,
                     None,
                     None,
-                    snapshot.payload().len() as u64,
+                    bytes,
                 )
             }
-            TransferStage::DownloadVerified => {
-                let object = destination
-                    .upload(UploadRequest {
-                        source_path: path,
-                        object_path: destination_object_key,
-                        content_type: Some(SNAPSHOT_CONTENT_TYPE.into()),
-                        content_length: Some(snapshot.payload().len() as u64),
-                        expected_checksum: Some(expected.clone()),
-                        metadata: BTreeMap::from([
-                            ("rec_bag.snapshot_id".into(), snapshot_id.to_string()),
-                            ("rec_bag.operation_key".into(), job.idempotency_key.clone()),
-                        ]),
-                        idempotency_key: Some(job.idempotency_key.clone()),
-                    })
-                    .await
-                    .map_err(|error| storage_sync_error("snapshot.upload", error))?;
-                checkpoint_step(
-                    job,
-                    transfer,
-                    TransferStage::Uploaded,
-                    &expected,
-                    None,
-                    Some(object.object_id),
-                    0,
-                )
+            Some(transfer) => {
+                let expected = transfer.expected_checksum.clone();
+                match transfer.stage {
+                    TransferStage::PendingDownload => unreachable!("handled above"),
+                    TransferStage::DownloadVerified => {
+                        let length = tokio::fs::metadata(&path)
+                            .await
+                            .map_err(io_sync_error)?
+                            .len();
+                        let object = destination
+                            .upload(UploadRequest {
+                                source_path: path,
+                                object_path: destination_object_key,
+                                content_type: Some("application/vnd.sqlite3".into()),
+                                content_length: Some(length),
+                                expected_checksum: Some(expected.clone()),
+                                metadata: BTreeMap::from([(
+                                    "rec_bag.operation_key".into(),
+                                    job.idempotency_key.clone(),
+                                )]),
+                                idempotency_key: Some(job.idempotency_key.clone()),
+                            })
+                            .await
+                            .map_err(|error| storage_sync_error("database_backup.upload", error))?;
+                        checkpoint_step(
+                            job,
+                            transfer,
+                            TransferStage::Uploaded,
+                            &expected,
+                            None,
+                            Some(object.object_id),
+                            0,
+                        )
+                    }
+                    TransferStage::Uploaded => {
+                        let object_id =
+                            transfer.destination_object_id.clone().ok_or_else(|| {
+                                sync_error(
+                                    SyncErrorKind::InvalidData,
+                                    "database_backup.missing_object_id",
+                                    "database backup checkpoint has no destination object ID",
+                                    false,
+                                )
+                            })?;
+                        verify_destination(
+                            destination.as_ref(),
+                            &object_id,
+                            &expected,
+                            &staging_path(&self.staging_root, job.id, "library.verify"),
+                        )
+                        .await?;
+                        checkpoint_step(
+                            job,
+                            transfer,
+                            TransferStage::DestinationVerified,
+                            &expected,
+                            None,
+                            Some(object_id),
+                            0,
+                        )
+                    }
+                    TransferStage::DestinationVerified => {
+                        Ok(JobStep::Complete(JobCompletion::Succeeded {
+                            bytes_transferred: 0,
+                        }))
+                    }
+                }
             }
-            TransferStage::Uploaded => {
-                let object_id = transfer.destination_object_id.clone().ok_or_else(|| {
-                    sync_error(
-                        SyncErrorKind::InvalidData,
-                        "snapshot.missing_object_id",
-                        "snapshot upload checkpoint has no destination object ID",
-                        false,
-                    )
-                })?;
-                verify_destination(
-                    destination.as_ref(),
-                    &object_id,
-                    &expected,
-                    &staging_path(&self.staging_root, job.id, "snapshot.verify"),
-                )
-                .await?;
-                checkpoint_step(
-                    job,
-                    transfer,
-                    TransferStage::DestinationVerified,
-                    &expected,
-                    None,
-                    Some(object_id),
-                    0,
-                )
-            }
-            TransferStage::DestinationVerified => Ok(JobStep::Complete(JobCompletion::Succeeded {
-                bytes_transferred: 0,
-            })),
         }
     }
 }
@@ -1811,18 +1785,6 @@ fn mark_current_version(object: &StorageObject, versions: &mut [StorageObjectVer
     }
 }
 
-async fn complete_snapshot_triggers(
-    catalog: &TursoCatalog,
-    triggers: &mut [SnapshotTrigger],
-    snapshot_id: Uuid,
-) -> Result<(), RepositoryError> {
-    for trigger in triggers {
-        trigger.completed_snapshot_id = Some(snapshot_id);
-        catalog.put_snapshot_trigger(trigger.clone()).await?;
-    }
-    Ok(())
-}
-
 async fn active_approval(
     catalog: &TursoCatalog,
     storage_id: Uuid,
@@ -1848,18 +1810,6 @@ fn receipt_scope(job: &SyncJob) -> (Option<Uuid>, Option<Uuid>, Option<String>) 
             ..
         } => (
             Some(*asset_id),
-            Some(*destination_storage_id),
-            job.checkpoint
-                .as_ref()
-                .and_then(|checkpoint| checkpoint.transfer.as_ref())
-                .and_then(|transfer| transfer.destination_object_id.clone()),
-        ),
-        SyncJobPayload::CreateCatalogSnapshot {
-            snapshot_id,
-            destination_storage_id,
-            ..
-        } => (
-            Some(*snapshot_id),
             Some(*destination_storage_id),
             job.checkpoint
                 .as_ref()
@@ -1909,17 +1859,6 @@ fn retention_review_json(review: &RetentionReview) -> serde_json::Value {
 fn parse_expected_checksum(value: &str) -> Option<ContentHash> {
     let digest = value.strip_prefix("sha256:").unwrap_or(value);
     ContentHash::sha256(digest).ok()
-}
-
-fn snapshot_reason_key(reason: SnapshotReason) -> &'static str {
-    match reason {
-        SnapshotReason::SuccessfulSync => "successful_sync",
-        SnapshotReason::ReconciliationChange => "reconciliation_change",
-        SnapshotReason::CatalogEdit => "catalog_edit",
-        SnapshotReason::BeforePrimaryMigration => "before_primary_migration",
-        SnapshotReason::BeforeRetentionCleanup => "before_retention_cleanup",
-        SnapshotReason::Daily => "daily",
-    }
 }
 
 fn deterministic_uuid(value: &str) -> Uuid {
@@ -2775,73 +2714,5 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-    }
-
-    #[tokio::test]
-    async fn snapshot_debounce_fingerprint_and_exact_retention_approval_are_persistent() {
-        let catalog = Arc::new(TursoCatalog::in_memory().await.unwrap());
-        let providers = Arc::new(BackupProviderRegistry::default());
-        let service = BackupService::new(catalog.clone(), providers, temp_root("snapshot"));
-        let now = Utc::now();
-        service
-            .record_snapshot_trigger(SnapshotReason::CatalogEdit, None, now)
-            .await
-            .unwrap();
-        assert!(service.create_due_snapshot(now).await.unwrap().is_none());
-        // There are no backups, but the due trigger is still completed by a durable local snapshot.
-        assert!(service
-            .create_due_snapshot(now + DEFAULT_DEBOUNCE)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(catalog
-            .list_snapshot_triggers()
-            .await
-            .unwrap()
-            .iter()
-            .all(|trigger| trigger.completed_snapshot_id.is_some()));
-
-        let storage_id = Uuid::new_v4();
-        let backup = configured_storage(
-            storage_id,
-            MusicStorageKind::LocalDirectory,
-            StorageRole::Backup,
-        );
-        MusicStorageRepository::upsert(catalog.as_ref(), backup)
-            .await
-            .unwrap();
-        let review = RetentionReview {
-            generated_at: now,
-            items: vec![RetentionReviewItem {
-                storage_id,
-                object_id: "track.flac".into(),
-                evaluation: RetentionEvaluation {
-                    status: rec_sync::RetentionStatus::ReviewRequired,
-                    retained_version_ids: Vec::new(),
-                    cleanup_candidates: vec![rec_sync::CleanupCandidate {
-                        object_id: "track.flac".into(),
-                        version_id: "old".into(),
-                        modified_at: Some(now - Duration::days(90)),
-                        reason: "expired".into(),
-                    }],
-                },
-                approved_candidate_keys: BTreeSet::new(),
-            }],
-        };
-        let keys = review.candidate_keys();
-        service
-            .approve_retention_candidates(&review, &keys, "tester", now, None)
-            .await
-            .unwrap();
-        let key = keys.iter().next().unwrap();
-        assert!(catalog
-            .get_cleanup_approval(storage_id, key)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(service
-            .approve_retention_candidates(&review, &BTreeSet::new(), "tester", now, None,)
-            .await
-            .is_err());
     }
 }

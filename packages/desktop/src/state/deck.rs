@@ -106,25 +106,6 @@ impl Default for DeckSnapshot {
     }
 }
 
-
-// [DEBUG-4e77] Probe: what the refresh loop actually observes in the running app.
-pub(crate) fn debug_4e77(line: &str) {
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/rec_bag_probe.log")
-    {
-        let _ = writeln!(file, "{line}");
-    }
-}
-
-pub(crate) fn debug_4e77_every(counter: &std::sync::atomic::AtomicUsize, n: usize) -> bool {
-    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n == 0
-}
-
-static DEBUG_4E77_REFRESH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// One playback channel that a Loaded Track occupies.
 #[derive(Clone, Copy)]
 pub struct Deck {
@@ -254,26 +235,14 @@ impl Deck {
     /// Skips the update when the audio output is busy, so a refresh never blocks the
     /// interface. Writing only on change keeps an idle deck from re-rendering.
     pub fn refresh(&self) {
-        let loud = self.index == 0 && debug_4e77_every(&DEBUG_4E77_REFRESH, 20);
         let observed = {
             let shared = self.audio.read().clone();
             let Ok(audio) = shared.try_lock() else {
-                if loud {
-                    debug_4e77("refresh: TRY_LOCK FAILED");
-                }
                 return;
             };
             observe(&*audio, self.index)
         };
-        let current = self.live.read().clone();
-        let changed = current != observed;
-        if loud {
-            debug_4e77(&format!(
-                "refresh: observed={:?} state={:?} current={:?} changed={changed}",
-                observed.position, observed.state, current.position
-            ));
-        }
-        if changed {
+        if *self.live.read() != observed {
             let mut live = self.live;
             live.set(observed);
         }
@@ -722,7 +691,11 @@ mod view_tests {
             decks[0].play();
         });
         dom.render_immediate(&mut dioxus_core::NoOpMutations);
-        assert_eq!(rendered_playhead(&dom), 0, "playback starts at the beginning");
+        assert_eq!(
+            rendered_playhead(&dom),
+            0,
+            "playback starts at the beginning"
+        );
 
         // The audio output has moved on, exactly as it does while a track plays.
         fake.lock().unwrap().decks[0].position = Duration::from_secs(30);

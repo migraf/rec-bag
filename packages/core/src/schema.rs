@@ -17,7 +17,7 @@ use uuid::Uuid;
 pub const LEGACY_CATALOG_SCHEMA_VERSION: CatalogSchemaVersion = CatalogSchemaVersion(1);
 
 /// The current provider-independent catalog layout required by the core contracts.
-pub const CURRENT_CATALOG_SCHEMA_VERSION: CatalogSchemaVersion = CatalogSchemaVersion(3);
+pub const CURRENT_CATALOG_SCHEMA_VERSION: CatalogSchemaVersion = CatalogSchemaVersion(4);
 
 /// A validated catalog schema version.
 ///
@@ -590,12 +590,10 @@ pub enum RequiredCatalogTable {
     SyncIssues,
     /// Non-secret application and persistence settings.
     Settings,
-    /// Versioned, integrity-addressed catalog recovery snapshots.
-    CatalogSnapshots,
 }
 
 impl RequiredCatalogTable {
-    /// Stable logical key for diagnostics, snapshots, and capability declarations.
+    /// Stable logical key for diagnostics and capability declarations.
     /// It does not require a backend to use the key as a physical table name.
     pub const fn logical_name(self) -> &'static str {
         match self {
@@ -627,7 +625,6 @@ impl RequiredCatalogTable {
             Self::SyncJobs => "sync_jobs",
             Self::SyncIssues => "sync_issues",
             Self::Settings => "settings",
-            Self::CatalogSnapshots => "catalog_snapshots",
         }
     }
 }
@@ -668,7 +665,6 @@ pub const REQUIRED_CATALOG_TABLES: &[RequiredCatalogTable] = &[
     RequiredCatalogTable::SyncJobs,
     RequiredCatalogTable::SyncIssues,
     RequiredCatalogTable::Settings,
-    RequiredCatalogTable::CatalogSnapshots,
 ];
 
 #[cfg(test)]

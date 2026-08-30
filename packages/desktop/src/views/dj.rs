@@ -24,15 +24,6 @@ pub fn DjView() -> Element {
     // when a playhead moves.
     let visible = use_memo(move || browser.visible_tracks());
 
-    // [DEBUG-4e77] Does this view re-render, and what position does it read?
-    {
-        static RENDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        if crate::state::deck::debug_4e77_every(&RENDERS, 20) {
-            let positions: Vec<_> = app_state.decks().iter().map(|d| d.position()).collect();
-            crate::state::deck::debug_4e77(&format!("DjView render: positions={positions:?}"));
-        }
-    }
-
     let on_context_action = move |action: ContextMenuAction| match action {
         ContextMenuAction::AddToPlaylist(playlist_id) => {
             browser.add_selection_to_playlist(playlist_id);

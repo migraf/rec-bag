@@ -90,7 +90,6 @@ pub struct SuiteResult {
     pub paginated_tracks: usize,
     pub reconciliation_inputs: usize,
     pub claimed_jobs: usize,
-    pub snapshot_bytes: usize,
 }
 
 pub async fn run_suite(config: BenchConfig) -> BenchResult<SuiteResult> {
@@ -142,23 +141,6 @@ pub async fn run_suite(config: BenchConfig) -> BenchResult<SuiteResult> {
         120,
     );
 
-    let started = Instant::now();
-    let snapshot = source.export_snapshot().await?;
-    let snapshot_bytes = snapshot.payload().len();
-    let export = measure(
-        "snapshot_fingerprint_export",
-        started,
-        config.tracks,
-        config,
-        20,
-        240,
-    );
-
-    let imported = TursoCatalog::in_memory().await?;
-    let started = Instant::now();
-    imported.import_snapshot(&snapshot).await?;
-    let import = measure("snapshot_import", started, config.tracks, config, 30, 360);
-
     let job_catalog = TursoCatalog::in_memory().await?;
     seed_jobs(&job_catalog, config.jobs).await?;
     let started = Instant::now();
@@ -172,7 +154,7 @@ pub async fn run_suite(config: BenchConfig) -> BenchResult<SuiteResult> {
         240,
     );
 
-    let measurements = vec![migration, paginated, reconciliation, export, import, claims];
+    let measurements = vec![migration, paginated, reconciliation, claims];
     for value in &measurements {
         value.print_and_check(config.enforce_thresholds)?;
     }
@@ -182,7 +164,6 @@ pub async fn run_suite(config: BenchConfig) -> BenchResult<SuiteResult> {
         paginated_tracks,
         reconciliation_inputs,
         claimed_jobs,
-        snapshot_bytes,
     })
 }
 

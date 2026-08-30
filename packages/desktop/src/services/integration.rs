@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -20,14 +20,14 @@ use rec_core::{
     SourceRepository, StorageRole, StorageVerificationStatus,
 };
 use rec_persistence::TursoCatalog;
-use rec_sync::{SnapshotTrigger as SnapshotReason, VerificationCadence, VerificationRequest};
+use rec_sync::{VerificationCadence, VerificationRequest};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Notify};
 use ui::{CleanupItemView, MusicManagementView};
 use uuid::Uuid;
 
 use super::{
-    backup::{BackupProviderRegistry, BackupService, RetentionReview},
+    backup::{BackupProviderRegistry, BackupService, DatabaseBackup, RetentionReview},
     catalog_projection::CatalogViewBuilder,
     google_drive::{
         DriveFolderSelection, DriveRuntimeFactory, DriveRuntimeRegistry, GoogleCredential,
@@ -41,13 +41,9 @@ use super::{
     },
     profile_manager::{
         AssumeOwnershipConfirmation, HeartbeatHandle, ManagerIdentity, OwnershipLease,
-        OwnershipStatus, ProfileManager, ProfileManagerError, TakeoverReason,
+        OwnershipStatus, ProfileManager, ProfileManagerError,
     },
     reconciliation_actions::ReconciliationActionsService,
-    recovery::{
-        OwnershipHandoff, RecoveryService, RestoreOptions, RestoreReport, SnapshotListing,
-        SnapshotTransferConfirmation,
-    },
     scheduler::{
         start_scheduler, ScheduledTask, SchedulerConfig, SchedulerError, SchedulerHandle,
         SchedulerTaskError, SchedulerTasks, TaskOutcome,
@@ -195,11 +191,12 @@ impl OwnershipTakeoverOffer {
 /// Live Stage 4 runtime shared by all desktop views.
 pub struct DesktopIntegration {
     catalog: Arc<TursoCatalog>,
+    /// Where the catalog database lives, so a restore knows what it is replacing.
+    catalog_path: PathBuf,
     registry: Arc<ProviderRegistry>,
     projector: Arc<LocalLibraryService>,
     soundcloud: Arc<SoundCloudCatalogService>,
     backup: Arc<BackupService>,
-    recovery: Arc<RecoveryService>,
     profile_manager: ProfileManager,
     ownership_lease: Mutex<OwnershipLease>,
     previous_owner_device: Option<String>,
@@ -285,6 +282,7 @@ impl DesktopIntegration {
         lease: OwnershipLease,
         previous_owner_device: Option<String>,
     ) -> Result<Arc<Self>, IntegrationError> {
+        apply_staged_restore(&paths.catalog)?;
         tracing::info!(catalog_path = %paths.catalog.display(), "desktop integration startup: opening catalog");
         let catalog = Arc::new(TursoCatalog::open(&paths.catalog).await.map_err(|error| {
             startup_error(format!(
@@ -293,24 +291,7 @@ impl DesktopIntegration {
             ))
         })?);
         tracing::info!("desktop integration startup: catalog opened and migrations completed");
-        let recovery = Arc::new(RecoveryService::new(
-            catalog.clone(),
-            paths.snapshots.clone(),
-        ));
         let mut startup_errors = Vec::new();
-        tracing::debug!("desktop integration startup: checking interrupted recovery");
-        if let Some(progress) = recovery.recover_interrupted().await.map_err(|error| {
-            startup_error(format!("Could not reconcile interrupted recovery: {error}"))
-        })? {
-            startup_errors.push(startup_error(progress.message));
-        }
-        tracing::debug!("desktop integration startup: persisting catalog authority");
-        recovery
-            .persist_catalog_authority(&manager, &lease)
-            .await
-            .map_err(|error| {
-                startup_error(format!("Could not persist profile authority: {error}"))
-            })?;
 
         tracing::debug!("desktop integration startup: creating local-library services");
         let credentials = production_credentials();
@@ -388,7 +369,6 @@ impl DesktopIntegration {
             local,
             soundcloud,
             backup,
-            recovery,
             manager,
             lease,
             previous_owner_device,
@@ -405,7 +385,6 @@ impl DesktopIntegration {
         projector: Arc<LocalLibraryService>,
         soundcloud: Arc<SoundCloudCatalogService>,
         backup: Arc<BackupService>,
-        recovery: Arc<RecoveryService>,
         profile_manager: ProfileManager,
         ownership_lease: OwnershipLease,
         previous_owner_device: Option<String>,
@@ -419,12 +398,12 @@ impl DesktopIntegration {
             .map(|slice| (slice, Arc::new(Notify::new())))
             .collect();
         Self {
+            catalog_path: catalog.path().map(Path::to_path_buf).unwrap_or_default(),
             catalog,
             registry,
             projector,
             soundcloud,
             backup,
-            recovery,
             profile_manager,
             ownership_lease: Mutex::new(ownership_lease),
             previous_owner_device,
@@ -492,16 +471,6 @@ impl DesktopIntegration {
         }
         self.require_ownership(Some(&request))?;
         let _catalog_operation = self.catalog_operation_lock.lock().await;
-        if matches!(
-            request.event,
-            ui::MusicManagementEvent::PreparePrimaryMigration(_)
-        ) {
-            self.record_snapshot(SnapshotReason::BeforePrimaryMigration, None)
-                .await
-                .map_err(|error| {
-                    IntegrationError::for_request(&request, error.message, error.retryable)
-                })?;
-        }
         let handler = self.registry.handler(request.slice).ok_or_else(|| {
             IntegrationError::for_request(
                 &request,
@@ -511,11 +480,6 @@ impl DesktopIntegration {
         })?;
         let mut outcome = handler.handle(request.clone()).await?;
         tracing::debug!(request_id = request.id, slice = ?request.slice, "provider handler completed; processing cross-slice work");
-        if let Some(reason) = snapshot_reason_for_event(&request.event) {
-            self.record_snapshot(reason, None).await.map_err(|error| {
-                IntegrationError::for_request(&request, error.message, error.retryable)
-            })?;
-        }
         self.complete_cross_slice_handoffs(&request, &mut outcome)
             .await;
         if matches!(
@@ -637,7 +601,6 @@ impl DesktopIntegration {
                 backup: self.backup.clone(),
                 catalog_operation_lock: self.catalog_operation_lock.clone(),
                 soundcloud: self.soundcloud.clone(),
-                recovery: self.recovery.clone(),
                 profile_manager: self.profile_manager.clone(),
             });
             *scheduler = Some(start_scheduler(tasks, SchedulerConfig::default()));
@@ -646,117 +609,43 @@ impl DesktopIntegration {
         Ok(())
     }
 
-    pub fn recovery_snapshots(&self) -> Result<Vec<SnapshotListing>, IntegrationError> {
-        let _operation = self.begin_unscoped_operation("Recovery listing")?;
+    /// Every catalog database copy held by a configured backup storage, newest first.
+    pub async fn database_backups(&self) -> Result<Vec<DatabaseBackup>, IntegrationError> {
+        let _operation = self.begin_unscoped_operation("Database backup listing")?;
         self.require_ownership(None)?;
-        self.recovery
-            .list_snapshots()
-            .map_err(|error| recovery_error(error.to_string()))
-    }
-
-    pub async fn prepare_snapshot_transfer(
-        &self,
-        listing: &SnapshotListing,
-    ) -> Result<Option<SnapshotTransferConfirmation>, IntegrationError> {
-        let _operation = self.begin_unscoped_operation("Snapshot ownership transfer")?;
-        self.require_ownership(None)?;
-        let Some(observed) = listing.authority.as_ref() else {
-            return Ok(None);
-        };
-        let current = self
-            .recovery
-            .catalog_authority()
+        self.backup
+            .list_database_backups()
             .await
-            .map_err(|error| recovery_error(error.to_string()))?;
-        let transfer_required = current.as_ref().is_none_or(|current| {
-            observed.profile_id != current.profile_id
-                || observed.manager_device != current.manager_device
-                || observed.ownership_generation > current.ownership_generation
-        });
-        if !transfer_required {
-            return Ok(None);
-        }
-        self.recovery
-            .prepare_snapshot_transfer(listing, &self.profile_manager, Utc::now())
-            .map(Some)
-            .map_err(|error| recovery_error(error.to_string()))
+            .map_err(|error| backup_error(error.to_string()))
     }
 
-    pub fn cancel_snapshot_transfer(
-        &self,
-        confirmation: &SnapshotTransferConfirmation,
-    ) -> Result<bool, IntegrationError> {
-        self.recovery
-            .cancel_snapshot_transfer(confirmation)
-            .map_err(|error| recovery_error(error.to_string()))
-    }
-
-    pub async fn dry_run_restore(&self, path: PathBuf) -> Result<RestoreReport, IntegrationError> {
-        self.restore_snapshot_internal(path, true, None).await
-    }
-
-    pub async fn restore_snapshot(
-        &self,
-        path: PathBuf,
-        dry_run: bool,
-    ) -> Result<RestoreReport, IntegrationError> {
-        self.restore_snapshot_internal(path, dry_run, None).await
-    }
-
-    pub async fn restore_snapshot_with_confirmation(
-        &self,
-        path: PathBuf,
-        confirmation: SnapshotTransferConfirmation,
-    ) -> Result<RestoreReport, IntegrationError> {
-        self.restore_snapshot_internal(path, false, Some(confirmation))
-            .await
-    }
-
-    async fn restore_snapshot_internal(
-        &self,
-        path: PathBuf,
-        dry_run: bool,
-        snapshot_confirmation: Option<SnapshotTransferConfirmation>,
-    ) -> Result<RestoreReport, IntegrationError> {
-        let _operation = self.begin_unscoped_operation("Catalog recovery")?;
+    /// Copies the catalog database to every configured backup storage.
+    ///
+    /// Nothing schedules this. A backup is a copy of the database as it stands when the
+    /// user asks for one.
+    pub async fn back_up_database(&self) -> Result<Option<Uuid>, IntegrationError> {
+        let _operation = self.begin_unscoped_operation("Database backup")?;
         self.require_ownership(None)?;
-        let lease = self.ownership_lease.lock().await.clone();
-        let ownership_handoff = self
-            .previous_owner_device
-            .clone()
-            .and_then(|previous_device_id| {
-                matches!(
-                    lease.takeover_reason,
-                    TakeoverReason::ConfirmedHandoff | TakeoverReason::ExpiredLease
-                )
-                .then_some(OwnershipHandoff {
-                    previous_device_id,
-                    lease,
-                })
-            });
-        let restore = self.recovery.restore(
-            path,
-            RestoreOptions {
-                dry_run,
-                ownership_handoff,
-                snapshot_confirmation,
-            },
-            Some(&self.profile_manager),
-        );
-        tokio::select! {
-            biased;
-            _ = self.shutdown_notify.notified() => {
-                Err(recovery_error("Recovery was cancelled by application shutdown"))
-            }
-            result = restore => result.map_err(|error| recovery_error(error.to_string())),
-        }
+        self.backup
+            .back_up_database(Utc::now())
+            .await
+            .map_err(|error| backup_error(error.to_string()))
     }
 
-    pub async fn rollback_restore(
+    /// Downloads a backup and stages it to replace the catalog on the next start.
+    ///
+    /// The catalog is open and in use, so the exchange waits for a moment when nothing
+    /// holds it. Returns the staged path; restarting the application completes it.
+    pub async fn restore_database_backup(
         &self,
-        pre_restore_snapshot: PathBuf,
-    ) -> Result<RestoreReport, IntegrationError> {
-        self.restore_snapshot(pre_restore_snapshot, false).await
+        backup: &DatabaseBackup,
+    ) -> Result<PathBuf, IntegrationError> {
+        let _operation = self.begin_unscoped_operation("Database restore")?;
+        self.require_ownership(None)?;
+        self.backup
+            .restore_database(backup, &self.catalog_path)
+            .await
+            .map_err(|error| backup_error(error.to_string()))
     }
 
     pub async fn initial_view(&self) -> Result<MusicManagementView, IntegrationError> {
@@ -914,28 +803,6 @@ impl DesktopIntegration {
         ))
     }
 
-    async fn record_snapshot(
-        &self,
-        reason: SnapshotReason,
-        source_run_id: Option<Uuid>,
-    ) -> Result<(), IntegrationError> {
-        let now = Utc::now();
-        self.backup
-            .record_snapshot_trigger(reason, source_run_id, now)
-            .await
-            .map_err(|error| provider_error(IntegrationSlice::Backup, error.to_string()))?;
-        let snapshot = self.catalog.export_snapshot().await.map_err(|error| {
-            recovery_error(format!("Could not export recovery snapshot: {error}"))
-        })?;
-        self.recovery
-            .store_snapshot(&snapshot)
-            .map_err(|error| recovery_error(error.to_string()))?;
-        if let Some(scheduler) = self.scheduler.lock().await.as_ref() {
-            scheduler.wake();
-        }
-        Ok(())
-    }
-
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
@@ -983,7 +850,6 @@ struct RuntimeSchedulerTasks {
     backup: Arc<BackupService>,
     catalog_operation_lock: Arc<Mutex<()>>,
     soundcloud: Arc<SoundCloudCatalogService>,
-    recovery: Arc<RecoveryService>,
     profile_manager: ProfileManager,
 }
 
@@ -1025,16 +891,6 @@ impl SchedulerTasks for RuntimeSchedulerTasks {
                             .map_err(|error| scheduler_integration_error(error))?;
                         synced = true;
                     }
-                    if synced {
-                        persist_recovery_snapshot(
-                            self.catalog.as_ref(),
-                            self.backup.as_ref(),
-                            self.recovery.as_ref(),
-                            SnapshotReason::SuccessfulSync,
-                            now,
-                        )
-                        .await?;
-                    }
                     Ok(TaskOutcome {
                         made_progress: synced,
                         next_due: None,
@@ -1072,40 +928,15 @@ impl SchedulerTasks for RuntimeSchedulerTasks {
                         next_due: None,
                     })
                     .map_err(scheduler_backup_error),
-                ScheduledTask::DailySnapshot => {
-                    persist_recovery_snapshot(
-                        self.catalog.as_ref(),
-                        self.backup.as_ref(),
-                        self.recovery.as_ref(),
-                        SnapshotReason::Daily,
-                        now,
-                    )
-                    .await?;
-                    let run = self
-                        .backup
-                        .create_due_snapshot(now)
-                        .await
-                        .map_err(scheduler_backup_error)?;
-                    Ok(TaskOutcome {
-                        made_progress: run.is_some(),
-                        next_due: None,
-                    })
-                }
             }
         })
     }
 
     fn checkpoint(
         &self,
-        now: chrono::DateTime<Utc>,
+        _now: chrono::DateTime<Utc>,
     ) -> BoxFuture<'_, Result<(), SchedulerTaskError>> {
-        Box::pin(async move {
-            self.backup
-                .create_due_snapshot(now)
-                .await
-                .map_err(scheduler_backup_error)?;
-            Ok(())
-        })
+        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -1237,27 +1068,6 @@ fn append_outcome_message(outcome: &mut IntegrationOutcome, message: impl Into<S
     });
 }
 
-fn snapshot_reason_for_event(event: &ui::MusicManagementEvent) -> Option<SnapshotReason> {
-    use ui::MusicManagementEvent;
-    match event {
-        MusicManagementEvent::PreparePrimaryMigration(_) => None,
-        MusicManagementEvent::AddSource(ui::ProviderChoice::SoundCloud)
-        | MusicManagementEvent::SyncSource(_)
-        | MusicManagementEvent::RetrySyncRun { .. } => Some(SnapshotReason::SuccessfulSync),
-        MusicManagementEvent::ReviewMatch(_)
-        | MusicManagementEvent::ConfirmMatch(_)
-        | MusicManagementEvent::RejectMatch(_)
-        | MusicManagementEvent::AssociateLocalFile { .. }
-        | MusicManagementEvent::AssociateUnknownFile { .. }
-        | MusicManagementEvent::ApproveExternalChange { .. }
-        | MusicManagementEvent::RetryReconciliationResult { .. }
-        | MusicManagementEvent::ImportUnknownFile(_)
-        | MusicManagementEvent::IgnoreUnknownFile(_) => Some(SnapshotReason::ReconciliationChange),
-        MusicManagementEvent::SetTrackFilter(_) => None,
-        _ => Some(SnapshotReason::CatalogEdit),
-    }
-}
-
 async fn list_sources(catalog: &TursoCatalog) -> Result<Vec<CatalogSource>, String> {
     let mut cursor = None;
     let mut sources = Vec::new();
@@ -1335,27 +1145,6 @@ async fn verification_requests(catalog: &TursoCatalog) -> Result<Vec<Verificatio
         .collect())
 }
 
-async fn persist_recovery_snapshot(
-    catalog: &TursoCatalog,
-    backup: &BackupService,
-    recovery: &RecoveryService,
-    reason: SnapshotReason,
-    now: chrono::DateTime<Utc>,
-) -> Result<(), SchedulerTaskError> {
-    backup
-        .record_snapshot_trigger(reason, None, now)
-        .await
-        .map_err(scheduler_backup_error)?;
-    let snapshot = catalog
-        .export_snapshot()
-        .await
-        .map_err(|error| SchedulerTaskError::Unavailable(error.to_string()))?;
-    recovery
-        .store_snapshot(&snapshot)
-        .map_err(|error| SchedulerTaskError::Failed(error.to_string()))?;
-    Ok(())
-}
-
 fn scheduler_backup_error(error: super::backup::BackupError) -> SchedulerTaskError {
     if error.retryable() {
         SchedulerTaskError::Unavailable(error.to_string())
@@ -1388,11 +1177,11 @@ fn ownership_error(error: ProfileManagerError) -> IntegrationError {
     }
 }
 
-fn recovery_error(message: impl Into<String>) -> IntegrationError {
+fn backup_error(message: impl Into<String>) -> IntegrationError {
     IntegrationError {
         request_id: None,
         slice: None,
-        message: format!("Recovery operation failed: {}", message.into()),
+        message: format!("Backup operation failed: {}", message.into()),
         retryable: false,
     }
 }
@@ -1433,7 +1222,6 @@ struct DesktopPaths {
     catalog: PathBuf,
     drive_cache: PathBuf,
     staging: PathBuf,
-    snapshots: PathBuf,
 }
 
 impl DesktopPaths {
@@ -1455,7 +1243,6 @@ impl DesktopPaths {
             catalog: root.join("library.db"),
             drive_cache: root.join("cache").join("google-drive"),
             staging: root.join("staging"),
-            snapshots: root.join("recovery").join("catalog-snapshots"),
             root,
         })
     }
@@ -1478,6 +1265,34 @@ fn default_data_directory() -> Option<PathBuf> {
             })
     }
     .map(|path| path.join("rec_bag"))
+}
+
+/// Moves a staged database backup into place before anything opens the catalog.
+///
+/// A restore downloads and verifies its file while the application runs, but cannot swap
+/// it in then: the catalog is open. Startup is the one moment nothing holds it, so the
+/// exchange is a rename here, with the replaced database kept alongside.
+fn apply_staged_restore(catalog_path: &Path) -> Result<(), IntegrationError> {
+    let staged = crate::services::backup::staged_restore_path(catalog_path);
+    if !staged.exists() {
+        return Ok(());
+    }
+    tracing::info!(staged = %staged.display(), "applying a staged database restore");
+    if catalog_path.exists() {
+        let replaced = catalog_path.with_extension("db.replaced");
+        std::fs::rename(catalog_path, &replaced).map_err(|error| {
+            startup_error(format!("Could not set the current catalog aside: {error}"))
+        })?;
+    }
+    // A WAL beside the replaced database describes pages the restored file does not have.
+    let _ = std::fs::remove_file(catalog_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(catalog_path.with_extension("db-shm"));
+    std::fs::rename(&staged, catalog_path).map_err(|error| {
+        startup_error(format!(
+            "Could not move the restored catalog into place: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn startup_error(message: impl Into<String>) -> IntegrationError {
@@ -2804,10 +2619,6 @@ mod tests {
             backup_providers.clone(),
             root.path().join("staging"),
         ));
-        let recovery = Arc::new(RecoveryService::new(
-            catalog.clone(),
-            root.path().join("snapshots"),
-        ));
         let manager = ProfileManager::new(
             root.path(),
             ManagerIdentity::new("profile", "device"),
@@ -2815,10 +2626,6 @@ mod tests {
         )
         .unwrap();
         let lease = manager.acquire(Utc::now()).unwrap();
-        recovery
-            .persist_catalog_authority(&manager, &lease)
-            .await
-            .unwrap();
         let drive_registry = Arc::new(DriveRuntimeRegistry::new(Arc::new(NeverDriveFactory)));
         let runtime = Arc::new(DesktopIntegration::from_parts(
             catalog,
@@ -2826,7 +2633,6 @@ mod tests {
             local,
             soundcloud,
             backup,
-            recovery,
             manager,
             lease,
             None,
@@ -2857,14 +2663,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_cannot_start_after_shutdown_begins() {
-        let (runtime, _root) = lifecycle_runtime("restore-shutdown").await;
+    async fn a_database_backup_cannot_start_after_shutdown_begins() {
+        let (runtime, _root) = lifecycle_runtime("backup-shutdown").await;
         runtime.begin_shutdown();
 
-        let error = runtime
-            .restore_snapshot(PathBuf::from("unused-snapshot"), false)
-            .await
-            .unwrap_err();
+        let error = runtime.back_up_database().await.unwrap_err();
 
         assert!(error.message.contains("cannot start"));
         runtime

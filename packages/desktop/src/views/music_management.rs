@@ -1,14 +1,10 @@
 //! Desktop adapter for the provider-independent music-management dashboard.
 
 use dioxus::prelude::*;
-use std::path::PathBuf;
 use ui::{MusicManagementDashboard, MusicManagementEvent, MusicManagementView, ProviderChoice};
 
-use crate::{
-    services::recovery::{CatalogAuthority, SnapshotListing, SnapshotTransferConfirmation},
-    state::integration::{
-        use_integration_state, IntegrationError, IntegrationEvent, IntegrationSlice, RecoveryAction,
-    },
+use crate::state::integration::{
+    use_integration_state, IntegrationError, IntegrationEvent, IntegrationSlice,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,7 +109,7 @@ impl SafeErrorKind {
     }
 }
 
-fn snapshot_date(value: Option<chrono::DateTime<chrono::Utc>>) -> String {
+fn backup_date(value: Option<chrono::DateTime<chrono::Utc>>) -> String {
     value.map_or_else(|| "Unknown date".into(), |date| date.to_rfc3339())
 }
 
@@ -139,22 +135,6 @@ fn classify_error(error: &IntegrationError) -> SafeErrorKind {
         }
     }
     SafeErrorKind::classify(&message)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DryRunReview {
-    listing: SnapshotListing,
-    foreign_authority: Option<CatalogAuthority>,
-    transfer_confirmation_required: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingRecoveryRestore {
-    path: PathBuf,
-    snapshot_id: Option<uuid::Uuid>,
-    authority: Option<CatalogAuthority>,
-    confirmation: Option<SnapshotTransferConfirmation>,
-    rollback: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -211,22 +191,18 @@ pub fn MusicManagement() -> Element {
         .collect();
     let events = snapshot.events.clone();
     let ownership_blocked_by = snapshot.ownership_blocked_by.clone();
-    let recovery_snapshots = snapshot.recovery_snapshots.clone();
-    let rollback_snapshot = snapshot.last_pre_restore_snapshot.clone();
+    let database_backups = snapshot.database_backups.clone();
+    let staged_restore = snapshot.staged_restore.clone();
     drop(snapshot);
 
     let mut presentation = use_signal(ErrorAccessibilityState::default);
     let mut confirm_takeover = use_signal(|| false);
-    let mut confirm_restore = use_signal(|| None::<PendingRecoveryRestore>);
-    let mut dry_run_review = use_signal(|| None::<DryRunReview>);
     let mut integration_state = integration.state;
     let mut dashboard_integration = integration.clone();
     let takeover_integration = integration.clone();
-    let recovery_refresh_integration = integration.clone();
-    let recovery_action_integration = integration.clone();
-    let transfer_prepare_integration = integration.clone();
-    let transfer_confirm_integration = integration.clone();
-    let transfer_cancel_integration = integration.clone();
+    let backup_refresh_integration = integration.clone();
+    let backup_now_integration = integration.clone();
+    let backup_restore_integration = integration.clone();
     let runtime_ready = integration.runtime().is_some();
 
     rsx! {
@@ -258,203 +234,58 @@ pub fn MusicManagement() -> Element {
             }
         }
         if runtime_ready {
-            section { class: "mm-section", "aria-label": "Catalog recovery",
+            section { class: "mm-section", "aria-label": "Database backups",
                 div { class: "mm-section-header",
                     div {
-                        h2 { "Catalog recovery" }
-                        p { "Verify snapshots before restoring. Every restore creates a rollback snapshot." }
+                        h2 { "Database backups" }
+                        p { "A backup is a copy of the catalog database, kept on every storage configured as a backup. Nothing runs on a schedule." }
                     }
-                    button {
-                        class: "mm-button secondary",
-                        onclick: move |_| {
-                            let mut recovery = recovery_refresh_integration.clone();
-                            spawn(async move { recovery.refresh_recovery_snapshots().await; });
-                        },
-                        "Refresh snapshots"
-                    }
-                }
-                if recovery_snapshots.is_empty() {
-                    p { "No local recovery snapshots are listed yet." }
-                } else {
-                    ul {
-                        for listing in recovery_snapshots.iter() {
-                            li { key: "{listing.path.display()}",
-                                strong { "{snapshot_date(listing.created_at)}" }
-                                span { " · {listing.health:?}" }
-                                if let Some(authority) = listing.authority.as_ref() {
-                                    span {
-                                        " · profile {authority.profile_id}, device {authority.manager_device}, generation {authority.ownership_generation}"
-                                    }
-                                }
-                                button {
-                                    class: "mm-link-button",
-                                    disabled: listing.health != crate::services::recovery::SnapshotHealth::Valid,
-                                    onclick: {
-                                        let listing = listing.clone();
-                                        let runtime = recovery_action_integration.runtime();
-                                        move |_| {
-                                            let listing = listing.clone();
-                                            let runtime = runtime.clone();
-                                            spawn(async move {
-                                                let Some(runtime) = runtime else { return; };
-                                                match runtime.dry_run_restore(listing.path.clone()).await {
-                                                    Ok(report) => dry_run_review.set(Some(DryRunReview {
-                                                        listing,
-                                                        foreign_authority: report.foreign_authority,
-                                                        transfer_confirmation_required: report.transfer_confirmation_required,
-                                                    })),
-                                                    Err(error) => integration_state.write().report_error(error),
-                                                }
-                                            });
-                                        }
-                                    },
-                                    "Dry run"
-                                }
-
-                            }
-                        }
-                    }
-                }
-                if let Some(review) = dry_run_review() {
-                    aside { class: "mm-activity-banner", role: "status", "aria-live": "polite",
-                        h3 { "Snapshot dry-run passed" }
-                        p { "Integrity, schema, secret filtering, and exact replacement checks completed without changing the catalog." }
-                        if let Some(authority) = review.foreign_authority.as_ref() {
-                            p {
-                                "Foreign authority: profile {authority.profile_id}, device {authority.manager_device}, generation {authority.ownership_generation}. Explicit transfer confirmation is required for restore."
-                            }
-                        }
-                        button {
-                            class: "mm-button primary",
-                            onclick: {
-                                let review = review.clone();
-                                let runtime = transfer_prepare_integration.runtime();
-                                move |_| {
-                                    let review = review.clone();
-                                    let runtime = runtime.clone();
-                                    spawn(async move {
-                                        let Some(runtime) = runtime else { return; };
-                                        match runtime.prepare_snapshot_transfer(&review.listing).await {
-                                            Ok(confirmation) => confirm_restore.set(Some(PendingRecoveryRestore {
-                                                path: review.listing.path,
-                                                snapshot_id: review.listing.id,
-                                                authority: review.listing.authority,
-                                                confirmation,
-                                                rollback: false,
-                                            })),
-                                            Err(error) => integration_state.write().report_error(error),
-                                        }
-                                    });
-                                }
-                            },
-                            if review.transfer_confirmation_required { "Review and confirm ownership transfer" } else { "Review and confirm restore" }
-                        }
-                    }
-                }
-                if let Some(path) = rollback_snapshot.clone() {
-                    button {
-                        class: "mm-button secondary",
-                        onclick: move |_| confirm_restore.set(Some(PendingRecoveryRestore {
-                            path: path.clone(),
-                            snapshot_id: None,
-                            authority: None,
-                            confirmation: None,
-                            rollback: true,
-                        })),
-                        "Roll back last restore"
-                    }
-                }
-                if let Some(pending) = confirm_restore() {
-                    div {
-                        class: "mm-error-banner",
-                        role: "alertdialog",
-                        "aria-modal": "true",
-                        "aria-labelledby": "snapshot-transfer-title",
-                        "aria-describedby": "snapshot-transfer-description",
-                        tabindex: "-1",
-                        h3 {
-                            id: "snapshot-transfer-title",
-                            if pending.rollback {
-                                "Confirm catalog rollback"
-                            } else if pending.confirmation.is_some() {
-                                "Confirm snapshot ownership transfer"
-                            } else {
-                                "Confirm catalog restore"
-                            }
-                        }
-                        p { id: "snapshot-transfer-description", "This replaces the current catalog after verification. Provider credentials are not restored." }
-                        if let Some(authority) = pending.authority.as_ref() {
-                            dl {
-                                dt { "Snapshot profile" }
-                                dd { "{authority.profile_id}" }
-                                dt { "Previous manager device" }
-                                dd { "{authority.manager_device}" }
-                                dt { "Ownership generation" }
-                                dd { "{authority.ownership_generation}" }
-                                if let Some(snapshot_id) = pending.snapshot_id {
-                                    dt { "Snapshot ID" }
-                                    dd { "{snapshot_id}" }
-                                }
-                            }
-                            if let Some(confirmation) = pending.confirmation.as_ref() {
-                                p { "Confirming transfers this snapshot to the current manager and advances its ownership generation. This confirmation expires at {confirmation.valid_until().to_rfc3339()}." }
-                            } else {
-                                p { "This snapshot authority already matches the current manager." }
-                            }
-                        }
-                        button {
-                            class: "mm-button primary",
-                            autofocus: true,
-                            onclick: {
-                                let pending = pending.clone();
-                                let integration = transfer_confirm_integration.clone();
-                                move |_| {
-                                let selected = pending.clone();
-                                let mut recovery = recovery_action_integration.clone();
-                                let runtime = integration.runtime();
-                                confirm_restore.set(None);
-                                spawn(async move {
-                                    if let Some(confirmation) = selected.confirmation {
-                                        let Some(runtime) = runtime else { return; };
-                                        match runtime.restore_snapshot_with_confirmation(selected.path, confirmation).await {
-                                            Ok(report) => {
-                                                if !report.pre_restore_snapshot.as_os_str().is_empty() {
-                                                    recovery.state.write().last_pre_restore_snapshot = Some(report.pre_restore_snapshot);
-                                                }
-                                                recovery.refresh_recovery_snapshots().await;
-                                            }
-                                            Err(error) => recovery.state.write().report_error(error),
-                                        }
-                                    } else {
-                                        let action = if selected.rollback { RecoveryAction::Rollback } else { RecoveryAction::Restore };
-                                        recovery.run_recovery(action, selected.path).await;
-                                    }
-                                });
-                                }
-                            },
-                            if pending.rollback {
-                                "Confirm rollback"
-                            } else if pending.confirmation.is_some() {
-                                "Confirm ownership transfer and restore"
-                            } else {
-                                "Confirm restore"
-                            }
-                        }
+                    div { class: "mm-section-actions",
                         button {
                             class: "mm-button secondary",
-                            onclick: {
-                                let pending = pending.clone();
-                                let integration = transfer_cancel_integration.clone();
-                                move |_| {
-                                    if let (Some(runtime), Some(confirmation)) = (integration.runtime(), pending.confirmation.as_ref()) {
-                                        if let Err(error) = runtime.cancel_snapshot_transfer(confirmation) {
-                                            integration_state.write().report_error(error);
-                                        }
-                                    }
-                                    confirm_restore.set(None);
-                                }
+                            onclick: move |_| {
+                                let mut backups = backup_refresh_integration.clone();
+                                spawn(async move { backups.refresh_database_backups().await; });
                             },
-                            "Cancel"
+                            "Refresh"
+                        }
+                        button {
+                            class: "mm-button primary",
+                            onclick: move |_| {
+                                let mut backups = backup_now_integration.clone();
+                                spawn(async move { backups.back_up_database().await; });
+                            },
+                            "Back up now"
+                        }
+                    }
+                }
+                if let Some(staged) = staged_restore.clone() {
+                    p { class: "mm-notice", role: "status",
+                        "A restored database is staged at {staged.display()}. Restart the application to put it in place."
+                    }
+                }
+                if database_backups.is_empty() {
+                    p { "No database backups are listed. Configure a backup storage, then back up." }
+                } else {
+                    ul { class: "mm-list",
+                        for backup in database_backups.iter() {
+                            li { key: "{backup.storage_id}:{backup.object_id}", class: "mm-list-row",
+                                strong { "{backup_date(backup.created_at)}" }
+                                span { " on {backup.storage_name} \u{2014} {backup.size_bytes} bytes" }
+                                button {
+                                    class: "mm-button secondary",
+                                    onclick: {
+                                        let backup = backup.clone();
+                                        let integration = backup_restore_integration.clone();
+                                        move |_| {
+                                            let mut backups = integration.clone();
+                                            let backup = backup.clone();
+                                            spawn(async move { backups.restore_database_backup(backup).await; });
+                                        }
+                                    },
+                                    "Restore"
+                                }
+                            }
                         }
                     }
                 }

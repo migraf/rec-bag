@@ -15,7 +15,7 @@ pub enum SyncRunKind {
     Reconciliation,
     AssetTransfer,
     BackupReplication,
-    CatalogSnapshot,
+    DatabaseBackup,
     FullSync,
 }
 
@@ -32,7 +32,7 @@ pub enum SyncJobKind {
     DownloadAsset,
     VerifyAsset,
     ReplicateAsset,
-    CreateCatalogSnapshot,
+    BackUpDatabase,
 }
 
 /// The current durable schema version of every [`SyncJobPayload`] variant.
@@ -128,10 +128,9 @@ pub enum SyncJobPayload {
         destination_storage_id: Uuid,
         destination_object_key: String,
     },
-    CreateCatalogSnapshot {
+    /// Uploads a consistent copy of the catalog database file to a backup storage.
+    BackUpDatabase {
         version: u16,
-        snapshot_id: Uuid,
-        source_id: Option<Uuid>,
         destination_storage_id: Uuid,
         destination_object_key: String,
     },
@@ -149,7 +148,7 @@ impl SyncJobPayload {
             Self::DownloadAsset { .. } => SyncJobKind::DownloadAsset,
             Self::VerifyAsset { .. } => SyncJobKind::VerifyAsset,
             Self::ReplicateAsset { .. } => SyncJobKind::ReplicateAsset,
-            Self::CreateCatalogSnapshot { .. } => SyncJobKind::CreateCatalogSnapshot,
+            Self::BackUpDatabase { .. } => SyncJobKind::BackUpDatabase,
         }
     }
 
@@ -164,7 +163,7 @@ impl SyncJobPayload {
             | Self::DownloadAsset { version, .. }
             | Self::VerifyAsset { version, .. }
             | Self::ReplicateAsset { version, .. }
-            | Self::CreateCatalogSnapshot { version, .. } => *version,
+            | Self::BackUpDatabase { version, .. } => *version,
         }
     }
 
@@ -1104,7 +1103,6 @@ mod tests {
         let destination_storage_id = Uuid::new_v4();
         let asset_id = Uuid::new_v4();
         let track_id = Uuid::new_v4();
-        let snapshot_id = Uuid::new_v4();
         let payloads = vec![
             (
                 SyncJobPayload::FetchCatalogPage {
@@ -1216,15 +1214,13 @@ mod tests {
                 "replicate_asset",
             ),
             (
-                SyncJobPayload::CreateCatalogSnapshot {
+                SyncJobPayload::BackUpDatabase {
                     version: SYNC_JOB_PAYLOAD_VERSION,
-                    snapshot_id,
-                    source_id: Some(source_id),
                     destination_storage_id,
-                    destination_object_key: "snapshots/catalog".to_owned(),
+                    destination_object_key: "catalog-backups/library.db".to_owned(),
                 },
-                SyncJobKind::CreateCatalogSnapshot,
-                "create_catalog_snapshot",
+                SyncJobKind::BackUpDatabase,
+                "back_up_database",
             ),
         ];
 
@@ -1335,12 +1331,10 @@ mod tests {
 
     #[test]
     fn persisted_job_kind_mismatch_is_detected() {
-        let payload = SyncJobPayload::CreateCatalogSnapshot {
+        let payload = SyncJobPayload::BackUpDatabase {
             version: SYNC_JOB_PAYLOAD_VERSION,
-            snapshot_id: Uuid::new_v4(),
-            source_id: None,
             destination_storage_id: Uuid::new_v4(),
-            destination_object_key: "snapshots/catalog".to_owned(),
+            destination_object_key: "catalog-backups/library.db".to_owned(),
         };
         let mut job = SyncJob::new(Uuid::new_v4(), payload);
         job.kind = SyncJobKind::Reconcile;
@@ -1349,7 +1343,7 @@ mod tests {
             job.validate_kind(),
             Err(SyncJobKindMismatch {
                 job_kind: SyncJobKind::Reconcile,
-                payload_kind: SyncJobKind::CreateCatalogSnapshot,
+                payload_kind: SyncJobKind::BackUpDatabase,
             })
         );
     }
