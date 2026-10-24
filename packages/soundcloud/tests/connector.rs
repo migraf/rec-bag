@@ -6,7 +6,7 @@ use rec_core::{
 use soundcloud::{
     ReqwestSoundCloudTransport, SoundCloudClient, SoundCloudConnector, SoundCloudHttpRequest,
     SoundCloudHttpResponse, SoundCloudHttpTransport, SoundCloudJitterSource, SoundCloudRetryPolicy,
-    SoundCloudSleeper, SoundCloudTokenProvider, SoundCloudTransportError,
+    SoundCloudSleeper, SoundCloudStreamFormat, SoundCloudTokenProvider, SoundCloudTransportError,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -592,6 +592,68 @@ async fn playlist_tracks_are_paged_from_the_tracks_endpoint_when_not_embedded() 
         requests[3].url,
         "https://api.soundcloud.com/playlists/soundcloud:playlists:9/tracks?cursor=2"
     );
+}
+
+#[tokio::test]
+async fn a_stream_is_assembled_in_memory_and_the_token_never_reaches_the_cdn() {
+    let transport = Arc::new(MockTransport::with_responses([
+        response(401, "{}"),
+        response(
+            200,
+            r#"{"hls_mp3_128_url": "https://cf-hls-media.sndcdn.com/playlist/t.m3u8?Policy=p", "hls_aac_160_url": null}"#,
+        ),
+        response(
+            200,
+            "#EXTM3U\n#EXTINF:10,\nhttps://cf-hls-media.sndcdn.com/media/0/a.mp3?Policy=p\n#EXTINF:10,\nb.mp3\n#EXT-X-ENDLIST\n",
+        ),
+        response(200, "AAA"),
+        response(200, "BBB"),
+    ]));
+    let tokens = Arc::new(MockTokens::new("access", "rotated"));
+    let client = SoundCloudClient::with_options(
+        transport.clone(),
+        tokens.clone(),
+        Arc::new(RecordingSleeper::default()),
+        SoundCloudRetryPolicy::default(),
+        API_URL,
+    )
+    .unwrap();
+
+    let audio = client.stream_audio("soundcloud:tracks:42").await.unwrap();
+
+    assert_eq!(audio.format, SoundCloudStreamFormat::Mp3);
+    assert_eq!(audio.bytes, b"AAABBB");
+    assert_eq!(tokens.refresh_calls(), 1);
+    let requests = transport.requests();
+    assert_eq!(
+        requests[1].url,
+        "https://api.soundcloud.com/tracks/soundcloud:tracks:42/streams"
+    );
+    assert_eq!(requests[1].headers["authorization"], "OAuth rotated");
+    assert!(requests[2..]
+        .iter()
+        .all(|request| !request.headers.contains_key("authorization")));
+    assert!(requests[4].url.ends_with("/playlist/b.mp3"));
+}
+
+#[tokio::test]
+async fn a_track_without_any_stream_reports_it_cannot_be_played() {
+    let transport = Arc::new(MockTransport::with_responses([response(200, "{}")]));
+    let client = SoundCloudClient::with_options(
+        transport,
+        Arc::new(MockTokens::new("access", "rotated")),
+        Arc::new(RecordingSleeper::default()),
+        SoundCloudRetryPolicy::default(),
+        API_URL,
+    )
+    .unwrap();
+
+    let error = client
+        .stream_audio("soundcloud:tracks:42")
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, SourceErrorKind::PermissionDenied);
 }
 
 #[tokio::test]

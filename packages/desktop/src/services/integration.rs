@@ -435,6 +435,11 @@ impl DesktopIntegration {
         self.asset_resolver.clone()
     }
 
+    /// Where tracks with no local file are streamed from.
+    pub fn track_streams(&self) -> Arc<dyn super::catalog::TrackStreams> {
+        self.soundcloud.clone()
+    }
+
     pub fn startup_errors(&self) -> &[IntegrationError] {
         &self.startup_errors
     }

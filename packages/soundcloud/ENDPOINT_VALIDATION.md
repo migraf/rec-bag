@@ -17,12 +17,15 @@ Validated on **2026-08-14** against SoundCloud's official sources:
 | Liked playlists | `GET /me/likes/playlists` | `Playlists`; `limit`, `linked_partitioning`, `show_tracks=false` |
 | Playlist tracks | `GET /playlists/{playlist_urn}/tracks` | `Tracks`; `limit=200`, `linked_partitioning`, `access=playable,preview,blocked` |
 | Revoke grant (desktop) | `POST /disconnect` | 204; replaces the unsupported `secure.soundcloud.com/sign-out` |
+| Deck playback | `GET /tracks/{track_urn}/streams` | `Streams`: `hls_mp3_128_url`, `hls_aac_160_url`, `preview_mp3_128_url` (authenticated) |
 
 Playlist pages are fetched without embedded tracks so a page of large playlists cannot exceed the response body limit; each playlist's tracks are then paged in order. Embedded tracks are used only when present and complete (`tracks.len() == track_count`).
 
 Re-checked on **2026-10-24** against the API guide, the OpenAPI document at `developers.soundcloud.com/docs/api/explorer/api.json`, the rate-limits page, the API Terms of Use (effective 2024-03-30), and the `soundcloud/api` releases. Relevant changes since the first validation: `/disconnect` added (2026-09-16), `http_mp3_128_url` removed (2026-08-12), numeric `id` removed in favour of `urn` (2025-06-30), and access tokens are variable-length JWTs.
 
 The Terms forbid downloading or storing User Content even when the uploader enabled downloads, so a playable track maps to `StreamingOnly` and never to `Obtainable`; `downloadable`/`download_url` are kept only as metadata.
+
+Deck playback asks `/streams` only when the user loads a track that has no local file. It prefers `hls_mp3_128_url`, then `hls_aac_160_url`, then the preview. The HLS playlist and its segments are fetched into memory (no disk writes, Terms section 5 session caching) and dropped when the deck unloads. Analysis runs on that same in-memory copy, and its results are kept for the session only. The access token is sent only to the API origin, never to the signed CDN URLs. Encrypted playlists are refused. While a streamed track is loaded, the deck credits SoundCloud with a link back to the track's permalink, and the uploader appears as the artist (Terms section 8). SoundCloud playlists are mirrored read-only in the DJ view with a SoundCloud badge that links to the playlist.
 
 The client requests linked pagination and follows `next_href`. Continuations are accepted only when scheme, host, and effective port match the configured API origin. The OpenAPI `limit` range is 1–200; the connector enforces it before making a request.
 

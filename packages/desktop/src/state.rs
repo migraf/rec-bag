@@ -26,11 +26,10 @@ use dioxus::prelude::*;
 use metadata::MetadataEdit;
 use projection::{CatalogProjection, PlaylistWriter};
 use rec_core::{
-    analyze_track, AudioEngine, BeatGridData, FrequencyWaveformData, LibraryEntry, Playlist, Track,
-    TrackAnalysis, WaveformPeaks,
+    analyze_audio_bytes, analyze_track, AudioEngine, AudioInput, BeatGridData,
+    FrequencyWaveformData, LibraryEntry, Playlist, Track, TrackAnalysis, WaveformPeaks,
 };
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use uuid::Uuid;
 
@@ -42,6 +41,9 @@ use uuid::Uuid;
 pub struct TrackAnalysisResult {
     pub track_id: Uuid,
     pub analysis: Option<TrackAnalysis>,
+    /// Whether the analysis may be saved to the Catalog. Analysis of a provider stream is
+    /// shown for the session only: the stream is not ours to keep, nor what it derives.
+    pub persist: bool,
 }
 
 /// Channel sender for analysis results (thread-safe, clonable)
@@ -205,23 +207,36 @@ impl AppState {
         let Some(catalog) = self.catalog() else {
             return false;
         };
+        let title = self
+            .projection
+            .track(track_id)
+            .map(|track| track.title)
+            .unwrap_or_else(|| "track".to_string());
+        if !deck.begin_loading(track_id, title) {
+            // Already on its way to this deck; a second fetch would only race the first.
+            return false;
+        }
 
         spawn(async move {
             let loaded = match catalog.load_track(track_id).await {
                 Ok(loaded) => loaded,
                 Err(error) => {
+                    deck.abandon_loading(track_id);
                     eprintln!("Could not prepare track {track_id} for playback: {error}");
                     return;
                 }
             };
 
-            let needs_analysis = loaded.track.needs_analysis();
-            let path = loaded.path.clone();
-            if !deck.load(loaded) {
+            // A stream is analyzed from the memory it already sits in, for this session only.
+            let analyze = loaded
+                .track
+                .needs_analysis()
+                .then(|| (loaded.audio.clone(), loaded.streamed_from.is_none()));
+            if !deck.finish_loading(loaded) {
                 return;
             }
-            if needs_analysis {
-                spawn_track_analysis(self, track_id, path);
+            if let Some((audio, persist)) = analyze {
+                spawn_track_analysis(self, track_id, audio, persist);
             }
         });
 
@@ -329,7 +344,11 @@ impl AppState {
 
     /// Apply analysis to the projection, the decks, and the Catalog.
     async fn apply_analysis_result(mut self, result: TrackAnalysisResult) {
-        let TrackAnalysisResult { track_id, analysis } = result;
+        let TrackAnalysisResult {
+            track_id,
+            analysis,
+            persist,
+        } = result;
 
         self.analyzing_tracks.write().remove(&track_id);
         let Some(analysis) = analysis else {
@@ -337,6 +356,9 @@ impl AppState {
         };
         self.edit_track_everywhere(track_id, |track| analysis.apply_to(track));
 
+        if !persist {
+            return;
+        }
         if let Some(catalog) = self.catalog() {
             if let Err(error) = catalog.save_analysis(analysis).await {
                 eprintln!("Could not save analysis for track {track_id}: {error}");
@@ -345,23 +367,35 @@ impl AppState {
     }
 
     /// Discard a track's analysis and derive it again from its audio.
+    ///
+    /// A track with no local file is analyzed from the stream a deck holds, for this session
+    /// only. A stream is never fetched just to be analyzed.
     pub fn analyze_track(self, track_id: Uuid) {
         let Some(catalog) = self.catalog() else {
             return;
         };
 
         spawn(async move {
-            let loaded = match catalog.load_track(track_id).await {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    eprintln!("Could not prepare track {track_id} for analysis: {error}");
-                    return;
-                }
+            let (audio, persist) = match catalog.load_local_track(track_id).await {
+                Ok(loaded) => (loaded.audio, true),
+                Err(error) => match self
+                    .decks
+                    .iter()
+                    .find_map(|deck| deck.streamed_audio(track_id))
+                {
+                    Some(stream) => (stream, false),
+                    None => {
+                        eprintln!("Could not prepare track {track_id} for analysis: {error}");
+                        return;
+                    }
+                },
             };
 
             let mut app_state = self;
-            if let Err(error) = catalog.forget_analysis(track_id).await {
-                eprintln!("Could not clear analysis for track {track_id}: {error}");
+            if persist {
+                if let Err(error) = catalog.forget_analysis(track_id).await {
+                    eprintln!("Could not clear analysis for track {track_id}: {error}");
+                }
             }
             app_state.edit_track_everywhere(track_id, |track| {
                 track.waveform = None;
@@ -371,7 +405,7 @@ impl AppState {
                 track.key = None;
             });
             app_state.analyzing_tracks.write().remove(&track_id);
-            spawn_track_analysis(app_state, track_id, loaded.path);
+            spawn_track_analysis(app_state, track_id, audio, persist);
         });
     }
 
@@ -487,7 +521,7 @@ pub fn use_app_state() -> AppState {
 /// Spawn background track analysis (waveform, BPM, key, beat grid detection).
 /// Uses std::thread::spawn for CPU-intensive work as per Dioxus docs.
 /// Results are sent via channel and processed by `use_app_state_provider`'s poll loop.
-pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) {
+pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, audio: AudioInput, persist: bool) {
     if app_state.is_analyzing(track_id) {
         return;
     }
@@ -500,9 +534,13 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) 
     // As per Dioxus docs: "If you have an expensive task you need to run,
     // you should spawn it on a separate thread using std::thread::spawn"
     std::thread::spawn(move || {
-        tracing::debug!(%track_id, path = %path.display(), "starting track analysis");
+        tracing::debug!(%track_id, ?audio, "starting track analysis");
 
-        match analyze_track(&path) {
+        let result = match &audio {
+            AudioInput::File(path) => analyze_track(path),
+            AudioInput::Memory(bytes) => analyze_audio_bytes(bytes.clone()),
+        };
+        match result {
             Ok(result) => {
                 let analysis = TrackAnalysis {
                     track_id,
@@ -531,6 +569,7 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) 
                 let _ = tx.send(TrackAnalysisResult {
                     track_id,
                     analysis: Some(analysis),
+                    persist,
                 });
             }
             Err(error) => {
@@ -538,6 +577,7 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, path: PathBuf) 
                 let _ = tx.send(TrackAnalysisResult {
                     track_id,
                     analysis: None,
+                    persist,
                 });
             }
         }

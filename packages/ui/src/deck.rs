@@ -2,7 +2,7 @@
 
 use crate::{BeatGrid, FrequencyWaveform, Trackbar};
 use dioxus::prelude::*;
-use rec_core::Track;
+use rec_core::{SourceType, Track};
 use std::time::Duration;
 
 const DECK_CSS: Asset = asset!("/assets/components/deck.css");
@@ -14,6 +14,46 @@ pub enum DeckDisplayState {
     Stopped,
     Playing,
     Paused,
+}
+
+/// Credit for a track streamed from a provider rather than played from a local file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamCredit {
+    pub source_type: SourceType,
+    /// The track's page at the provider.
+    pub url: Option<String>,
+    /// Whether only a short preview is playing.
+    pub preview: bool,
+}
+
+/// A quiet "via SoundCloud" on the artist line, linking to the track's page.
+#[component]
+fn StreamSource(stream: StreamCredit) -> Element {
+    let provider = match stream.source_type {
+        SourceType::SoundCloud => "SoundCloud",
+        SourceType::GoogleDrive => "Drive",
+        SourceType::Dropbox => "Dropbox",
+        _ => "stream",
+    };
+    let label = if stream.preview {
+        format!("preview via {provider}")
+    } else {
+        format!("via {provider}")
+    };
+    rsx! {
+        if let Some(url) = stream.url {
+            a {
+                class: "track-source",
+                href: "{url}",
+                target: "_blank",
+                rel: "noopener noreferrer",
+                title: "Streaming from {provider}. Open the track there",
+                "{label}"
+            }
+        } else {
+            span { class: "track-source", title: "Streaming from {provider}", "{label}" }
+        }
+    }
 }
 
 /// Props for the DeckControl component.
@@ -41,6 +81,12 @@ pub struct DeckControlProps {
     pub on_seek: EventHandler<Duration>,
     /// Callback when a file is dropped
     pub on_file_drop: EventHandler<String>,
+    /// Who is streaming the loaded track, when it is not a local file
+    #[props(default)]
+    pub stream: Option<StreamCredit>,
+    /// The title of the track being prepared for this deck, while one is
+    #[props(default)]
+    pub loading: Option<String>,
 }
 
 /// A single deck control panel.
@@ -112,6 +158,13 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
         div { class: "deck deck-{props.deck_number}",
             div { class: "deck-header",
                 span { class: "deck-number", "Deck {props.deck_number}" }
+                // In the header, so the track display keeps its two lines while it loads.
+                if let Some(title) = props.loading.clone() {
+                    div { class: "deck-loading", role: "status", "aria-live": "polite", title: "Loading {title}",
+                        span { class: "deck-spinner", "aria-hidden": "true" }
+                        span { class: "deck-loading-title", "Loading {title}…" }
+                    }
+                }
                 div { class: "deck-header-info",
                     if !track_bpm.is_empty() {
                         span { class: "deck-bpm", "{track_bpm}" }
@@ -126,9 +179,16 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
 
             div { class: "deck-display",
                 div { class: "track-info",
-                    div { class: "track-title", "{track_title}" }
-                    if !track_artist.is_empty() {
-                        div { class: "track-artist", "{track_artist}" }
+                    div { class: "track-title", title: "{track_title}", "{track_title}" }
+                    if !track_artist.is_empty() || props.stream.is_some() {
+                        div { class: "track-artist",
+                            span { class: "track-artist-name", "{track_artist}" }
+                            // A streamed track credits its uploader (the artist) and the
+                            // provider, linking back to the track's page there.
+                            if let Some(stream) = props.stream.clone() {
+                                StreamSource { stream }
+                            }
+                        }
                     }
                 }
             }

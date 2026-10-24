@@ -645,10 +645,10 @@ fn catalog_failure(error: CatalogError) -> IntegrationError {
 
 /// Compose the one Catalog from a live integration runtime.
 fn catalog_for(runtime: &Arc<DesktopIntegration>) -> Arc<Catalog> {
-    Arc::new(Catalog::new(
-        runtime.catalog().clone(),
-        AssetPlaybackPaths::new(runtime),
-    ))
+    Arc::new(
+        Catalog::new(runtime.catalog().clone(), AssetPlaybackPaths::new(runtime))
+            .with_streams(runtime.track_streams()),
+    )
 }
 
 pub fn use_integration_state() -> IntegrationContext {

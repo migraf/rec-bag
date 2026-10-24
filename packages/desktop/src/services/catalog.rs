@@ -6,7 +6,8 @@
 //!
 //! A canonical track deliberately has no filesystem path. Playback therefore never
 //! reads a path off a track: it asks [`Catalog::load_track`] for a [`LoadedTrack`], and
-//! that one function is the only place a concrete audio file is resolved.
+//! that one function is the only place a track's audio is resolved — to a local file
+//! when one exists, otherwise to a provider stream held in memory.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -16,10 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rec_core::{
-    CanonicalPlaylist, CanonicalPlaylistEntry, CanonicalTrack, CatalogSource, CatalogSourceKind,
-    LibraryEntry, LibraryEntryRepository, MetadataField, MetadataValue, MusicSource, Playlist,
-    PlaylistRepository, RepositoryPage, RepositoryPageRequest, Setting, SettingsRepository,
-    SourceOccurrenceFilter, SourceRepository, SourceType, Track, TrackAnalysis,
+    AudioInput, CanonicalPlaylist, CanonicalPlaylistEntry, CanonicalTrack, CatalogSource,
+    CatalogSourceKind, ExternalPlaylistFilter, LibraryEntry, LibraryEntryRepository, MetadataField,
+    MetadataValue, MusicSource, Playlist, PlaylistOrigin, PlaylistRepository, RepositoryPage,
+    RepositoryPageRequest, Setting, SettingsRepository, SourceCollectionRelationshipFilter,
+    SourceEntityKind, SourceOccurrenceFilter, SourceRepository, SourceType, Track, TrackAnalysis,
     TrackAnalysisRepository, TrackRepository,
 };
 use rec_persistence::TursoCatalog;
@@ -45,26 +47,62 @@ pub trait PlaybackPaths: Send + Sync {
     fn resolve<'a>(&'a self, track_id: Uuid) -> PlaybackPathFuture<'a>;
 }
 
+/// A provider stream of a track's audio, fetched into memory for one playback session.
+#[derive(Clone)]
+pub struct StreamedAudio {
+    pub bytes: Arc<[u8]>,
+    pub origin: StreamOrigin,
+}
+
+/// Who is streaming a track. Whatever plays it must credit them and link back
+/// (SoundCloud API Terms, section 8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamOrigin {
+    pub source_type: SourceType,
+    /// The track's public page at the provider.
+    pub permalink: Option<String>,
+    /// Whether this is only a short preview rather than the full track.
+    pub preview: bool,
+}
+
+pub type StreamFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<StreamedAudio>, CatalogError>> + Send + 'a>>;
+
+/// Where a track with no local file can be streamed from.
+///
+/// `Ok(None)` means no connected provider offers the track; an error means one does but the
+/// stream could not be fetched, which is worth telling the user.
+pub trait TrackStreams: Send + Sync {
+    fn stream<'a>(&'a self, track_id: Uuid) -> StreamFuture<'a>;
+}
+
 /// A canonical track prepared for playback: identity and reconciled metadata, the
-/// analysis derived from its audio, and a concrete file to decode.
+/// analysis derived from its audio, and the audio to decode.
 ///
 /// A loaded track is a moment in the life of a track, not a record of one. Nothing here
 /// is written back to the catalog, so a cache copy of a remote asset never becomes the
-/// track's identity.
+/// track's identity, and a stream never outlives the deck holding it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoadedTrack {
     /// The canonical track as the interface shows it, with its analysis attached.
     pub track: Track,
-    /// The audio file the deck decodes.
-    pub path: PathBuf,
-    /// Whether `path` is a disposable cache entry.
+    /// The audio the deck decodes: a local file, or a stream held in memory.
+    pub audio: AudioInput,
+    /// Whether the audio is a disposable cache entry.
     pub cached: bool,
+    /// The provider streaming the audio, when it is not a local file.
+    pub streamed_from: Option<StreamOrigin>,
 }
 
 impl LoadedTrack {
     /// The canonical track's identity.
     pub fn id(&self) -> Uuid {
         self.track.id
+    }
+
+    /// The local file being played, which analysis can read. `None` for a stream.
+    pub fn path(&self) -> Option<&Path> {
+        self.audio.path()
     }
 }
 
@@ -152,11 +190,22 @@ const PAGE_SIZE: u32 = 500;
 pub struct Catalog {
     store: Arc<TursoCatalog>,
     paths: Arc<dyn PlaybackPaths>,
+    streams: Option<Arc<dyn TrackStreams>>,
 }
 
 impl Catalog {
     pub fn new(store: Arc<TursoCatalog>, paths: Arc<dyn PlaybackPaths>) -> Self {
-        Self { store, paths }
+        Self {
+            store,
+            paths,
+            streams: None,
+        }
+    }
+
+    /// Stream tracks that have no local file from `streams`.
+    pub fn with_streams(mut self, streams: Arc<dyn TrackStreams>) -> Self {
+        self.streams = Some(streams);
+        self
     }
 
     /// Every canonical track, projected with the user's library entry, its cached
@@ -205,7 +254,8 @@ impl Catalog {
             .collect())
     }
 
-    /// Every canonical playlist, with its membership resolved against `library`.
+    /// Every canonical playlist, then every playlist mirrored from a catalog source, with
+    /// membership resolved against `library`.
     ///
     /// Membership references tracks by identity, so a playlist entry whose track has
     /// left the catalog is dropped rather than shown as a hole.
@@ -237,6 +287,7 @@ impl Catalog {
                         .collect(),
                     created_at: canonical.created_at,
                     modified_at: canonical.updated_at,
+                    origin: None,
                 });
             }
             match page.next_cursor {
@@ -244,7 +295,112 @@ impl Catalog {
                 None => break,
             }
         }
+        playlists.extend(self.mirrored_playlists(&by_id).await?);
         Ok(playlists)
+    }
+
+    /// The playlists each provider source currently reports, read-only and in provider
+    /// order.
+    ///
+    /// A playlist row outlives its deletion or unliking at the source; only its collection
+    /// relationship goes. So a playlist is mirrored only while a top-level relationship
+    /// still names it, which is what the source reported on its last full sync.
+    async fn mirrored_playlists(
+        &self,
+        library: &HashMap<Uuid, &Track>,
+    ) -> CatalogResult<Vec<Playlist>> {
+        let sources = all_pages("sources", async |page| {
+            SourceRepository::list(self.store.as_ref(), page).await
+        })
+        .await?;
+        let mut mirrored = Vec::new();
+        for source in sources {
+            if source.kind == CatalogSourceKind::LocalFolder {
+                continue;
+            }
+            let source_id = source.id;
+            let current: HashSet<String> = all_pages("source collections", async |page| {
+                SourceRepository::list_collection_relationships(
+                    self.store.as_ref(),
+                    SourceCollectionRelationshipFilter {
+                        source_id,
+                        account_external_id: None,
+                        collection: None,
+                        entity_kind: Some(SourceEntityKind::Playlist),
+                    },
+                    page,
+                )
+                .await
+            })
+            .await?
+            .into_iter()
+            .filter(|relationship| relationship.identity.parent_external_id.is_none())
+            .map(|relationship| relationship.identity.entity_external_id)
+            .collect();
+            if current.is_empty() {
+                continue;
+            }
+            let track_by_external_id: HashMap<String, Uuid> =
+                all_pages("source occurrences", async |page| {
+                    SourceRepository::list_occurrences(
+                        self.store.as_ref(),
+                        SourceOccurrenceFilter {
+                            source_id: Some(source_id),
+                            ..Default::default()
+                        },
+                        page,
+                    )
+                    .await
+                })
+                .await?
+                .into_iter()
+                .filter_map(|occurrence| {
+                    occurrence
+                        .canonical_track_id
+                        .map(|track_id| (occurrence.identity.external_id, track_id))
+                })
+                .collect();
+            let external = all_pages("source playlists", async |page| {
+                PlaylistRepository::list_external(
+                    self.store.as_ref(),
+                    ExternalPlaylistFilter {
+                        source_id: Some(source_id),
+                        owner_external_id: None,
+                    },
+                    page,
+                )
+                .await
+            })
+            .await?;
+            for playlist in external
+                .into_iter()
+                .filter(|playlist| current.contains(&playlist.external_id))
+            {
+                let mut entries = playlist.entries;
+                entries.sort_by_key(|entry| entry.position);
+                mirrored.push(Playlist {
+                    // Stable across refreshes, so selecting a mirrored playlist survives a sync.
+                    id: Uuid::new_v5(&source_id, playlist.external_id.as_bytes()),
+                    name: playlist.name,
+                    description: playlist.description,
+                    tracks: entries
+                        .iter()
+                        .filter_map(|entry| track_by_external_id.get(&entry.track.external_id))
+                        .filter_map(|track_id| library.get(track_id))
+                        .map(|track| (*track).clone())
+                        .collect(),
+                    created_at: playlist.last_seen_at,
+                    modified_at: playlist.last_seen_at,
+                    origin: Some(PlaylistOrigin {
+                        source_id,
+                        source_type: source_type(&source.kind),
+                        external_url: playlist.external_url,
+                    }),
+                });
+            }
+        }
+        mirrored.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(mirrored)
     }
 
     /// Every configured catalog source, as the sources panel shows them.
@@ -268,11 +424,22 @@ impl Catalog {
 
     /// Prepare a canonical track for a deck.
     ///
-    /// This is the only seam between a track's identity and a file on disk. It resolves
-    /// the track's audio through the storage resolver it was given, and refuses a path
-    /// that is not an available local file rather than handing the audio engine
-    /// something it cannot decode.
+    /// This is the only seam between a track's identity and its audio. It resolves the
+    /// track through the storage resolver it was given, and refuses a path that is not an
+    /// available local file rather than handing the audio engine something it cannot
+    /// decode. A track with no local file is streamed instead, when a provider offers it;
+    /// an owned file always wins over a stream.
     pub async fn load_track(&self, track_id: Uuid) -> CatalogResult<LoadedTrack> {
+        self.load(track_id, true).await
+    }
+
+    /// Prepare a canonical track's local file, never a stream: for reading the audio
+    /// rather than playing it, such as analysis.
+    pub async fn load_local_track(&self, track_id: Uuid) -> CatalogResult<LoadedTrack> {
+        self.load(track_id, false).await
+    }
+
+    async fn load(&self, track_id: Uuid, allow_stream: bool) -> CatalogResult<LoadedTrack> {
         let canonical = TrackRepository::get(self.store.as_ref(), track_id)
             .await
             .map_err(read_error("a track"))?
@@ -283,13 +450,32 @@ impl Catalog {
         let analysis = TrackAnalysisRepository::get(self.store.as_ref(), track_id)
             .await
             .map_err(read_error("track analysis"))?;
-        let resolved = self.paths.resolve(track_id).await?;
-        if !resolved.path.is_file() {
-            return Err(CatalogError::retryable(format!(
-                "resolved playback path is not an available local file: {}",
-                resolved.path.display()
-            )));
-        }
+        let local = self.paths.resolve(track_id).await.and_then(|resolved| {
+            if resolved.path.is_file() {
+                Ok(resolved)
+            } else {
+                Err(CatalogError::retryable(format!(
+                    "resolved playback path is not an available local file: {}",
+                    resolved.path.display()
+                )))
+            }
+        });
+        let resolved = match local {
+            Ok(resolved) => resolved,
+            Err(no_file) if !allow_stream => return Err(no_file),
+            Err(no_file) => {
+                let Some(stream) = self.stream(track_id).await? else {
+                    return Err(no_file);
+                };
+                let track = catalog_track(canonical, entry.as_ref(), analysis.as_ref(), None);
+                return Ok(LoadedTrack {
+                    track,
+                    audio: AudioInput::Memory(stream.bytes),
+                    cached: false,
+                    streamed_from: Some(stream.origin),
+                });
+            }
+        };
 
         let mut track = catalog_track(
             canonical,
@@ -307,9 +493,17 @@ impl Catalog {
 
         Ok(LoadedTrack {
             track,
-            path: resolved.path,
+            audio: AudioInput::File(resolved.path),
             cached: resolved.cached,
+            streamed_from: None,
         })
+    }
+
+    async fn stream(&self, track_id: Uuid) -> CatalogResult<Option<StreamedAudio>> {
+        match &self.streams {
+            Some(streams) => streams.stream(track_id).await,
+            None => Ok(None),
+        }
     }
 
     /// Record the user's own values for a canonical track's metadata fields.
@@ -505,17 +699,21 @@ fn music_source(source: CatalogSource, track_count: u32) -> MusicSource {
         // The panel browses a local source's filesystem tree and summarizes any other
         // kind, so calling a provider source local would mount a folder browser on
         // something that has no folder.
-        source_type: match source.kind {
-            CatalogSourceKind::LocalFolder => SourceType::Local,
-            CatalogSourceKind::SoundCloud => SourceType::SoundCloud,
-            CatalogSourceKind::Custom(_) => SourceType::WebDav,
-        },
+        source_type: source_type(&source.kind),
         uri: source.config.get("path").cloned().unwrap_or_default(),
         config: None,
         track_count,
         enabled: source.enabled,
         created_at: source.created_at,
         last_scanned: source.last_synced_at,
+    }
+}
+
+fn source_type(kind: &CatalogSourceKind) -> SourceType {
+    match kind {
+        CatalogSourceKind::LocalFolder => SourceType::Local,
+        CatalogSourceKind::SoundCloud => SourceType::SoundCloud,
+        CatalogSourceKind::Custom(_) => SourceType::WebDav,
     }
 }
 
@@ -745,7 +943,7 @@ mod tests {
 
         assert_eq!(loaded.id(), track.id);
         assert_eq!(loaded.track.title, "Drive track");
-        assert_eq!(loaded.path, cache);
+        assert_eq!(loaded.path(), Some(cache.as_path()));
         assert!(loaded.cached);
         // The catalog record is untouched: nothing wrote the cache path back.
         assert_eq!(catalog.tracks().await.unwrap()[0].path, PathBuf::new());
@@ -814,6 +1012,174 @@ mod tests {
         assert_eq!(playlists[0].tracks.len(), 1);
         assert_eq!(playlists[0].tracks[0].id, kept.id);
         assert!(playlists[0].tracks.iter().all(|track| track.id != departed));
+    }
+
+    /// A SoundCloud source holding two linked tracks, a playlist it still reports (in the
+    /// reverse of canonical order), and one it no longer does.
+    async fn a_soundcloud_source(
+        store: &TursoCatalog,
+    ) -> (CatalogSource, CanonicalTrack, CanonicalTrack) {
+        let source = CatalogSource::new("SoundCloud", CatalogSourceKind::SoundCloud);
+        SourceRepository::upsert(store, source.clone())
+            .await
+            .unwrap();
+        SourceRepository::upsert_account(
+            store,
+            rec_core::SourceAccount::new(source.id, "soundcloud:users:1"),
+        )
+        .await
+        .unwrap();
+        let first = canonical_track("First", "Uploader");
+        let second = canonical_track("Second", "Uploader");
+        let mut occurrences = Vec::new();
+        for (external_id, track) in [
+            ("soundcloud:tracks:1", &first),
+            ("soundcloud:tracks:2", &second),
+        ] {
+            TrackRepository::upsert(store, track.clone()).await.unwrap();
+            let mut occurrence = rec_core::SourceTrackOccurrence::new(source.id, external_id);
+            occurrence.canonical_track_id = Some(track.id);
+            occurrence.availability = rec_core::SourceAvailability::StreamingOnly;
+            occurrence.external_url = Some(format!("https://soundcloud.com/u/{external_id}"));
+            occurrences.push(occurrence);
+        }
+        SourceRepository::upsert_occurrences(store, occurrences)
+            .await
+            .unwrap();
+        for (external_id, current) in [
+            ("soundcloud:playlists:9", true),
+            ("soundcloud:playlists:8", false),
+        ] {
+            let mut playlist = rec_core::ExternalPlaylist::new(
+                source.id,
+                external_id,
+                format!("Set {external_id}"),
+            );
+            playlist.external_url = Some("https://soundcloud.com/u/sets/set".into());
+            playlist.entries = vec![
+                rec_core::ExternalPlaylistEntry::new(
+                    1,
+                    rec_core::SourceTrackIdentity::new(source.id, "soundcloud:tracks:1"),
+                ),
+                rec_core::ExternalPlaylistEntry::new(
+                    0,
+                    rec_core::SourceTrackIdentity::new(source.id, "soundcloud:tracks:2"),
+                ),
+            ];
+            PlaylistRepository::upsert_external(store, playlist)
+                .await
+                .unwrap();
+            if current {
+                SourceRepository::upsert_collection_relationship(
+                    store,
+                    rec_core::SourceCollectionRelationship::new(
+                        rec_core::SourceCollectionRelationshipIdentity::new(
+                            source.id,
+                            "soundcloud:users:1",
+                            rec_core::SourceCollection::OwnedPlaylists,
+                            SourceEntityKind::Playlist,
+                            external_id,
+                        ),
+                        Utc::now(),
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        (source, first, second)
+    }
+
+    #[tokio::test]
+    async fn a_soundcloud_playlist_is_mirrored_read_only_in_provider_order() {
+        let (catalog, store) = catalog(StubPaths::new(HashMap::new())).await;
+        let (source, first, second) = a_soundcloud_source(&store).await;
+
+        let library = catalog.tracks().await.unwrap();
+        let playlists = catalog.playlists(&library).await.unwrap();
+
+        assert_eq!(
+            playlists.len(),
+            1,
+            "only the playlist SoundCloud still reports"
+        );
+        let mirrored = &playlists[0];
+        assert!(!mirrored.is_editable());
+        assert_eq!(
+            mirrored.origin,
+            Some(PlaylistOrigin {
+                source_id: source.id,
+                source_type: SourceType::SoundCloud,
+                external_url: Some("https://soundcloud.com/u/sets/set".into()),
+            })
+        );
+        assert_eq!(
+            mirrored
+                .tracks
+                .iter()
+                .map(|track| track.id)
+                .collect::<Vec<_>>(),
+            [second.id, first.id]
+        );
+        // The same identity on every refresh, so a browsed playlist stays selected.
+        let again = catalog.playlists(&library).await.unwrap();
+        assert_eq!(again[0].id, mirrored.id);
+    }
+
+    struct StubStreams(Mutex<u32>);
+
+    impl TrackStreams for StubStreams {
+        fn stream<'a>(&'a self, _track_id: Uuid) -> StreamFuture<'a> {
+            *self.0.lock().unwrap() += 1;
+            Box::pin(async {
+                Ok(Some(StreamedAudio {
+                    bytes: Arc::from(&b"mp3"[..]),
+                    origin: StreamOrigin {
+                        source_type: SourceType::SoundCloud,
+                        permalink: Some("https://soundcloud.com/u/t".into()),
+                        preview: false,
+                    },
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_track_with_no_local_file_is_streamed_into_memory() {
+        let track = canonical_track("Streamed", "Uploader");
+        let local = canonical_track("Owned", "Me");
+        let file = temp_audio("owned");
+        let paths = StubPaths::new(HashMap::from([(
+            local.id,
+            Ok(ResolvedPlaybackPath {
+                path: file.clone(),
+                cached: false,
+            }),
+        )]));
+        let store = Arc::new(TursoCatalog::in_memory().await.unwrap());
+        let streams = Arc::new(StubStreams(Mutex::new(0)));
+        let catalog = Catalog::new(store.clone(), paths).with_streams(streams.clone());
+        for track in [&track, &local] {
+            TrackRepository::upsert(store.as_ref(), track.clone())
+                .await
+                .unwrap();
+        }
+
+        let streamed = catalog.load_track(track.id).await.unwrap();
+        assert_eq!(streamed.audio, AudioInput::Memory(Arc::from(&b"mp3"[..])));
+        assert_eq!(streamed.path(), None);
+        assert_eq!(
+            streamed.streamed_from.map(|origin| origin.source_type),
+            Some(SourceType::SoundCloud)
+        );
+
+        // An owned file wins over a stream, and analysis never streams.
+        let owned = catalog.load_track(local.id).await.unwrap();
+        assert_eq!(owned.path(), Some(file.as_path()));
+        assert!(owned.streamed_from.is_none());
+        assert!(catalog.load_local_track(track.id).await.is_err());
+        assert_eq!(*streams.0.lock().unwrap(), 1);
+        std::fs::remove_file(file).unwrap();
     }
 
     #[tokio::test]

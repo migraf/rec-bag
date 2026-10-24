@@ -212,7 +212,10 @@ impl LibraryBrowser {
     /// Removal persists and deselects in one gesture: a removed track that stays
     /// selected is a track later actions still act on.
     pub fn remove_from_playlist(mut self, track_ids: &[Uuid]) {
-        let Some(playlist_id) = self.browsed_playlist() else {
+        let Some(playlist_id) = self
+            .browsed_playlist()
+            .filter(|id| self.projection.is_editable(*id))
+        else {
             return;
         };
         self.projection

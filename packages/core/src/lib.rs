@@ -31,9 +31,9 @@ pub mod waveform;
 
 #[cfg(feature = "audio")]
 pub use analysis::{
-    analyze_track, AnalysisError, AnalysisResult, Analyzer, AnalyzerOutput, BeatGridAnalyzer,
-    BeatGridResult, BpmAnalyzer, BpmResult, FrequencyWaveform, FrequencyWaveformAnalyzer,
-    KeyAnalyzer, KeyResult, MusicalKey, WaveformAnalyzer,
+    analyze_audio_bytes, analyze_track, AnalysisError, AnalysisResult, Analyzer, AnalyzerOutput,
+    BeatGridAnalyzer, BeatGridResult, BpmAnalyzer, BpmResult, FrequencyWaveform,
+    FrequencyWaveformAnalyzer, KeyAnalyzer, KeyResult, MusicalKey, WaveformAnalyzer,
 };
 pub use asset::{
     AssetLocation, AssetRecord, AssetType, ContentHash, ContentHashError, DerivedAsset,
@@ -42,7 +42,7 @@ pub use asset::{
     StorageObject, StorageRole, StorageVerificationStatus,
 };
 #[cfg(feature = "audio")]
-pub use audio::{AudioEngine, Deck, DeckState};
+pub use audio::{AudioEngine, AudioInput, Deck, DeckState};
 pub use catalog::{
     CanonicalMetadata, CanonicalPlaylist, CanonicalPlaylistEntry, CanonicalTrack, CatalogSource,
     CatalogSourceKind, ExternalPlaylist, ExternalPlaylistEntry, LibraryEntry, MetadataField,
@@ -57,7 +57,7 @@ pub use doctor::{
     WavExtensibleCheck,
 };
 pub use folder::{build_folder_tree, is_audio_extension, FolderNode};
-pub use playlist::Playlist;
+pub use playlist::{Playlist, PlaylistOrigin};
 pub use provider::{
     BoxFuture, ByteRange, CatalogAssetReadRequest, CatalogAssetReadResult, CatalogAssetReader,
     CatalogSourceConnector, DownloadRequest, DownloadResult, HealthStatus, InventoryMode,

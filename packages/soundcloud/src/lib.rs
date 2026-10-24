@@ -38,6 +38,9 @@ const ALL_TRACK_ACCESS: &str = "playable,preview,blocked";
 pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 const CURSOR_VERSION: u8 = 1;
 
+mod stream;
+pub use stream::{SoundCloudAudio, SoundCloudStreamFormat};
+
 /// A non-secret access token provider. Implementations must atomically replace persisted refresh
 /// token state before returning because SoundCloud refresh tokens are single-use.
 pub trait SoundCloudTokenProvider: Send + Sync {
@@ -51,6 +54,44 @@ pub trait SoundCloudHttpTransport: Send + Sync {
         &self,
         request: SoundCloudHttpRequest,
     ) -> BoxFuture<'_, Result<SoundCloudHttpResponse, SoundCloudTransportError>>;
+
+    /// Fetches a binary body, such as a stream playlist or audio segment, of at most
+    /// `max_body_bytes`. The default reads through [`Self::execute`], which suits text fixtures.
+    fn execute_bytes(
+        &self,
+        request: SoundCloudHttpRequest,
+        max_body_bytes: usize,
+    ) -> BoxFuture<'_, Result<SoundCloudBinaryResponse, SoundCloudTransportError>> {
+        Box::pin(async move {
+            let response = self.execute(request).await?;
+            if response.body.len() > max_body_bytes {
+                return Err(SoundCloudTransportError::response_too_large());
+            }
+            Ok(SoundCloudBinaryResponse {
+                status: response.status,
+                headers: response.headers,
+                body: response.body.into_bytes(),
+            })
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SoundCloudBinaryResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+impl fmt::Debug for SoundCloudBinaryResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SoundCloudBinaryResponse")
+            .field("status", &self.status)
+            .field("headers", &sanitized_headers(&self.headers))
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -179,8 +220,28 @@ impl SoundCloudHttpTransport for ReqwestSoundCloudTransport {
         &self,
         request: SoundCloudHttpRequest,
     ) -> BoxFuture<'_, Result<SoundCloudHttpResponse, SoundCloudTransportError>> {
-        let client = self.client.clone();
         let max_response_body_bytes = self.max_response_body_bytes;
+        Box::pin(async move {
+            let response = self.execute_bytes(request, max_response_body_bytes).await?;
+            let body = String::from_utf8(response.body).map_err(|_| {
+                SoundCloudTransportError::invalid_response(
+                    "SoundCloud response body was not valid UTF-8",
+                )
+            })?;
+            Ok(SoundCloudHttpResponse {
+                status: response.status,
+                headers: response.headers,
+                body,
+            })
+        })
+    }
+
+    fn execute_bytes(
+        &self,
+        request: SoundCloudHttpRequest,
+        max_response_body_bytes: usize,
+    ) -> BoxFuture<'_, Result<SoundCloudBinaryResponse, SoundCloudTransportError>> {
+        let client = self.client.clone();
         Box::pin(async move {
             let mut builder = client.get(request.url);
             for (name, value) in request.headers {
@@ -218,12 +279,7 @@ impl SoundCloudHttpTransport for ReqwestSoundCloudTransport {
                 }
                 body.extend_from_slice(&chunk);
             }
-            let body = String::from_utf8(body).map_err(|_| {
-                SoundCloudTransportError::invalid_response(
-                    "SoundCloud response body was not valid UTF-8",
-                )
-            })?;
-            Ok(SoundCloudHttpResponse {
+            Ok(SoundCloudBinaryResponse {
                 status,
                 headers,
                 body,
@@ -692,8 +748,11 @@ impl SoundCloudConnector {
             CollectionPage::Playlists(page) => {
                 for mut playlist in page.collection {
                     if playlist.needs_track_fetch() {
-                        playlist.tracks =
-                            Some(self.client.playlist_tracks(&playlist.external_id()?).await?);
+                        playlist.tracks = Some(
+                            self.client
+                                .playlist_tracks(&playlist.external_id()?)
+                                .await?,
+                        );
                     }
                     add_playlist_and_entries(
                         &mut items,
@@ -1538,10 +1597,14 @@ mod tests {
         let parse = |json| serde_json::from_value::<PlaylistDto>(json).unwrap();
         let track = serde_json::json!({"urn": "soundcloud:tracks:1"});
         assert!(parse(serde_json::json!({"urn": "p"})).needs_track_fetch());
-        assert!(parse(serde_json::json!({"urn": "p", "track_count": 2, "tracks": [track.clone()]}))
-            .needs_track_fetch());
-        assert!(!parse(serde_json::json!({"urn": "p", "track_count": 1, "tracks": [track.clone()]}))
-            .needs_track_fetch());
+        assert!(parse(
+            serde_json::json!({"urn": "p", "track_count": 2, "tracks": [track.clone()]})
+        )
+        .needs_track_fetch());
+        assert!(!parse(
+            serde_json::json!({"urn": "p", "track_count": 1, "tracks": [track.clone()]})
+        )
+        .needs_track_fetch());
         assert!(!parse(serde_json::json!({"urn": "p", "tracks": [track]})).needs_track_fetch());
     }
 

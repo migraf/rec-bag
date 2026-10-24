@@ -15,10 +15,10 @@ mod echo;
 pub use echo::Echo;
 
 mod deck;
-pub use deck::{DeckControl, DeckControlProps, DeckDisplayState};
+pub use deck::{DeckControl, DeckControlProps, DeckDisplayState, StreamCredit};
 
 mod playlist_browser;
-pub use playlist_browser::{PlaylistBrowser, PlaylistBrowserProps};
+pub use playlist_browser::{PlaylistBrowser, PlaylistBrowserProps, SourceBadge};
 
 mod track_list;
 pub use track_list::{

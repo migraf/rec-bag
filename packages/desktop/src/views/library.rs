@@ -80,6 +80,8 @@ pub fn Library() -> Element {
     let playlist_infos: Vec<PlaylistInfo> = browser
         .playlists()
         .iter()
+        // A mirrored playlist belongs to its source, so nothing can be added to it here.
+        .filter(|p| p.is_editable())
         .map(|p| PlaylistInfo {
             id: p.id,
             name: p.name.clone(),

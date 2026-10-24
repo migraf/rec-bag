@@ -1,6 +1,6 @@
 //! Playlist model for organizing tracks.
 
-use crate::Track;
+use crate::{SourceType, Track};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -20,6 +20,23 @@ pub struct Playlist {
     pub created_at: DateTime<Utc>,
     /// When the playlist was last modified
     pub modified_at: DateTime<Utc>,
+    /// The catalog source this playlist mirrors, or `None` for the user's own playlist.
+    #[serde(default)]
+    pub origin: Option<PlaylistOrigin>,
+}
+
+/// A playlist mirrored from a catalog source, such as a SoundCloud playlist.
+///
+/// The source owns its membership, so a mirrored playlist is read-only here: the next sync
+/// would undo any local edit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlaylistOrigin {
+    /// The catalog source the playlist was synchronized from.
+    pub source_id: Uuid,
+    /// Which kind of source it is, for the badge naming it.
+    pub source_type: SourceType,
+    /// The playlist's public page at the source, when it has one.
+    pub external_url: Option<String>,
 }
 
 impl Playlist {
@@ -33,7 +50,13 @@ impl Playlist {
             tracks: Vec::new(),
             created_at: now,
             modified_at: now,
+            origin: None,
         }
+    }
+
+    /// Whether the user can rename, edit, or delete this playlist.
+    pub fn is_editable(&self) -> bool {
+        self.origin.is_none()
     }
 
     /// Create a playlist with tracks.

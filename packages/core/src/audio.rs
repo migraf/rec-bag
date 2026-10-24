@@ -4,7 +4,7 @@
 
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +25,48 @@ pub enum AudioError {
     NoTrackLoaded(usize),
 }
 
+/// Audio a deck can decode: a file on disk, or a stream already held in memory.
+///
+/// Memory input exists for streamed provider audio, which must not be written to disk. Cloning
+/// shares the buffer rather than copying it.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AudioInput {
+    File(PathBuf),
+    Memory(Arc<[u8]>),
+}
+
+impl AudioInput {
+    /// The file behind this input, when it is one.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::File(path) => Some(path),
+            Self::Memory(_) => None,
+        }
+    }
+
+    fn decode(&self) -> Result<Box<dyn rodio::Source<Item = i16> + Send>, AudioError> {
+        Ok(match self {
+            Self::File(path) => Box::new(Decoder::new(BufReader::new(File::open(path)?))?),
+            Self::Memory(bytes) => Box::new(Decoder::new(Cursor::new(bytes.clone()))?),
+        })
+    }
+}
+
+impl std::fmt::Debug for AudioInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => formatter.debug_tuple("File").field(path).finish(),
+            Self::Memory(bytes) => write!(formatter, "Memory({} bytes)", bytes.len()),
+        }
+    }
+}
+
+impl From<PathBuf> for AudioInput {
+    fn from(path: PathBuf) -> Self {
+        Self::File(path)
+    }
+}
+
 /// State of a single deck.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeckState {
@@ -43,8 +85,8 @@ pub struct Deck {
     sink: Sink,
     stream_handle: Arc<OutputStreamHandle>,
     state: DeckState,
-    /// The file currently decoded, kept so `stop` can rewind by re-decoding it.
-    source_path: Option<PathBuf>,
+    /// The audio currently decoded, kept so `stop` can rewind by re-decoding it.
+    source: Option<AudioInput>,
     volume: f32,
     /// Track if audio has been loaded (separate from track metadata)
     has_audio: bool,
@@ -60,31 +102,29 @@ impl Deck {
             sink,
             stream_handle,
             state: DeckState::Empty,
-            source_path: None,
+            source: None,
             volume: 1.0,
             has_audio: false,
         })
     }
 
-    /// Decode `path` onto this deck.
+    /// Decode `input` onto this deck.
     ///
-    /// A deck plays a file. What that file means — which canonical track it is, and
-    /// whether it is an owned original or a cache copy — belongs to the catalog, not
-    /// to audio output.
-    pub fn load(&mut self, path: &Path) -> Result<(), AudioError> {
+    /// A deck plays audio. What that audio means — which canonical track it is, and
+    /// whether it is an owned original, a cache copy, or a provider stream — belongs to
+    /// the catalog, not to audio output.
+    pub fn load(&mut self, input: &AudioInput) -> Result<(), AudioError> {
+        // Decode first, so a failure leaves the current track playing.
+        let source = input.decode()?;
         // Create a fresh sink to ensure clean state
         self.sink = Sink::try_new(&self.stream_handle).map_err(|_| AudioError::StreamInit)?;
-
-        // Open and decode the file
-        let file = File::open(path)?;
-        let source = Decoder::new(BufReader::new(file))?;
 
         // Append source and configure
         self.sink.append(source);
         self.sink.set_volume(self.volume);
         self.sink.pause();
 
-        self.source_path = Some(path.to_path_buf());
+        self.source = Some(input.clone());
         self.state = DeckState::Stopped;
         self.has_audio = true;
 
@@ -116,14 +156,12 @@ impl Deck {
             self.sink.pause();
         }
 
-        // Reload the file if we have one
-        if let Some(ref path) = self.source_path {
-            if let Ok(file) = File::open(path) {
-                if let Ok(source) = Decoder::new(BufReader::new(file)) {
-                    self.sink.append(source);
-                    self.sink.pause();
-                    self.has_audio = true;
-                }
+        // Reload the audio if we have some
+        if let Some(input) = &self.source {
+            if let Ok(source) = input.decode() {
+                self.sink.append(source);
+                self.sink.pause();
+                self.has_audio = true;
             }
         }
 
@@ -155,7 +193,7 @@ impl Deck {
 
     /// Check if the deck has audio loaded.
     pub fn has_audio(&self) -> bool {
-        self.source_path.is_some()
+        self.source.is_some()
     }
 
     /// Get playback position (if supported).
@@ -239,7 +277,12 @@ impl AudioEngine {
 
     /// Decode a file onto a specific deck.
     pub fn load_file(&mut self, deck_index: usize, path: &Path) -> Result<(), AudioError> {
-        self.deck_mut(deck_index)?.load(path)
+        self.load(deck_index, &AudioInput::File(path.to_path_buf()))
+    }
+
+    /// Decode a file or an in-memory stream onto a specific deck.
+    pub fn load(&mut self, deck_index: usize, input: &AudioInput) -> Result<(), AudioError> {
+        self.deck_mut(deck_index)?.load(input)
     }
 
     /// Play a specific deck.

@@ -7,11 +7,10 @@
 
 use crate::services::catalog::LoadedTrack;
 use dioxus::prelude::*;
-use rec_core::{AudioEngine, DeckState, Track};
-use std::path::Path;
+use rec_core::{AudioEngine, AudioInput, DeckState, Track};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use ui::DeckDisplayState;
+use ui::{DeckDisplayState, StreamCredit};
 use uuid::Uuid;
 
 /// How many decks the application runs.
@@ -23,7 +22,7 @@ pub const DECK_COUNT: usize = 2;
 /// in-memory fake in this module's tests. Every method takes the deck's own index, so
 /// an out-of-range index is this trait's problem and never a caller's.
 pub trait DeckAudio {
-    fn load(&mut self, index: usize, path: &Path) -> bool;
+    fn load(&mut self, index: usize, input: &AudioInput) -> bool;
     fn play(&mut self, index: usize);
     fn pause(&mut self, index: usize);
     fn stop(&mut self, index: usize);
@@ -36,8 +35,8 @@ pub trait DeckAudio {
 }
 
 impl DeckAudio for AudioEngine {
-    fn load(&mut self, index: usize, path: &Path) -> bool {
-        self.load_file(index, path).is_ok()
+    fn load(&mut self, index: usize, input: &AudioInput) -> bool {
+        AudioEngine::load(self, index, input).is_ok()
     }
 
     fn play(&mut self, index: usize) {
@@ -112,7 +111,17 @@ pub struct Deck {
     audio: Signal<SharedAudio>,
     index: usize,
     loaded: Signal<Option<LoadedTrack>>,
+    /// The track being prepared for this deck, which can take seconds when it streams.
+    loading: Signal<Option<Pending>>,
     live: Signal<DeckSnapshot>,
+}
+
+/// A track a deck has been asked to load and is still preparing.
+#[derive(Clone, PartialEq)]
+struct Pending {
+    track_id: Uuid,
+    /// What to call it while it loads; the projection's record when it holds one.
+    title: String,
 }
 
 impl Deck {
@@ -122,6 +131,7 @@ impl Deck {
             audio,
             index,
             loaded: Signal::new(None),
+            loading: Signal::new(None),
             live: Signal::new(DeckSnapshot::default()),
         }
     }
@@ -137,6 +147,24 @@ impl Deck {
             .read()
             .as_ref()
             .map(|loaded| loaded.track.clone())
+    }
+
+    /// Who is streaming the Loaded Track, when it is not a local file.
+    pub fn stream(&self) -> Option<StreamCredit> {
+        let loaded = self.loaded.read();
+        let origin = loaded.as_ref()?.streamed_from.as_ref()?;
+        Some(StreamCredit {
+            source_type: origin.source_type,
+            url: origin.permalink.clone(),
+            preview: origin.preview,
+        })
+    }
+
+    /// The in-memory stream of `track_id`, when this deck holds that track as a stream.
+    pub fn streamed_audio(&self, track_id: Uuid) -> Option<AudioInput> {
+        let loaded = self.loaded.read();
+        let loaded = loaded.as_ref()?;
+        (loaded.id() == track_id && loaded.streamed_from.is_some()).then(|| loaded.audio.clone())
     }
 
     /// Whether this deck holds the given canonical track.
@@ -163,12 +191,64 @@ impl Deck {
         self.state() == DeckDisplayState::Playing
     }
 
+    /// The title of the track this deck is preparing, while it prepares one.
+    pub fn loading(&self) -> Option<String> {
+        self.loading
+            .read()
+            .as_ref()
+            .map(|pending| pending.title.clone())
+    }
+
+    /// Start preparing `track_id` for this deck.
+    ///
+    /// Returns false when the deck is already preparing that same track, so a repeated
+    /// gesture — a double click while a stream downloads — starts nothing a second time.
+    /// Asking for a different track takes the deck over: the earlier one is discarded when
+    /// it arrives.
+    pub fn begin_loading(&self, track_id: Uuid, title: String) -> bool {
+        if self.is_loading(track_id) {
+            return false;
+        }
+        let mut loading = self.loading;
+        loading.set(Some(Pending { track_id, title }));
+        true
+    }
+
+    /// Put a prepared track on this deck, unless a later request took the deck over while
+    /// it was being prepared.
+    pub fn finish_loading(&self, loaded: LoadedTrack) -> bool {
+        if !self.is_loading(loaded.id()) {
+            return false;
+        }
+        self.clear_loading();
+        self.load(loaded)
+    }
+
+    /// Give up preparing `track_id`, leaving whatever the deck holds.
+    pub fn abandon_loading(&self, track_id: Uuid) {
+        if self.is_loading(track_id) {
+            self.clear_loading();
+        }
+    }
+
+    fn is_loading(&self, track_id: Uuid) -> bool {
+        self.loading
+            .read()
+            .as_ref()
+            .is_some_and(|pending| pending.track_id == track_id)
+    }
+
+    fn clear_loading(&self) {
+        let mut loading = self.loading;
+        loading.set(None);
+    }
+
     /// Put a Loaded Track on this deck.
     ///
-    /// The audio engine decodes the loaded track's resolved file; the deck keeps the
+    /// The audio engine decodes the loaded track's resolved audio; the deck keeps the
     /// track's own identity, so a cached copy of a remote asset never becomes the track.
     pub fn load(&self, loaded: LoadedTrack) -> bool {
-        if !self.with_audio(|audio, index| audio.load(index, &loaded.path)) {
+        if !self.with_audio(|audio, index| audio.load(index, &loaded.audio)) {
             return false;
         }
         self.set_loaded(Some(loaded));
@@ -305,7 +385,7 @@ mod tests {
         volume: f32,
         finished: bool,
         refuse_load: bool,
-        loaded_from: Option<PathBuf>,
+        loaded_from: Option<AudioInput>,
     }
 
     impl Default for FakeDeck {
@@ -331,12 +411,12 @@ mod tests {
     }
 
     impl DeckAudio for FakeAudio {
-        fn load(&mut self, index: usize, path: &Path) -> bool {
+        fn load(&mut self, index: usize, input: &AudioInput) -> bool {
             self.calls.push(format!("load {index}"));
             if self.decks[index].refuse_load {
                 return false;
             }
-            self.decks[index].loaded_from = Some(path.to_path_buf());
+            self.decks[index].loaded_from = Some(input.clone());
             self.decks[index].state = DeckState::Stopped;
             true
         }
@@ -390,6 +470,7 @@ mod tests {
             audio,
             index,
             loaded: Signal::new_in_scope(None, ScopeId::ROOT),
+            loading: Signal::new_in_scope(None, ScopeId::ROOT),
             live: Signal::new_in_scope(DeckSnapshot::default(), ScopeId::ROOT),
         }
     }
@@ -401,8 +482,9 @@ mod tests {
         track.title = "Canonical".into();
         LoadedTrack {
             track,
-            path: PathBuf::from(cache),
+            audio: AudioInput::File(PathBuf::from(cache)),
             cached: true,
+            streamed_from: None,
         }
     }
 
@@ -431,7 +513,7 @@ mod tests {
             assert!(decks[0].load(loaded));
             assert_eq!(
                 fake.lock().unwrap().decks[0].loaded_from,
-                Some(PathBuf::from("/cache/drive/abc.mp3"))
+                Some(AudioInput::File(PathBuf::from("/cache/drive/abc.mp3")))
             );
             // The cache copy is what plays; it never becomes the track's identity.
             assert_eq!(
@@ -439,6 +521,80 @@ mod tests {
                 Some(PathBuf::new())
             );
             assert!(decks[0].holds(id));
+        });
+    }
+
+    #[test]
+    fn asking_again_for_the_track_a_deck_is_preparing_starts_nothing() {
+        with_decks(|decks, fake| {
+            let loaded = a_loaded_track("/cache/stream.mp3");
+            let id = loaded.id();
+            assert!(decks[0].begin_loading(id, "Canonical".into()));
+            assert!(!decks[0].begin_loading(id, "Canonical".into()));
+            // The other deck is a separate, deliberate request.
+            assert!(decks[1].begin_loading(id, "Canonical".into()));
+            assert_eq!(decks[0].loading().as_deref(), Some("Canonical"));
+
+            assert!(decks[0].finish_loading(loaded));
+
+            assert_eq!(decks[0].loading(), None);
+            assert!(decks[0].holds(id));
+            assert_eq!(fake.lock().unwrap().calls, vec!["load 0"]);
+        });
+    }
+
+    #[test]
+    fn a_track_superseded_while_preparing_is_discarded_when_it_arrives() {
+        with_decks(|decks, fake| {
+            let first = a_loaded_track("/cache/first.mp3");
+            let second = a_loaded_track("/cache/second.mp3");
+            assert!(decks[0].begin_loading(first.id(), "First".into()));
+            assert!(decks[0].begin_loading(second.id(), "Second".into()));
+
+            assert!(!decks[0].finish_loading(first.clone()));
+            assert_eq!(decks[0].loading().as_deref(), Some("Second"));
+            // A late failure of the superseded track leaves the newer request alone.
+            decks[0].abandon_loading(first.id());
+            assert_eq!(decks[0].loading().as_deref(), Some("Second"));
+
+            assert!(decks[0].finish_loading(second.clone()));
+            assert!(decks[0].holds(second.id()));
+            assert_eq!(fake.lock().unwrap().calls, vec!["load 0"]);
+        });
+    }
+
+    #[test]
+    fn a_failed_load_clears_the_indicator_and_allows_a_retry() {
+        with_decks(|decks, _| {
+            let id = Uuid::new_v4();
+            assert!(decks[0].begin_loading(id, "Flaky".into()));
+            decks[0].abandon_loading(id);
+            assert_eq!(decks[0].loading(), None);
+            assert!(decks[0].begin_loading(id, "Flaky".into()));
+        });
+    }
+
+    #[test]
+    fn only_a_streamed_track_offers_its_audio_for_analysis() {
+        with_decks(|decks, _| {
+            let file = a_loaded_track("/cache/owned.mp3");
+            let mut stream = a_loaded_track("/unused");
+            stream.audio = AudioInput::Memory(Arc::from(&b"mp3"[..]));
+            stream.streamed_from = Some(crate::services::catalog::StreamOrigin {
+                source_type: rec_core::SourceType::SoundCloud,
+                permalink: None,
+                preview: false,
+            });
+            let (file_id, stream_id) = (file.id(), stream.id());
+            decks[0].load(file);
+            decks[1].load(stream);
+
+            assert_eq!(decks[0].streamed_audio(file_id), None);
+            assert_eq!(decks[1].streamed_audio(file_id), None);
+            assert_eq!(
+                decks[1].streamed_audio(stream_id),
+                Some(AudioInput::Memory(Arc::from(&b"mp3"[..])))
+            );
         });
     }
 
@@ -592,8 +748,9 @@ mod view_tests {
         track.set_duration(Duration::from_secs(240));
         LoadedTrack {
             track,
-            path: PathBuf::from("/cache/playing.mp3"),
+            audio: AudioInput::File(PathBuf::from("/cache/playing.mp3")),
             cached: true,
+            streamed_from: None,
         }
     }
 

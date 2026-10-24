@@ -29,7 +29,9 @@ pub use waveform::WaveformAnalyzer;
 /// Files longer than this are analyzed using only the first portion.
 const MAX_DECODE_SAMPLES: usize = 100_000_000;
 
+use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -42,11 +44,19 @@ use symphonia::core::probe::Hint;
 /// This function decodes the audio once and runs all analyzers (waveform, BPM, key, beat grid)
 /// on the decoded samples.
 pub fn analyze_track(path: impl AsRef<Path>) -> Result<AnalysisResult, AnalysisError> {
-    let path = path.as_ref();
+    let (samples, sample_rate) = decode_audio(path.as_ref())?;
+    analyze_samples(samples, sample_rate)
+}
 
-    // Decode audio to samples
-    let (samples, sample_rate) = decode_audio(path)?;
+/// Analyze audio already held in memory, such as a provider stream, without touching disk.
+pub fn analyze_audio_bytes(bytes: Arc<[u8]>) -> Result<AnalysisResult, AnalysisError> {
+    let mss = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
+    let (samples, sample_rate) = decode_stream(mss, Hint::new())?;
+    analyze_samples(samples, sample_rate)
+}
 
+/// Run every analyzer over decoded mono samples.
+fn analyze_samples(samples: Vec<f32>, sample_rate: u32) -> Result<AnalysisResult, AnalysisError> {
     if samples.is_empty() {
         return Err(AnalysisError::InsufficientData);
     }
@@ -146,7 +156,11 @@ fn decode_audio(path: &Path) -> Result<(Vec<f32>, u32), AnalysisError> {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
+    decode_stream(mss, hint)
+}
 
+/// Decode a media stream to mono f32 samples.
+fn decode_stream(mss: MediaSourceStream, hint: Hint) -> Result<(Vec<f32>, u32), AnalysisError> {
     // Probe the format
     let probed = symphonia::default::get_probe()
         .format(
@@ -230,6 +244,53 @@ fn decode_audio(path: &Path) -> Result<(Vec<f32>, u32), AnalysisError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Four seconds of a 120 BPM click track as 16-bit mono WAV bytes.
+    fn click_track_wav() -> Vec<u8> {
+        const RATE: u32 = 44_100;
+        let samples: Vec<i16> = (0..RATE * 4)
+            .map(|n| {
+                let since_beat = n % (RATE / 2);
+                if since_beat < 400 {
+                    (((n as f32) * 0.3).sin() * 20_000.0) as i16
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let data_len = samples.len() as u32 * 2;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&RATE.to_le_bytes());
+        wav.extend_from_slice(&(RATE * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    #[test]
+    fn audio_in_memory_is_analyzed_like_a_file() {
+        let result = analyze_audio_bytes(Arc::from(click_track_wav())).unwrap();
+
+        assert_eq!(result.sample_rate, 44_100);
+        assert!((result.duration_secs - 4.0).abs() < 0.01);
+        assert!(!result.waveform_peaks.is_empty());
+    }
+
+    #[test]
+    fn bytes_that_are_not_audio_are_refused() {
+        assert!(analyze_audio_bytes(Arc::from(&b"not audio"[..])).is_err());
+    }
 
     #[test]
     fn test_musical_key_display() {

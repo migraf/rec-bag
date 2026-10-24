@@ -1,10 +1,11 @@
 //! Playlist browser component for managing playlists.
 
 use dioxus::prelude::*;
-use rec_core::Playlist;
+use rec_core::{Playlist, SourceType};
 use uuid::Uuid;
 
 const PLAYLIST_BROWSER_CSS: Asset = asset!("/assets/components/playlist-browser.css");
+const SOURCE_BADGE_CSS: Asset = asset!("/assets/components/source-badge.css");
 
 /// Props for the PlaylistBrowser component.
 #[derive(Props, Clone, PartialEq)]
@@ -19,6 +20,34 @@ pub struct PlaylistBrowserProps {
     pub on_create: EventHandler<String>,
     /// Callback when deleting a playlist
     pub on_delete: EventHandler<Uuid>,
+}
+
+/// Names the catalog source a playlist or track comes from, linking to its page there.
+#[component]
+pub fn SourceBadge(source_type: SourceType, url: Option<String>) -> Element {
+    let (label, class) = match source_type {
+        SourceType::SoundCloud => ("SoundCloud", "source-badge source-soundcloud"),
+        SourceType::GoogleDrive => ("Drive", "source-badge"),
+        SourceType::Dropbox => ("Dropbox", "source-badge"),
+        SourceType::Local => ("Local", "source-badge"),
+        _ => ("Remote", "source-badge"),
+    };
+    rsx! {
+        document::Stylesheet { href: SOURCE_BADGE_CSS }
+        if let Some(url) = url {
+            a {
+                class: "{class}",
+                href: "{url}",
+                target: "_blank",
+                rel: "noopener noreferrer",
+                title: "Open on {label}",
+                onclick: move |e| e.stop_propagation(),
+                "{label}"
+            }
+        } else {
+            span { class: "{class}", "{label}" }
+        }
+    }
 }
 
 /// Playlist browser sidebar component.
@@ -81,6 +110,7 @@ pub fn PlaylistBrowser(props: PlaylistBrowserProps) -> Element {
                     {
                         let id = playlist.id;
                         let is_selected = props.selected_id == Some(id);
+                        let origin = playlist.origin.clone();
                         rsx! {
                             li {
                                 key: "{id}",
@@ -90,13 +120,22 @@ pub fn PlaylistBrowser(props: PlaylistBrowserProps) -> Element {
                                     span { class: "playlist-name", "{playlist.name}" }
                                     span { class: "playlist-count", "({playlist.tracks.len()})" }
                                 }
-                                button {
-                                    class: "btn-delete",
-                                    onclick: move |e| {
-                                        e.stop_propagation();
-                                        props.on_delete.call(id);
-                                    },
-                                    "×"
+                                if let Some(origin) = origin {
+                                    // Mirrored from a source: credited and linked back to it,
+                                    // and read-only because the next sync owns its contents.
+                                    SourceBadge {
+                                        source_type: origin.source_type,
+                                        url: origin.external_url,
+                                    }
+                                } else {
+                                    button {
+                                        class: "btn-delete",
+                                        onclick: move |e| {
+                                            e.stop_propagation();
+                                            props.on_delete.call(id);
+                                        },
+                                        "×"
+                                    }
                                 }
                             }
                         }

@@ -94,7 +94,7 @@ impl CatalogProjection {
             .collect()
     }
 
-    /// Every canonical playlist.
+    /// Every playlist: the user's own, then those mirrored from catalog sources.
     pub fn playlists(&self) -> Vec<Playlist> {
         self.playlists.read().clone()
     }
@@ -179,8 +179,12 @@ impl CatalogProjection {
         id
     }
 
-    /// Delete a playlist and forget it in the store.
+    /// Delete a playlist and forget it in the store. A mirrored playlist belongs to its
+    /// source and is left alone.
     pub fn delete_playlist(mut self, playlist_id: Uuid) {
+        if !self.is_editable(playlist_id) {
+            return;
+        }
         self.playlists.write().retain(|p| p.id != playlist_id);
         if let Some(writer) = self.playlist_writer.read().clone() {
             writer.delete(playlist_id);
@@ -189,6 +193,9 @@ impl CatalogProjection {
 
     /// Add tracks to a playlist and persist the new membership.
     pub fn add_tracks_to_playlist(mut self, tracks: Vec<Track>, playlist_id: Uuid) {
+        if !self.is_editable(playlist_id) {
+            return;
+        }
         let mut playlists = self.playlists.write();
         let Some(playlist) = playlists.iter_mut().find(|p| p.id == playlist_id) else {
             return;
@@ -202,6 +209,9 @@ impl CatalogProjection {
 
     /// Remove tracks from a playlist and persist the new membership.
     pub fn remove_tracks_from_playlist(mut self, track_ids: &[Uuid], playlist_id: Uuid) {
+        if !self.is_editable(playlist_id) {
+            return;
+        }
         let mut playlists = self.playlists.write();
         let Some(playlist) = playlists.iter_mut().find(|p| p.id == playlist_id) else {
             return;
@@ -211,6 +221,15 @@ impl CatalogProjection {
         }
         drop(playlists);
         self.save_playlist(playlist_id);
+    }
+
+    /// Whether `playlist_id` is one of the user's own playlists. A mirrored playlist would
+    /// be overwritten by the next sync, so editing one is refused rather than lost later.
+    pub fn is_editable(&self, playlist_id: Uuid) -> bool {
+        self.playlists
+            .read()
+            .iter()
+            .any(|playlist| playlist.id == playlist_id && playlist.is_editable())
     }
 
     fn any_playlist_holds(&self, track_id: Uuid) -> bool {
@@ -318,6 +337,31 @@ mod tests {
 
             projection.delete_playlist(playlist_id);
             assert_eq!(writer.deleted(), vec![playlist_id]);
+        })
+    }
+
+    #[test]
+    fn a_mirrored_playlist_cannot_be_edited_or_deleted() {
+        with_runtime(|| {
+            let (projection, writer) = a_projection(vec![a_track("/music/one.mp3", "Blue Monday")]);
+            let track = projection.tracks()[0].clone();
+            let mut mirrored = Playlist::with_tracks("Likes", vec![track.clone()]);
+            mirrored.origin = Some(rec_core::PlaylistOrigin {
+                source_id: Uuid::new_v4(),
+                source_type: rec_core::SourceType::SoundCloud,
+                external_url: None,
+            });
+            let id = mirrored.id;
+            let mut playlists = projection.playlists;
+            playlists.write().push(mirrored);
+
+            projection.remove_tracks_from_playlist(&[track.id], id);
+            projection.add_tracks_to_playlist(vec![track.clone()], id);
+            projection.delete_playlist(id);
+
+            assert_eq!(projection.playlist_tracks(id).len(), 1);
+            assert_eq!(writer.last_saved(id), None);
+            assert!(writer.deleted().is_empty());
         })
     }
 

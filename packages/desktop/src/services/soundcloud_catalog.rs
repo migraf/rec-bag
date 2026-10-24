@@ -30,7 +30,8 @@ use rec_persistence::{RefreshTokenMetadata, TursoCatalog};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soundcloud::{
-    ReqwestSoundCloudTransport, SoundCloudClient, SoundCloudConnector, SoundCloudTokenProvider,
+    ReqwestSoundCloudTransport, SoundCloudClient, SoundCloudConnector, SoundCloudHttpTransport,
+    SoundCloudStreamFormat, SoundCloudTokenProvider,
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex as AsyncMutex;
@@ -42,6 +43,7 @@ use ui::{
 use url::Url;
 use uuid::Uuid;
 
+use super::catalog::{CatalogError, StreamFuture, StreamOrigin, StreamedAudio, TrackStreams};
 use super::integration::{
     CredentialKey, CredentialStore, IntegrationFuture, IntegrationSliceHandler, Secret,
 };
@@ -322,7 +324,11 @@ impl SoundCloudBrokerClient for ApiSoundCloudBrokerClient {
         &self,
         request: SoundCloudRefreshTokenExchange,
     ) -> BoxFuture<'_, Result<SoundCloudTokenResponse, IntegrationError>> {
-        Box::pin(async move { api::refresh_soundcloud_token(request).await.map_err(broker_error) })
+        Box::pin(async move {
+            api::refresh_soundcloud_token(request)
+                .await
+                .map_err(broker_error)
+        })
     }
 
     fn public_config(&self) -> BoxFuture<'_, Result<SoundCloudPublicConfig, IntegrationError>> {
@@ -743,7 +749,11 @@ struct CredentialTokenProvider {
     credentials: Arc<dyn CredentialStore>,
     broker: Arc<dyn SoundCloudBrokerClient>,
     catalog: Arc<TursoCatalog>,
-    refresh_lock: AsyncMutex<()>,
+    /// Shared by every provider of the service: a sync and a deck stream may both see a 401,
+    /// and SoundCloud refresh tokens are single-use, so only one of them may refresh.
+    refresh_lock: Arc<AsyncMutex<()>>,
+    /// The access token this provider last handed out.
+    issued: Mutex<Option<String>>,
 }
 
 impl CredentialTokenProvider {
@@ -770,13 +780,24 @@ impl CredentialTokenProvider {
     }
 }
 
+impl CredentialTokenProvider {
+    fn issue(&self, access_token: &str) {
+        if let Ok(mut issued) = self.issued.lock() {
+            *issued = Some(access_token.to_string());
+        }
+    }
+}
+
 impl SoundCloudTokenProvider for CredentialTokenProvider {
     fn access_token(&self) -> BoxFuture<'_, Result<String, SourceError>> {
         Box::pin(async move {
-            self.load()
+            let access_token = self
+                .load()
                 .await
                 .map(|credentials| credentials.access_token)
-                .map_err(integration_to_source_error)
+                .map_err(integration_to_source_error)?;
+            self.issue(&access_token);
+            Ok(access_token)
         })
     }
 
@@ -784,6 +805,14 @@ impl SoundCloudTokenProvider for CredentialTokenProvider {
         Box::pin(async move {
             let _guard = self.refresh_lock.lock().await;
             let current = self.load().await.map_err(integration_to_source_error)?;
+            // Someone else rotated the tokens while this caller waited: the stored token is
+            // already newer than the one that was rejected, so use it rather than spend the
+            // refresh token a second time.
+            let stale = self.issued.lock().ok().and_then(|issued| issued.clone());
+            if stale.is_some_and(|stale| stale != current.access_token) {
+                self.issue(&current.access_token);
+                return Ok(current.access_token);
+            }
             let response = self
                 .broker
                 .refresh_token(SoundCloudRefreshTokenExchange {
@@ -799,6 +828,7 @@ impl SoundCloudTokenProvider for CredentialTokenProvider {
             self.persist_rotation(rotated)
                 .await
                 .map_err(integration_to_source_error)?;
+            self.issue(&access_token);
             Ok(access_token)
         })
     }
@@ -858,7 +888,25 @@ pub struct SoundCloudCatalogService {
     pending: Mutex<HashMap<Uuid, PendingAuthorization>>,
     prepared: Mutex<Option<PreparedConnection>>,
     operation_lock: AsyncMutex<()>,
+    refresh_lock: Arc<AsyncMutex<()>>,
+    /// How deck streams reach SoundCloud; replaced by fixtures in tests.
+    stream_transport: Arc<dyn SoundCloudHttpTransport>,
     view: AsyncMutex<MusicManagementView>,
+}
+
+impl TrackStreams for SoundCloudCatalogService {
+    fn stream<'a>(&'a self, track_id: Uuid) -> StreamFuture<'a> {
+        Box::pin(async move {
+            self.stream_track(track_id).await.map_err(|error| {
+                let message = format!("Could not stream from SoundCloud: {}", error.message);
+                if error.retryable {
+                    CatalogError::retryable(message)
+                } else {
+                    CatalogError::new(message)
+                }
+            })
+        })
+    }
 }
 
 /// Credentials obtained by [`SoundCloudCatalogService::authorize`] but not yet persisted. The
@@ -906,6 +954,8 @@ impl SoundCloudCatalogService {
             pending: Mutex::new(HashMap::new()),
             prepared: Mutex::new(None),
             operation_lock: AsyncMutex::new(()),
+            refresh_lock: Arc::new(AsyncMutex::new(())),
+            stream_transport: Arc::new(ReqwestSoundCloudTransport::default()),
             view: AsyncMutex::new(empty_view()),
         }
     }
@@ -957,6 +1007,78 @@ impl SoundCloudCatalogService {
     pub fn with_sign_out_client(mut self, sign_out: Arc<dyn SoundCloudSignOutClient>) -> Self {
         self.sign_out = sign_out;
         self
+    }
+
+    #[cfg(test)]
+    fn with_stream_transport(mut self, transport: Arc<dyn SoundCloudHttpTransport>) -> Self {
+        self.stream_transport = transport;
+        self
+    }
+
+    /// Fetches a track's SoundCloud stream into memory for a deck the user loaded it onto.
+    ///
+    /// Takes no catalog or operation lock, so playback never waits for a sync. `Ok(None)` when
+    /// no connected SoundCloud source has a playable copy of the track.
+    pub async fn stream_track(
+        &self,
+        track_id: Uuid,
+    ) -> Result<Option<StreamedAudio>, IntegrationError> {
+        let occurrences = SourceRepository::list_occurrences(
+            self.catalog.as_ref(),
+            SourceOccurrenceFilter {
+                canonical_track_id: Some(track_id),
+                ..Default::default()
+            },
+            RepositoryPageRequest {
+                cursor: None,
+                limit: Some(50),
+            },
+        )
+        .await
+        .map_err(repository_error)?
+        .items;
+        for occurrence in occurrences {
+            if !matches!(
+                occurrence.availability,
+                SourceAvailability::StreamingOnly | SourceAvailability::PreviewOnly
+            ) {
+                continue;
+            }
+            let source_id = occurrence.identity.source_id;
+            let Some(source) = SourceRepository::get(self.catalog.as_ref(), source_id)
+                .await
+                .map_err(repository_error)?
+            else {
+                continue;
+            };
+            if source.kind != CatalogSourceKind::SoundCloud
+                || self
+                    .credentials
+                    .load(&credential_key(source_id))
+                    .await?
+                    .is_none()
+            {
+                continue;
+            }
+            let client = SoundCloudClient::new(
+                self.stream_transport.clone(),
+                self.token_provider(source_id),
+            )
+            .map_err(source_error)?;
+            let audio = client
+                .stream_audio(&occurrence.identity.external_id)
+                .await
+                .map_err(source_error)?;
+            return Ok(Some(StreamedAudio {
+                bytes: audio.bytes.into(),
+                origin: StreamOrigin {
+                    source_type: rec_core::SourceType::SoundCloud,
+                    permalink: occurrence.external_url,
+                    preview: audio.format == SoundCloudStreamFormat::PreviewMp3,
+                },
+            }));
+        }
+        Ok(None)
     }
 
     /// Saved desktop settings win; otherwise the broker supplies the public client ID and its
@@ -1086,7 +1208,9 @@ impl SoundCloudCatalogService {
             .lock()
             .map_err(|_| integration_error("OAuth state store is unavailable", true))?
             .take()
-            .ok_or_else(|| integration_error("SoundCloud authorization was not completed", false))?;
+            .ok_or_else(|| {
+                integration_error("SoundCloud authorization was not completed", false)
+            })?;
         let source_id = source.id;
         self.credentials
             .store(&credential_key(source_id), stored.encode()?)
@@ -1240,13 +1364,10 @@ impl SoundCloudCatalogService {
                 })
         };
         let tokens = self.token_provider(source_id);
-        let access_token = tokens
-            .access_token()
-            .await
-            .map_err(|error| {
-                let retryable = error.is_retryable();
-                integration_error(error.message, retryable)
-            })?;
+        let access_token = tokens.access_token().await.map_err(|error| {
+            let retryable = error.is_retryable();
+            integration_error(error.message, retryable)
+        })?;
         match revoke(access_token).await? {
             ProviderGrantRevocation::AccessTokenRejected => {}
             other => return Ok(other),
@@ -1321,7 +1442,8 @@ impl SoundCloudCatalogService {
             credentials: self.credentials.clone(),
             broker: self.broker.clone(),
             catalog: self.catalog.clone(),
-            refresh_lock: AsyncMutex::new(()),
+            refresh_lock: self.refresh_lock.clone(),
+            issued: Mutex::new(None),
         })
     }
 
@@ -2264,16 +2386,26 @@ fn add_provider_metadata(canonical: &mut CanonicalTrack, occurrence: &SourceTrac
         .and_then(object_value)
         .and_then(|user| user.get("username"))
         .and_then(text_value);
+    let genre = occurrence
+        .provider_metadata
+        .get("genre")
+        .and_then(text_value)
+        .filter(|genre| !genre.trim().is_empty());
+    // Milliseconds. A streamed track has no file to read its length from, and a deck cannot
+    // seek in a track of unknown length.
+    let duration_ms = match occurrence.provider_metadata.get("duration") {
+        Some(MetadataValue::Integer(value)) if *value > 0 => Some(MetadataValue::Integer(*value)),
+        _ => None,
+    };
+    let text = |value: Option<&str>| value.map(|value| MetadataValue::Text(value.to_string()));
     for (field, value) in [
-        (MetadataField::Title, title),
-        (MetadataField::Artist, artist),
+        (MetadataField::Title, text(title)),
+        (MetadataField::Artist, text(artist)),
+        (MetadataField::Genre, text(genre)),
+        (MetadataField::DurationMs, duration_ms),
     ] {
         let Some(value) = value else { continue };
-        let candidate = MetadataFieldValue::new(
-            field,
-            MetadataValue::Text(value.to_string()),
-            provenance.clone(),
-        );
+        let candidate = MetadataFieldValue::new(field, value, provenance.clone());
         if !canonical.metadata.values.iter().any(|old| {
             old.field == candidate.field
                 && old.value == candidate.value
@@ -2690,8 +2822,8 @@ mod tests {
         );
     }
     use rec_core::{
-        MetadataOrigin, SourceAccount,
-        SourceCollectionRelationshipIdentity, SourceSyncPage, SyncCursor,
+        MetadataOrigin, SourceAccount, SourceCollectionRelationshipIdentity, SourceSyncPage,
+        SyncCursor,
     };
 
     struct MockUserAgent {
@@ -3089,7 +3221,8 @@ mod tests {
             credentials: credentials.clone(),
             broker: broker.clone(),
             catalog: service.catalog.clone(),
-            refresh_lock: AsyncMutex::new(()),
+            refresh_lock: Arc::new(AsyncMutex::new(())),
+            issued: Mutex::new(None),
         };
         assert_eq!(provider.refresh_access_token().await.unwrap(), "access-2");
         let rotated = StoredSoundCloudCredentials::decode(
@@ -3112,6 +3245,115 @@ mod tests {
                 .refresh_generation,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_another_caller_already_made_is_not_spent_again() {
+        let (service, _, broker, credentials, _) = fixture().await;
+        let source = CatalogSource::new("SoundCloud", CatalogSourceKind::SoundCloud);
+        SourceRepository::upsert(service.catalog.as_ref(), source.clone())
+            .await
+            .unwrap();
+        let initial = StoredSoundCloudCredentials::from_response(
+            token_response("old-access", "old-refresh"),
+            0,
+        );
+        credentials
+            .store(&credential_key(source.id), initial.encode().unwrap())
+            .await
+            .unwrap();
+        // A sync and a deck stream both start with the same, soon expired, access token.
+        let sync = service.token_provider(source.id);
+        let stream = service.token_provider(source.id);
+        assert_eq!(sync.access_token().await.unwrap(), "old-access");
+        assert_eq!(stream.access_token().await.unwrap(), "old-access");
+
+        assert_eq!(sync.refresh_access_token().await.unwrap(), "access-2");
+        assert_eq!(stream.refresh_access_token().await.unwrap(), "access-2");
+
+        assert_eq!(*broker.refreshes.lock().unwrap(), 1);
+    }
+
+    /// Answers stream requests in order, recording what was asked for.
+    #[derive(Default)]
+    struct StreamTransport {
+        responses: Mutex<VecDeque<soundcloud::SoundCloudHttpResponse>>,
+        requests: Mutex<Vec<soundcloud::SoundCloudHttpRequest>>,
+    }
+
+    impl SoundCloudHttpTransport for StreamTransport {
+        fn execute(
+            &self,
+            request: soundcloud::SoundCloudHttpRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<soundcloud::SoundCloudHttpResponse, soundcloud::SoundCloudTransportError>,
+        > {
+            self.requests.lock().unwrap().push(request);
+            let response = self.responses.lock().unwrap().pop_front().unwrap();
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    fn ok(body: &str) -> soundcloud::SoundCloudHttpResponse {
+        soundcloud::SoundCloudHttpResponse {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: body.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connected_soundcloud_track_streams_with_a_credit_back_to_its_page() {
+        let (service, _, _, credentials, _) = fixture().await;
+        let transport = Arc::new(StreamTransport::default());
+        transport.responses.lock().unwrap().extend([
+            ok(r#"{"hls_mp3_128_url": "https://cf-hls-media.sndcdn.com/playlist/t.m3u8"}"#),
+            ok("#EXTM3U\n#EXTINF:10,\na.mp3\n#EXTINF:10,\nb.mp3\n"),
+            ok("ID3"),
+            ok("MP3"),
+        ]);
+        let service = service.with_stream_transport(transport.clone());
+        let source = CatalogSource::new("SoundCloud", CatalogSourceKind::SoundCloud);
+        SourceRepository::upsert(service.catalog.as_ref(), source.clone())
+            .await
+            .unwrap();
+        let track = CanonicalTrack::new();
+        TrackRepository::upsert(service.catalog.as_ref(), track.clone())
+            .await
+            .unwrap();
+        let mut occurrence = SourceTrackOccurrence::new(source.id, "soundcloud:tracks:7");
+        occurrence.canonical_track_id = Some(track.id);
+        occurrence.availability = SourceAvailability::StreamingOnly;
+        occurrence.external_url = Some("https://soundcloud.com/artist/track".into());
+        SourceRepository::upsert_occurrences(service.catalog.as_ref(), vec![occurrence])
+            .await
+            .unwrap();
+
+        // Not connected: nothing to stream from, and SoundCloud is never asked.
+        assert!(service.stream_track(track.id).await.unwrap().is_none());
+        assert!(transport.requests.lock().unwrap().is_empty());
+
+        let stored =
+            StoredSoundCloudCredentials::from_response(token_response("access", "refresh"), 0);
+        credentials
+            .store(&credential_key(source.id), stored.encode().unwrap())
+            .await
+            .unwrap();
+        let streamed = service.stream_track(track.id).await.unwrap().unwrap();
+
+        assert_eq!(&streamed.bytes[..], b"ID3MP3");
+        assert_eq!(
+            streamed.origin.permalink.as_deref(),
+            Some("https://soundcloud.com/artist/track")
+        );
+        assert!(!streamed.origin.preview);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].url,
+            "https://api.soundcloud.com/tracks/soundcloud:tracks:7/streams"
+        );
+        assert_eq!(requests[0].headers["authorization"], "OAuth access");
     }
 
     #[tokio::test]
@@ -3155,7 +3397,10 @@ mod tests {
         );
 
         let view = service.revoke_provider_grant(source.id).await.unwrap();
-        assert!(view.sources.is_empty(), "revoking removes the SoundCloud source");
+        assert!(
+            view.sources.is_empty(),
+            "revoking removes the SoundCloud source"
+        );
         assert!(credentials
             .load(&credential_key(source.id))
             .await
@@ -3559,7 +3804,9 @@ mod tests {
     async fn callback_receiver_ignores_preconnects_and_other_paths() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let address = listener.local_addr().unwrap();
         let redirect = Url::parse(&format!("http://{address}/oauth/soundcloud")).unwrap();
         let request = |path: &'static str| async move {

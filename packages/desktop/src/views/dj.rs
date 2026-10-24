@@ -45,6 +45,8 @@ pub fn DjView() -> Element {
     let playlists = browser.playlists();
     let playlist_infos: Vec<PlaylistInfo> = playlists
         .iter()
+        // A mirrored playlist belongs to its source, so nothing can be added to it here.
+        .filter(|p| p.is_editable())
         .map(|p| PlaylistInfo {
             id: p.id,
             name: p.name.clone(),
@@ -70,6 +72,8 @@ pub fn DjView() -> Element {
                         track: deck.track(),
                         position: deck.position(),
                         volume: deck.volume(),
+                        stream: deck.stream(),
+                        loading: deck.loading(),
                         on_play: move |_| { deck.play() },
                         on_pause: move |_| { deck.pause() },
                         on_stop: move |_| { deck.stop() },

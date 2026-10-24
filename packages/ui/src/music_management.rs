@@ -534,8 +534,7 @@ impl LifecycleAction {
 
     fn into_event(self) -> MusicManagementEvent {
         match self {
-            Self::DisconnectSource { source_id }
-            | Self::DisconnectSoundCloud { source_id, .. } => {
+            Self::DisconnectSource { source_id } | Self::DisconnectSoundCloud { source_id, .. } => {
                 MusicManagementEvent::DisconnectSource { source_id }
             }
             Self::DisconnectStorage { storage_id } => {
