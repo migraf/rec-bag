@@ -1600,6 +1600,7 @@ dependencies = [
  "sha2",
  "soundcloud",
  "subtle",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tracing",

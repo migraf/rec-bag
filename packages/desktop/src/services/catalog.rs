@@ -81,7 +81,7 @@ pub trait TrackStreams: Send + Sync {
 ///
 /// A loaded track is a moment in the life of a track, not a record of one. Nothing here
 /// is written back to the catalog, so a cache copy of a remote asset never becomes the
-/// track's identity, and a stream never outlives the deck holding it.
+/// track's identity, and a stream never outlives the session that fetched it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoadedTrack {
     /// The canonical track as the interface shows it, with its analysis attached.

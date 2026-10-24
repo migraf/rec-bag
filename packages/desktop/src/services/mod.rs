@@ -13,3 +13,4 @@ pub mod profile_manager;
 pub mod reconciliation_actions;
 pub mod scheduler;
 pub mod soundcloud_catalog;
+pub mod stream_cache;

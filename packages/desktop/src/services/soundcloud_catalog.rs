@@ -47,6 +47,7 @@ use super::catalog::{CatalogError, StreamFuture, StreamOrigin, StreamedAudio, Tr
 use super::integration::{
     CredentialKey, CredentialStore, IntegrationFuture, IntegrationSliceHandler, Secret,
 };
+use super::stream_cache::SessionStreamCache;
 use crate::state::integration::{
     IntegrationError, IntegrationOutcome, IntegrationRequest, IntegrationSlice,
 };
@@ -70,6 +71,15 @@ fn desktop_oauth_configuration_path(catalog: &TursoCatalog) -> Option<PathBuf> {
     catalog
         .path()
         .map(|catalog_path| catalog_path.with_file_name(DESKTOP_OAUTH_CONFIGURATION_FILE))
+}
+
+/// Next to the catalog, so streams are cached on the profile's disk rather than in a `/tmp`
+/// that may be memory-backed.
+fn stream_cache_directory(catalog: &TursoCatalog) -> PathBuf {
+    catalog
+        .path()
+        .map(|catalog_path| catalog_path.with_file_name("cache").join("streams"))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn integration_error(message: impl Into<String>, retryable: bool) -> IntegrationError {
@@ -891,6 +901,8 @@ pub struct SoundCloudCatalogService {
     refresh_lock: Arc<AsyncMutex<()>>,
     /// How deck streams reach SoundCloud; replaced by fixtures in tests.
     stream_transport: Arc<dyn SoundCloudHttpTransport>,
+    /// Streams already fetched this session, so loading a track again needs no download.
+    stream_cache: SessionStreamCache,
     view: AsyncMutex<MusicManagementView>,
 }
 
@@ -943,6 +955,7 @@ impl SoundCloudCatalogService {
         connectors: Arc<dyn SoundCloudConnectorFactory>,
         catalog: Arc<TursoCatalog>,
     ) -> Self {
+        let stream_cache = SessionStreamCache::new(stream_cache_directory(catalog.as_ref()));
         Self {
             config: AsyncMutex::new(config),
             user_agent,
@@ -956,6 +969,7 @@ impl SoundCloudCatalogService {
             operation_lock: AsyncMutex::new(()),
             refresh_lock: Arc::new(AsyncMutex::new(())),
             stream_transport: Arc::new(ReqwestSoundCloudTransport::default()),
+            stream_cache,
             view: AsyncMutex::new(empty_view()),
         }
     }
@@ -1015,7 +1029,8 @@ impl SoundCloudCatalogService {
         self
     }
 
-    /// Fetches a track's SoundCloud stream into memory for a deck the user loaded it onto.
+    /// Fetches a track's SoundCloud stream into memory for a deck the user loaded it onto, from
+    /// the session cache when it was streamed before.
     ///
     /// Takes no catalog or operation lock, so playback never waits for a sync. `Ok(None)` when
     /// no connected SoundCloud source has a playable copy of the track.
@@ -1060,22 +1075,36 @@ impl SoundCloudCatalogService {
             {
                 continue;
             }
+            let external_id = &occurrence.identity.external_id;
+            let origin = |preview| StreamOrigin {
+                source_type: rec_core::SourceType::SoundCloud,
+                permalink: occurrence.external_url.clone(),
+                preview,
+            };
+            if let Some(cached) = self.stream_cache.get(source_id, external_id).await {
+                return Ok(Some(StreamedAudio {
+                    bytes: cached.bytes,
+                    origin: origin(cached.preview),
+                }));
+            }
+            let generation = self.stream_cache.generation();
             let client = SoundCloudClient::new(
                 self.stream_transport.clone(),
                 self.token_provider(source_id),
             )
             .map_err(source_error)?;
             let audio = client
-                .stream_audio(&occurrence.identity.external_id)
+                .stream_audio(external_id)
                 .await
                 .map_err(source_error)?;
+            let preview = audio.format == SoundCloudStreamFormat::PreviewMp3;
+            let bytes: Arc<[u8]> = audio.bytes.into();
+            self.stream_cache
+                .insert(generation, source_id, external_id, bytes.clone(), preview)
+                .await;
             return Ok(Some(StreamedAudio {
-                bytes: audio.bytes.into(),
-                origin: StreamOrigin {
-                    source_type: rec_core::SourceType::SoundCloud,
-                    permalink: occurrence.external_url,
-                    preview: audio.format == SoundCloudStreamFormat::PreviewMp3,
-                },
+                bytes,
+                origin: origin(preview),
             }));
         }
         Ok(None)
@@ -1268,6 +1297,7 @@ impl SoundCloudCatalogService {
             .lock()
             .map_err(|_| integration_error("OAuth state store is unavailable", true))?
             .remove(&source_id);
+        self.stream_cache.forget_source(source_id);
         self.catalog
             .delete_source_provider_data(source_id)
             .await
@@ -1280,6 +1310,7 @@ impl SoundCloudCatalogService {
     ) -> Result<MusicManagementView, IntegrationError> {
         let _operation = self.operation_lock.lock().await;
         self.require_soundcloud_source(source_id).await?;
+        self.stream_cache.forget_source(source_id);
         let transaction = self.catalog.begin().await.map_err(repository_error)?;
         let result = clear_source_checkpoints(transaction.as_ref(), source_id).await;
         match result {
@@ -3354,6 +3385,23 @@ mod tests {
             "https://api.soundcloud.com/tracks/soundcloud:tracks:7/streams"
         );
         assert_eq!(requests[0].headers["authorization"], "OAuth access");
+        drop(requests);
+
+        // Loaded again this session: read back from the session cache, not downloaded.
+        let again = service.stream_track(track.id).await.unwrap().unwrap();
+        assert_eq!(&again.bytes[..], b"ID3MP3");
+        assert_eq!(again.origin, streamed.origin);
+        assert_eq!(transport.requests.lock().unwrap().len(), 4);
+
+        // Clearing the source's local cache drops the stream too.
+        service.clear_local_cache(source.id).await.unwrap();
+        transport.responses.lock().unwrap().extend([
+            ok(r#"{"hls_mp3_128_url": "https://cf-hls-media.sndcdn.com/playlist/t.m3u8"}"#),
+            ok("#EXTM3U\n#EXTINF:10,\na.mp3\n"),
+            ok("NEW"),
+        ]);
+        let refetched = service.stream_track(track.id).await.unwrap().unwrap();
+        assert_eq!(&refetched.bytes[..], b"NEW");
     }
 
     #[tokio::test]

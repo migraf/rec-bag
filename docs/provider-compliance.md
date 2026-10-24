@@ -21,7 +21,7 @@ These are engineering release gates, not legal advice. Provider terms, verificat
 - [ ] Treat imported SoundCloud playlists as read-only.
 - [ ] Do not archive playback transcodes. Only associate/copy audio the user owns and is permitted to store.
 - [ ] Streamed SoundCloud tracks show "Streaming from SoundCloud", linking to the track's permalink, and mirrored playlists show a SoundCloud badge linking to the playlist.
-- [ ] Streamed audio is held in memory only: nothing is written to the profile, cache, or temp directories. Analysis of a stream (BPM, key, waveform, beat grid) runs on that in-memory copy and is shown for the session only; it is never saved to the catalog, and a stream is never fetched just to be analyzed.
+- [ ] Streamed audio is cached for the session only: in memory while a deck holds it, and otherwise in anonymous temporary files (no filesystem name, deleted by the OS when the app exits, crashes, or is killed) under `cache/streams` next to the catalog, which stays empty on Linux. The cache is capped at 2 GiB / 256 tracks and is dropped when SoundCloud is disconnected, revoked, forgotten, or its local cache is cleared. Analysis of a stream (BPM, key, waveform, beat grid) runs on that in-memory copy and is shown for the session only; it is never saved to the catalog, and a stream is never fetched just to be analyzed.
 - [ ] Review SoundCloud API Terms section 3 (no modification; no playback experience that combines User Content with content from other services) against DJ mixing before any public release.
 - [ ] Handle revocation/removal without deleting user-owned canonical data or backups.
 - [ ] Document export/deletion and revoke tokens on disconnect where supported.
