@@ -13,7 +13,7 @@ Supply secrets with the deployment platform's secret manager, not an image, mani
 ```dotenv
 SOUNDCLOUD_CLIENT_ID=your-soundcloud-client-id
 SOUNDCLOUD_KEY=your-soundcloud-client-secret
-SOUNDCLOUD_ALLOWED_REDIRECT_URIS=rec-bag://soundcloud/callback
+SOUNDCLOUD_ALLOWED_REDIRECT_URIS=http://127.0.0.1:17841/oauth/soundcloud
 ```
 
 `SOUNDCLOUD_ALLOWED_REDIRECT_URIS` is a required comma-separated **exact** allow-list. Wildcards, fragments, credentials in URLs, public plain-HTTP callbacks, and malformed entries cause startup-on-first-request configuration failure. Plain HTTP is accepted only for loopback development callbacks. Every production callback must also be registered with SoundCloud.
@@ -25,12 +25,16 @@ SOUNDCLOUD_OAUTH_RATE_LIMIT=20
 SOUNDCLOUD_OAUTH_RATE_WINDOW_SECONDS=60
 SOUNDCLOUD_OAUTH_MAX_TRACKED_CLIENTS=10000
 SOUNDCLOUD_OAUTH_HTTP_TIMEOUT_SECONDS=15
-SOUNDCLOUD_LOAD_DOTENV=false
+SOUNDCLOUD_LOAD_DOTENV=false   # default: true in debug builds, false in release builds
 ```
 
-`.env` loading is off by default. Set `SOUNDCLOUD_LOAD_DOTENV=true` only for controlled local development; process environment values take precedence. Invalid, zero, or out-of-range numeric values fail closed rather than silently falling back.
+`.env` loading is on by default in debug builds (local `dx serve`) and off in release builds; `SOUNDCLOUD_LOAD_DOTENV` overrides either default. Process environment values take precedence. Invalid, zero, or out-of-range numeric values fail closed rather than silently falling back.
 
 Configuration is cached on first broker use. Any environment change therefore requires a process restart or rolling deployment.
+
+## Public desktop configuration
+
+`GET /api/soundcloud/oauth/config` returns the client ID and the first loopback `http` entry of `SOUNDCLOUD_ALLOWED_REDIRECT_URIS`. The desktop uses it when no local override is saved. Neither value is secret.
 
 ## OAuth responsibility split
 
@@ -46,7 +50,7 @@ The broker validates state and PKCE syntax, exact redirect membership, and forwa
 
 ## Mandatory trusted-proxy boundary and rate limiting
 
-Dioxus server functions expose request headers but do not provide a deployment-independent peer socket address. Both OAuth endpoints therefore require one canonical `X-Real-IP` header containing exactly one IPv4 or IPv6 address and apply an atomic per-IP sliding-window limit. Missing, malformed, or comma-separated values fail closed with a safe `503`. Limiter identity storage is bounded by `SOUNDCLOUD_OAUTH_MAX_TRACKED_CLIENTS`.
+Dioxus server functions expose request headers but do not provide a deployment-independent peer socket address. Both OAuth endpoints therefore require one canonical `X-Real-IP` header containing exactly one IPv4 or IPv6 address and apply an atomic per-IP sliding-window limit. Missing, malformed, or comma-separated values fail closed with a safe `503`. Debug builds only treat a *missing* header as the loopback client so local `dx serve` works without a proxy; release builds always require it. Limiter identity storage is bounded by `SOUNDCLOUD_OAUTH_MAX_TRACKED_CLIENTS`.
 
 Deploy the app only behind a trusted reverse proxy/load balancer configured to:
 

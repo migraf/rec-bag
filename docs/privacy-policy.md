@@ -111,7 +111,7 @@ We do not provide Google user data to third parties except as necessary to provi
 
 In Music Management you can:
 
-- disconnect a SoundCloud source or Google storage without deleting catalog data or provider files;
+- disconnect a Google storage without deleting catalog data or provider files; disconnecting SoundCloud also deletes its SoundCloud-derived catalog data on this device;
 - revoke provider access, removing local credentials and disabling affected connections after provider revocation succeeds;
 - clear local cached bytes without deleting catalog or provider content;
 - explicitly forget and delete current local provider-derived catalog/storage rows and current snapshot records while preserving canonical owned assets and without deleting provider files;

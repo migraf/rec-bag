@@ -30,6 +30,11 @@ use uuid::Uuid;
 const DEFAULT_PAGE_SIZE: u32 = 50;
 const MAX_PAGE_SIZE: u32 = 200;
 const DEFAULT_API_URL: &str = "https://api.soundcloud.com/";
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Playlist track lists default to excluding blocked tracks; request every access level so stored
+/// positions match the playlist the user sees on SoundCloud.
+const ALL_TRACK_ACCESS: &str = "playable,preview,blocked";
 pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 const CURSOR_VERSION: u8 = 1;
 
@@ -132,8 +137,15 @@ pub struct ReqwestSoundCloudTransport {
 }
 
 impl Default for ReqwestSoundCloudTransport {
+    /// A stalled connection must not hang a sync forever, so the default client is bounded.
     fn default() -> Self {
-        Self::new(reqwest::Client::new())
+        let client = reqwest::Client::builder()
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .user_agent("rec-bag-desktop/1")
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self::new(client)
     }
 }
 
@@ -416,10 +428,25 @@ impl SoundCloudClient {
         }
     }
 
-    async fn playlist(&self, id: &str) -> Result<PlaylistDto, SourceError> {
-        let mut url = self.url_for_path(&format!("playlists/{id}"))?;
-        url.query_pairs_mut().append_pair("show_tracks", "true");
-        self.get(url).await
+    /// Fetches every track of a playlist in order via `GET /playlists/{urn}/tracks`. Collection
+    /// pages are requested without embedded tracks so a page of large playlists cannot exceed the
+    /// response body limit.
+    async fn playlist_tracks(&self, id: &str) -> Result<Vec<TrackDto>, SourceError> {
+        let mut url = self.url_for_path(&format!("playlists/{id}/tracks"))?;
+        url.query_pairs_mut()
+            .append_pair("linked_partitioning", "true")
+            .append_pair("limit", &MAX_PAGE_SIZE.to_string())
+            .append_pair("access", ALL_TRACK_ACCESS);
+        let mut tracks = Vec::new();
+        loop {
+            let page: ApiCollection<TrackDto> = self.get(url).await?;
+            let page = page.into_page();
+            tracks.extend(page.collection);
+            match page.next_href {
+                Some(href) => url = self.validated_next_href(&href)?,
+                None => return Ok(tracks),
+            }
+        }
     }
 
     fn collection_url(
@@ -441,7 +468,7 @@ impl SoundCloudClient {
             collection,
             SourceCollection::OwnedPlaylists | SourceCollection::LikedPlaylists
         ) {
-            query.append_pair("show_tracks", "true");
+            query.append_pair("show_tracks", "false");
         }
         drop(query);
         Ok(url)
@@ -664,8 +691,9 @@ impl SoundCloudConnector {
             }
             CollectionPage::Playlists(page) => {
                 for mut playlist in page.collection {
-                    if playlist.tracks.is_none() {
-                        playlist = self.client.playlist(&playlist.external_id()?).await?;
+                    if playlist.needs_track_fetch() {
+                        playlist.tracks =
+                            Some(self.client.playlist_tracks(&playlist.external_id()?).await?);
                     }
                     add_playlist_and_entries(
                         &mut items,
@@ -883,7 +911,7 @@ struct UserDto {
 
 impl UserDto {
     fn external_id(&self) -> Option<String> {
-        provider_id(self.urn.as_deref(), self.id.as_ref())
+        provider_id("users", self.urn.as_deref(), self.id.as_ref())
     }
 }
 
@@ -915,7 +943,7 @@ struct TrackDto {
 
 impl TrackDto {
     fn external_id(&self) -> Result<String, SourceError> {
-        provider_id(self.urn.as_deref(), self.id.as_ref())
+        provider_id("tracks", self.urn.as_deref(), self.id.as_ref())
             .ok_or_else(|| invalid_data("SoundCloud track is missing a valid urn or id"))
     }
 }
@@ -941,6 +969,8 @@ struct PlaylistDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sharing: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    track_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tracks: Option<Vec<TrackDto>>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
@@ -948,17 +978,30 @@ struct PlaylistDto {
 
 impl PlaylistDto {
     fn external_id(&self) -> Result<String, SourceError> {
-        provider_id(self.urn.as_deref(), self.id.as_ref())
+        provider_id("playlists", self.urn.as_deref(), self.id.as_ref())
             .ok_or_else(|| invalid_data("SoundCloud playlist is missing a valid urn or id"))
+    }
+
+    /// Embedded tracks are used only when present and complete; SoundCloud may omit or truncate
+    /// them, in which case `track_count` reveals the gap.
+    fn needs_track_fetch(&self) -> bool {
+        match (&self.tracks, self.track_count) {
+            (None, _) => true,
+            (Some(tracks), Some(count)) => (tracks.len() as u64) < count,
+            (Some(_), None) => false,
+        }
     }
 }
 
-fn provider_id(urn: Option<&str>, id: Option<&LegacyId>) -> Option<String> {
+/// Identity is always a URN. A legacy numeric `id` (removed from the API in 2025) is converted to
+/// the equivalent `soundcloud:{kind}:{id}` URN so one resource never gets two identities.
+fn provider_id(kind: &str, urn: Option<&str>, id: Option<&LegacyId>) -> Option<String> {
     urn.filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| {
             id.map(LegacyId::as_string)
                 .filter(|value| !value.is_empty())
+                .map(|value| format!("soundcloud:{kind}:{value}"))
         })
 }
 
@@ -1173,7 +1216,7 @@ fn emit_relationship(
 }
 
 fn map_account(source_id: Uuid, value: &AccountDto) -> Result<SourceAccount, SourceError> {
-    let external_id = provider_id(value.urn.as_deref(), value.id.as_ref())
+    let external_id = provider_id("users", value.urn.as_deref(), value.id.as_ref())
         .ok_or_else(|| invalid_data("SoundCloud account is missing a valid urn or id"))?;
     let mut account = SourceAccount::new(source_id, external_id);
     account.username = value.username.clone();
@@ -1228,12 +1271,11 @@ fn availability(value: &TrackDto) -> SourceAvailability {
         Some("failed") | Some("inaccessible") => return SourceAvailability::Inaccessible,
         _ => {}
     }
+    // The API Terms forbid downloading or storing User Content even when the uploader enabled
+    // downloads, so a SoundCloud track is never `Obtainable`. `downloadable` stays in metadata.
     match value.access.as_deref() {
         Some("preview") => SourceAvailability::PreviewOnly,
         Some("blocked") => SourceAvailability::Blocked,
-        Some("playable") if value.downloadable == Some(true) && value.download_url.is_some() => {
-            SourceAvailability::Obtainable
-        }
         Some("playable") => SourceAvailability::StreamingOnly,
         _ => SourceAvailability::MetadataOnly,
     }
@@ -1372,10 +1414,25 @@ fn response_error(response: &SoundCloudHttpResponse, max_retry_after: Duration) 
     error.provider_code = body
         .and_then(|error| error.code.map(|code| code.to_string()))
         .or_else(|| Some(response.status.to_string()));
-    error.retry_after_seconds = header(&response.headers, "retry-after")
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|seconds| seconds.min(max_retry_after.as_secs()));
+    error.retry_after_seconds =
+        retry_after_seconds(response).map(|seconds| seconds.min(max_retry_after.as_secs()));
     error
+}
+
+/// `Retry-After`, or for rate limits the documented `X-Ratelimit-Reset` (Unix seconds).
+fn retry_after_seconds(response: &SoundCloudHttpResponse) -> Option<u64> {
+    header(&response.headers, "retry-after")
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| {
+            if response.status != 429 {
+                return None;
+            }
+            let reset = header(&response.headers, "x-ratelimit-reset")?
+                .parse::<u64>()
+                .ok()?;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+            Some(reset.saturating_sub(now))
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1390,8 +1447,7 @@ fn retry_delay(
     policy: SoundCloudRetryPolicy,
     jitter: &dyn SoundCloudJitterSource,
 ) -> Duration {
-    header(&response.headers, "retry-after")
-        .and_then(|value| value.parse::<u64>().ok())
+    retry_after_seconds(response)
         .map(Duration::from_secs)
         .map(|delay| delay.min(policy.max_retry_after))
         .unwrap_or_else(|| jittered_exponential_delay(retry, policy, jitter))
@@ -1436,7 +1492,8 @@ mod tests {
             availability(&parse(
                 serde_json::json!({"id": 1, "access": "playable", "downloadable": true, "download_url": "x"})
             )),
-            SourceAvailability::Obtainable
+            SourceAvailability::StreamingOnly,
+            "downloadable SoundCloud tracks are still not archivable under the API Terms"
         );
         assert_eq!(
             availability(&parse(serde_json::json!({"id": 1, "access": "preview"}))),
@@ -1477,6 +1534,18 @@ mod tests {
     }
 
     #[test]
+    fn playlists_fetch_tracks_when_embedded_list_is_missing_or_truncated() {
+        let parse = |json| serde_json::from_value::<PlaylistDto>(json).unwrap();
+        let track = serde_json::json!({"urn": "soundcloud:tracks:1"});
+        assert!(parse(serde_json::json!({"urn": "p"})).needs_track_fetch());
+        assert!(parse(serde_json::json!({"urn": "p", "track_count": 2, "tracks": [track.clone()]}))
+            .needs_track_fetch());
+        assert!(!parse(serde_json::json!({"urn": "p", "track_count": 1, "tracks": [track.clone()]}))
+            .needs_track_fetch());
+        assert!(!parse(serde_json::json!({"urn": "p", "tracks": [track]})).needs_track_fetch());
+    }
+
+    #[test]
     fn current_urn_and_legacy_numeric_ids_are_supported() {
         let current: TrackDto = serde_json::from_value(serde_json::json!({
             "urn": "soundcloud:tracks:123"
@@ -1484,6 +1553,6 @@ mod tests {
         .unwrap();
         let legacy: TrackDto = serde_json::from_value(serde_json::json!({"id": 123})).unwrap();
         assert_eq!(current.external_id().unwrap(), "soundcloud:tracks:123");
-        assert_eq!(legacy.external_id().unwrap(), "123");
+        assert_eq!(legacy.external_id().unwrap(), "soundcloud:tracks:123");
     }
 }

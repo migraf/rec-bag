@@ -42,7 +42,7 @@ REC_BAG_GOOGLE_CLIENT_ID=installed-app-client-id
 REC_BAG_GOOGLE_REDIRECT_URI=http://127.0.0.1:17842/oauth/google
 ```
 
-Configure the public SoundCloud client ID and registered loopback redirect from **Music Management → Configure SoundCloud**. These values are stored in the local profile; the broker client secret is never entered in the desktop app.
+The desktop app gets the public SoundCloud client ID and loopback redirect from the broker (`/api/soundcloud/oauth/config`), so connecting needs no manual setup. **Music Management → Configure SoundCloud** optionally overrides them in the local profile; the broker client secret is never entered in the desktop app.
 
 SoundCloud broker:
 
@@ -70,5 +70,6 @@ Use a secret manager for server credentials. Provider user tokens belong in the 
 - External primary changes wait for review before replication. Primary deletion does not delete backup copies.
 - Google Drive access uses `drive.file`, My Drive only, and a dedicated app-created `rec_bag Music` folder subtree.
 - SHA-256 is the canonical content checksum. Filename/title similarity alone never verifies a match.
+- Disconnecting or revoking SoundCloud also deletes its provider-derived catalog data, as the SoundCloud API Terms require; canonical owned assets are kept.
 - Forgetting provider data deletes current provider-derived source/storage rows and current snapshot records while preserving canonical owned assets and never deleting remote provider files.
 - Cleanup requires explicit approval; defaults retain 30 days and at least three recent versions.

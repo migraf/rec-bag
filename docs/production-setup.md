@@ -52,7 +52,7 @@ REC_BAG_GOOGLE_CLIENT_ID=google-installed-app-client-id
 REC_BAG_GOOGLE_REDIRECT_URI=http://127.0.0.1:17842/oauth/google
 ```
 
-Configure the public SoundCloud client ID and registered loopback redirect in **Music Management → Configure SoundCloud**. rec_bag validates and stores those desktop-safe values in the local profile; no restart is needed. The SoundCloud broker client secret is server-only and is never collected by the desktop UI.
+The desktop fetches the public SoundCloud client ID and loopback redirect from the broker on first connect. **Music Management → Configure SoundCloud** optionally overrides them in the local profile; no restart is needed. The SoundCloud broker client secret is server-only and is never collected by the desktop UI.
 
 Optional local-folder override:
 
@@ -93,7 +93,7 @@ SOUNDCLOUD_OAUTH_RATE_LIMIT=20
 SOUNDCLOUD_OAUTH_RATE_WINDOW_SECONDS=60
 SOUNDCLOUD_OAUTH_MAX_TRACKED_CLIENTS=10000
 SOUNDCLOUD_OAUTH_HTTP_TIMEOUT_SECONDS=15
-SOUNDCLOUD_LOAD_DOTENV=false
+SOUNDCLOUD_LOAD_DOTENV=false   # default: true in debug builds, false in release builds
 ```
 
 `SOUNDCLOUD_ALLOWED_REDIRECT_URIS` is a comma-separated exact allow-list. Wildcards, fragments, URL credentials, malformed URLs, and public plain HTTP fail closed. Loopback HTTP is allowed for installed-app callbacks. Broker configuration is cached on first use; restart or roll all instances after any change.

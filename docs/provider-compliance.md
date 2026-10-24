@@ -97,7 +97,7 @@ Manual, because it requires browser consent and real redirects:
 - [ ] Verify exact loopback callback, state/PKCE success, and keyring entry creation.
 - [ ] Sync `/me`, uploads, owned playlists, liked tracks, and liked playlists appropriate to the account.
 - [ ] Force/await token refresh and verify the old single-use refresh token is replaced atomically.
-- [ ] Disconnect/revoke and confirm authorization is required without catalog/file deletion.
+- [ ] Disconnect/revoke and confirm SoundCloud reports the grant revoked, the keyring entry is gone, and SoundCloud-derived catalog rows are deleted while canonical owned assets remain.
 - [ ] Inspect restricted edge/origin/APM logs for absence of codes, verifiers, state, tokens, and provider bodies.
 
 Record date, app ID (not secret), test account classification, environment, reviewer, and redacted evidence. This repository documentation records no such execution.

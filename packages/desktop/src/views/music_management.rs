@@ -556,10 +556,13 @@ fn retry_event(
                 .sources
                 .iter()
                 .find(|source| source.provider == provider)?;
-            source.failed_sync_run_id.clone().map_or_else(
-                || Some(MusicManagementEvent::SyncSource(source.id.clone())),
-                |sync_run_id| Some(MusicManagementEvent::RetrySyncRun { sync_run_id }),
-            )
+            // SoundCloud syncs run synchronously; a queued RetrySyncRun would never execute.
+            match source.failed_sync_run_id.clone() {
+                Some(sync_run_id) if provider != ProviderChoice::SoundCloud => {
+                    Some(MusicManagementEvent::RetrySyncRun { sync_run_id })
+                }
+                _ => Some(MusicManagementEvent::SyncSource(source.id.clone())),
+            }
         }
         IntegrationSlice::GoogleDrive => view
             .primary_storage

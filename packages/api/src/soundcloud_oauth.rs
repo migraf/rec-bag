@@ -74,6 +74,13 @@ pub struct SoundCloudTokenResponse {
     pub token_type: Option<String>,
 }
 
+/// Non-secret settings the desktop needs to start an authorization request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoundCloudPublicConfig {
+    pub client_id: String,
+    pub redirect_uri: String,
+}
+
 /// Safe classifications exposed by the broker. Provider response text and credentials are never
 /// included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,15 +140,16 @@ pub struct SoundCloudOAuthConfig {
 impl SoundCloudOAuthConfig {
     /// Load and strictly validate deployment configuration.
     ///
-    /// `.env` loading is disabled by default and only enabled when
-    /// `SOUNDCLOUD_LOAD_DOTENV=true`; process environment always takes precedence.
+    /// `.env` loading defaults to on for debug builds (local `dx serve`) and off for release
+    /// builds; `SOUNDCLOUD_LOAD_DOTENV` overrides either default. Process environment always
+    /// takes precedence over `.env` values.
     #[cfg(feature = "server")]
     pub fn from_environment() -> Result<Self, SoundCloudOAuthError> {
         if optional_environment("SOUNDCLOUD_LOAD_DOTENV")
             .as_deref()
             .map(parse_bool)
             .transpose()?
-            .unwrap_or(false)
+            .unwrap_or(cfg!(debug_assertions))
         {
             DOTENV_LOADED.get_or_init(|| {
                 let _ = dotenvy::dotenv();
@@ -379,6 +387,33 @@ impl SoundCloudOAuthBroker {
         }
     }
 
+    /// Public desktop OAuth settings. The client ID is not secret, and the redirect is the
+    /// first loopback HTTP entry of the allow-list, which is what the desktop callback
+    /// receiver can serve.
+    pub fn public_config(&self) -> Result<SoundCloudPublicConfig, SoundCloudOAuthError> {
+        let redirect_uri = self
+            .config
+            .allowed_redirect_uris
+            .iter()
+            .find(|uri| {
+                Url::parse(uri).is_ok_and(|url| {
+                    url.scheme() == "http" && is_loopback_host(url.host_str().unwrap_or_default())
+                })
+            })
+            .cloned()
+            .ok_or_else(|| {
+                SoundCloudOAuthError::new(
+                    SoundCloudOAuthErrorKind::Misconfigured,
+                    500,
+                    "SoundCloud OAuth broker has no loopback desktop redirect URI",
+                )
+            })?;
+        Ok(SoundCloudPublicConfig {
+            client_id: self.config.client_id.clone(),
+            redirect_uri,
+        })
+    }
+
     pub async fn exchange_authorization_code(
         &self,
         client: OAuthClientIp,
@@ -442,9 +477,26 @@ impl SoundCloudOAuthBroker {
         if response.body.len() > MAX_PROVIDER_RESPONSE_BODY {
             return Err(invalid_provider_response());
         }
-        let token: SoundCloudTokenWire =
-            serde_json::from_str(&response.body).map_err(|_| invalid_provider_response())?;
-        validate_provider_token(&token)?;
+        let mut token: SoundCloudTokenWire =
+            serde_json::from_str(&response.body).map_err(|error| {
+                // Category and position only: serde messages can echo field values.
+                dioxus::logger::tracing::warn!(
+                    category = ?error.classify(),
+                    line = error.line(),
+                    column = error.column(),
+                    "SoundCloud token response could not be parsed"
+                );
+                invalid_provider_response()
+            })?;
+        // SoundCloud sends `"scope": ""`; an empty optional value carries no information.
+        token.scope = token.scope.filter(|scope| !scope.is_empty());
+        token.token_type = token.token_type.filter(|kind| !kind.is_empty());
+        validate_provider_token(&token).inspect_err(|_| {
+            dioxus::logger::tracing::warn!(
+                field = invalid_token_field(&token),
+                "SoundCloud token response failed validation"
+            );
+        })?;
         Ok(SoundCloudTokenResponse {
             access_token: token.access_token,
             refresh_token: token.refresh_token,
@@ -652,6 +704,21 @@ fn validate_provider_token(token: &SoundCloudTokenWire) -> Result<(), SoundCloud
     Ok(())
 }
 
+/// Names the first field `validate_provider_token` rejects, for logs. Never returns values.
+fn invalid_token_field(token: &SoundCloudTokenWire) -> &'static str {
+    if validate_provider_field(&token.access_token, MAX_TOKEN_LENGTH).is_err() {
+        "access_token"
+    } else if validate_provider_field(&token.refresh_token, MAX_TOKEN_LENGTH).is_err() {
+        "refresh_token"
+    } else if token.expires_in == Some(0) {
+        "expires_in"
+    } else if token.scope.is_some() {
+        "scope"
+    } else {
+        "token_type"
+    }
+}
+
 fn validate_provider_field(value: &str, maximum_length: usize) -> Result<(), SoundCloudOAuthError> {
     if value.is_empty()
         || value.len() > maximum_length
@@ -851,6 +918,48 @@ mod tests {
             SoundCloudOAuthErrorKind::RedirectNotAllowed
         );
         assert!(transport.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn public_config_exposes_client_id_and_loopback_redirect_only() {
+        let broker = broker_with_redirects([
+            "rec-bag://soundcloud/callback",
+            "http://127.0.0.1:17841/oauth/soundcloud",
+        ]);
+        let config = broker.public_config().unwrap();
+        assert_eq!(config.client_id, "client-id");
+        assert_eq!(config.redirect_uri, "http://127.0.0.1:17841/oauth/soundcloud");
+
+        let custom_scheme_only = broker_with_redirects(["rec-bag://soundcloud/callback"]);
+        assert_eq!(
+            oauth_error(custom_scheme_only.public_config()).kind,
+            SoundCloudOAuthErrorKind::Misconfigured
+        );
+    }
+
+    fn broker_with_redirects<'a>(
+        redirects: impl IntoIterator<Item = &'a str>,
+    ) -> SoundCloudOAuthBroker {
+        SoundCloudOAuthBroker::new(
+            SoundCloudOAuthConfig::for_test("client-id", "client-secret", redirects),
+            Arc::new(MockTransport::default()),
+            Arc::new(OAuthRateLimiter::new(20, Duration::from_secs(60), 100)),
+        )
+    }
+
+    #[tokio::test]
+    async fn empty_scope_from_soundcloud_is_accepted_as_absent() {
+        let transport = Arc::new(MockTransport::with_response(SoundCloudOAuthHttpResponse {
+            status: 200,
+            body: r#"{"access_token":"eyJ.a.b","expires_in":3599,"refresh_token":"refresh","scope":"","token_type":"bearer"}"#
+                .to_string(),
+        }));
+        let token = broker(transport)
+            .exchange_authorization_code(client(1), exchange_request())
+            .await
+            .unwrap();
+        assert_eq!(token.scope, None);
+        assert_eq!(token.token_type.as_deref(), Some("bearer"));
     }
 
     #[tokio::test]

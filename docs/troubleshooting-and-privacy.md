@@ -45,7 +45,7 @@ A copied catalog does not include tokens. Reauthorize on the destination device.
 
 ### “SoundCloud is not configured”
 
-Open **Music Management → Configure SoundCloud**, enter the public client ID and registered desktop redirect, then save. Confirm the broker uses the matching application client ID/secret and exact allow-list entry. The broker secret is server-only and is never entered in rec_bag.
+The desktop reads the client ID and redirect from the broker, so first confirm the broker is running and configured (`SOUNDCLOUD_CLIENT_ID`, `SOUNDCLOUD_KEY`, and a loopback entry in `SOUNDCLOUD_ALLOWED_REDIRECT_URIS` that is also registered in the SoundCloud app). **Music Management → Configure SoundCloud** overrides both values locally if needed. The broker secret is server-only and is never entered in rec_bag.
 
 ### Callback port cannot bind or authorization times out
 
@@ -133,7 +133,7 @@ Audio bytes leave the device when Google Drive is primary/backup. SoundCloud cat
 
 ### Retention and deletion
 
-Disconnect is non-destructive to catalog/assets/provider files: SoundCloud disconnect removes its local credential after sign-out handling, while Google storage disconnect retains the account credential for other/reconnected Drive storage. Revocation removes the relevant local credential and disables affected connections but does not delete remote content. Confirmed provider forget deletes current provider-derived catalog/storage rows and current catalog snapshot rows while preserving canonical owned assets and remote files. Independently exported/off-device snapshots and backups require separate deletion. Primary deletion does not cascade to backups. Define operator retention for profile backups, logs, and support artifacts, and honor user deletion/export requests across each location.
+SoundCloud disconnect revokes access at SoundCloud when reachable, removes its local credential, and deletes SoundCloud-derived catalog rows (SoundCloud API Terms), preserving canonical owned assets. Google storage disconnect is non-destructive and retains the account credential for other/reconnected Drive storage. Revocation removes the relevant local credential and disables affected connections but does not delete remote content. Confirmed provider forget deletes current provider-derived catalog/storage rows and current catalog snapshot rows while preserving canonical owned assets and remote files. Independently exported/off-device snapshots and backups require separate deletion. Primary deletion does not cascade to backups. Define operator retention for profile backups, logs, and support artifacts, and honor user deletion/export requests across each location.
 
 ### Logs and support
 

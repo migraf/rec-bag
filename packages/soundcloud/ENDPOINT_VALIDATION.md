@@ -12,14 +12,21 @@ Validated on **2026-08-14** against SoundCloud's official sources:
 |---|---|---|
 | Account identity | `GET /me` | `Me`; OAuth authorization-code token required |
 | Uploaded tracks | `GET /me/tracks` | `Tracks`; `limit`, `linked_partitioning` |
-| Owned playlists | `GET /me/playlists` | `Playlists`; `limit`, `linked_partitioning`, `show_tracks` |
+| Owned playlists | `GET /me/playlists` | `Playlists`; `limit`, `linked_partitioning`, `show_tracks=false` |
 | Liked tracks | `GET /me/likes/tracks` | `Tracks`; `limit`, `linked_partitioning`; access defaults include playable, preview, and blocked |
-| Liked playlists | `GET /me/likes/playlists` | `Playlists`; `limit`, `linked_partitioning` |
-| Playlist detail fallback | `GET /playlists/{playlist_urn}` | `Playlist`; `show_tracks=true` |
+| Liked playlists | `GET /me/likes/playlists` | `Playlists`; `limit`, `linked_partitioning`, `show_tracks=false` |
+| Playlist tracks | `GET /playlists/{playlist_urn}/tracks` | `Tracks`; `limit=200`, `linked_partitioning`, `access=playable,preview,blocked` |
+| Revoke grant (desktop) | `POST /disconnect` | 204; replaces the unsupported `secure.soundcloud.com/sign-out` |
+
+Playlist pages are fetched without embedded tracks so a page of large playlists cannot exceed the response body limit; each playlist's tracks are then paged in order. Embedded tracks are used only when present and complete (`tracks.len() == track_count`).
+
+Re-checked on **2026-10-24** against the API guide, the OpenAPI document at `developers.soundcloud.com/docs/api/explorer/api.json`, the rate-limits page, the API Terms of Use (effective 2024-03-30), and the `soundcloud/api` releases. Relevant changes since the first validation: `/disconnect` added (2026-09-16), `http_mp3_128_url` removed (2026-08-12), numeric `id` removed in favour of `urn` (2025-06-30), and access tokens are variable-length JWTs.
+
+The Terms forbid downloading or storing User Content even when the uploader enabled downloads, so a playable track maps to `StreamingOnly` and never to `Obtainable`; `downloadable`/`download_url` are kept only as metadata.
 
 The client requests linked pagination and follows `next_href`. Continuations are accepted only when scheme, host, and effective port match the configured API origin. The OpenAPI `limit` range is 1–200; the connector enforces it before making a request.
 
-The current specification uses URNs (`soundcloud:tracks:*`, `soundcloud:playlists:*`, and `soundcloud:users:*`). Typed DTOs prefer `urn` but also accept legacy numeric/string `id` fields so previously captured provider responses remain importable. The specification permits legacy unwrapped arrays for track and playlist responses; the client accepts those while requesting the preferred paginated object.
+The current specification uses URNs (`soundcloud:tracks:*`, `soundcloud:playlists:*`, and `soundcloud:users:*`). Typed DTOs prefer `urn` but also accept legacy numeric/string `id` fields so previously captured provider responses remain importable; a legacy `id` is converted to the equivalent `soundcloud:{kind}:{id}` URN so a resource never gets two identities. The specification permits legacy unwrapped arrays for track and playlist responses; the client accepts those while requesting the preferred paginated object.
 
 ## Fixture provenance and drift strategy
 

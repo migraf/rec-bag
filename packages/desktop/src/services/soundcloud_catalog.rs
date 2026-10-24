@@ -1,14 +1,15 @@
 //! SoundCloud catalog and desktop OAuth integration slice.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::ErrorKind,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use api::{
-    SoundCloudAuthorizationCodeExchange, SoundCloudRefreshTokenExchange, SoundCloudTokenResponse,
+    SoundCloudAuthorizationCodeExchange, SoundCloudPublicConfig, SoundCloudRefreshTokenExchange,
+    SoundCloudTokenResponse,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -18,7 +19,8 @@ use rec_core::{
     CatalogSourceKind, ExternalPlaylist, HealthStatus, MetadataField, MetadataFieldValue,
     MetadataProvenance, MetadataValue, PlaylistRepository, RepositoryPageRequest,
     RepositoryTransaction, SourceAvailability, SourceCapabilities, SourceCollection,
-    SourceCollectionRelationshipFilter, SourceEntityKind, SourceError, SourceErrorKind,
+    SourceCollectionRelationship, SourceCollectionRelationshipFilter,
+    SourceCollectionRelationshipIdentity, SourceEntityKind, SourceError, SourceErrorKind,
     SourceHealth, SourceOccurrenceFilter, SourceRepository, SourceSyncItem, SourceSyncMode,
     SourceSyncPage, SourceSyncRequest, SourceTrackOccurrence, StorageVerificationStatus,
     SyncCheckpoint, SyncError, SyncErrorKind, SyncProgress, SyncRun, SyncRunFilter, SyncRunKind,
@@ -53,8 +55,12 @@ const DEFAULT_PAGE_SIZE: u32 = 50;
 const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 #[cfg(feature = "desktop")]
 const MAX_CALLBACK_URL_BYTES: usize = 16 * 1024;
+/// Revokes this app's tokens for the user (documented "Disconnect SoundCloud" action). The legacy
+/// `secure.soundcloud.com/sign-out` endpoint is no longer supported.
 #[cfg(feature = "desktop")]
-const SIGN_OUT_URL: &str = "https://secure.soundcloud.com/sign-out";
+const DISCONNECT_URL: &str = "https://api.soundcloud.com/disconnect";
+#[cfg(feature = "desktop")]
+const CALLBACK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const FORGOTTEN_CONFIG_KEY: &str = "soundcloud_catalog_forgotten";
 const DESKTOP_OAUTH_CONFIGURATION_FILE: &str = "soundcloud-desktop-oauth.json";
 
@@ -178,6 +184,8 @@ pub trait OAuthUserAgent: Send + Sync {
 pub enum ProviderGrantRevocation {
     Revoked,
     AlreadyRevoked,
+    /// The access token was rejected; the grant may still be alive behind the refresh token.
+    AccessTokenRejected,
     Unsupported,
 }
 
@@ -239,14 +247,16 @@ impl SoundCloudSignOutClient for ReqwestSoundCloudSignOutClient {
             .map_err(|_| integration_error("Stored SoundCloud credentials are invalid", false))?;
             authorization.set_sensitive(true);
             let response = client
-                .post(SIGN_OUT_URL)
+                .post(DISCONNECT_URL)
                 .header(reqwest::header::AUTHORIZATION, authorization)
+                .header(reqwest::header::ACCEPT, "application/json; charset=utf-8")
                 .send()
                 .await
                 .map_err(|_| integration_error("SoundCloud remote sign-out failed", true))?;
             match response.status().as_u16() {
                 200..=299 => Ok(ProviderGrantRevocation::Revoked),
-                401 | 404 => Ok(ProviderGrantRevocation::AlreadyRevoked),
+                401 => Ok(ProviderGrantRevocation::AccessTokenRejected),
+                404 => Ok(ProviderGrantRevocation::AlreadyRevoked),
                 429 | 500..=599 => Err(integration_error(
                     "SoundCloud remote sign-out is temporarily unavailable",
                     true,
@@ -280,6 +290,17 @@ pub trait SoundCloudBrokerClient: Send + Sync {
         &self,
         request: SoundCloudRefreshTokenExchange,
     ) -> BoxFuture<'_, Result<SoundCloudTokenResponse, IntegrationError>>;
+
+    /// Public client ID and loopback redirect served by the broker, used when the desktop has
+    /// no locally saved OAuth settings.
+    fn public_config(&self) -> BoxFuture<'_, Result<SoundCloudPublicConfig, IntegrationError>> {
+        Box::pin(async {
+            Err(integration_error(
+                "SoundCloud is not configured. Open Music Management and choose Configure SoundCloud before connecting.",
+                false,
+            ))
+        })
+    }
 }
 
 #[derive(Default)]
@@ -293,7 +314,7 @@ impl SoundCloudBrokerClient for ApiSoundCloudBrokerClient {
         Box::pin(async move {
             api::exchange_soundcloud_authorization_code(request)
                 .await
-                .map_err(|error| broker_server_error(error.to_string()))
+                .map_err(broker_error)
         })
     }
 
@@ -301,11 +322,29 @@ impl SoundCloudBrokerClient for ApiSoundCloudBrokerClient {
         &self,
         request: SoundCloudRefreshTokenExchange,
     ) -> BoxFuture<'_, Result<SoundCloudTokenResponse, IntegrationError>> {
-        Box::pin(async move {
-            api::refresh_soundcloud_token(request)
-                .await
-                .map_err(|error| broker_server_error(error.to_string()))
-        })
+        Box::pin(async move { api::refresh_soundcloud_token(request).await.map_err(broker_error) })
+    }
+
+    fn public_config(&self) -> BoxFuture<'_, Result<SoundCloudPublicConfig, IntegrationError>> {
+        Box::pin(async move { api::soundcloud_public_config().await.map_err(broker_error) })
+    }
+}
+
+/// The broker only returns fixed, secret-free messages, so a server error's message is shown as
+/// is and its status decides whether retrying can help. Anything else is a transport problem.
+fn broker_error(error: dioxus::prelude::ServerFnError) -> IntegrationError {
+    match error {
+        dioxus::prelude::ServerFnError::ServerError { message, code, .. } => {
+            let retryable = matches!(code, 429 | 500..=599);
+            let message = match code {
+                500 => format!(
+                    "{message}. Check SOUNDCLOUD_CLIENT_ID, SOUNDCLOUD_KEY and SOUNDCLOUD_ALLOWED_REDIRECT_URIS for the rec_bag server, then retry."
+                ),
+                _ => message,
+            };
+            integration_error(message, retryable)
+        }
+        other => broker_server_error(other.to_string()),
     }
 }
 
@@ -591,46 +630,101 @@ impl OAuthUserAgent for LoopbackOAuthUserAgent {
             let port = redirect_uri
                 .port_or_known_default()
                 .ok_or_else(|| integration_error("Callback redirect has no port", false))?;
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            let address = match redirect_uri.host() {
+                Some(url::Host::Ipv4(address)) => std::net::IpAddr::V4(address),
+                Some(url::Host::Ipv6(address)) => std::net::IpAddr::V6(address),
+                _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            };
+            let listener = tokio::net::TcpListener::bind((address, port))
                 .await
-                .map_err(|_| integration_error("Could not bind the OAuth callback port", true))?;
+                .map_err(|_| {
+                    integration_error(
+                        format!("Could not listen for the SoundCloud callback on port {port}; close the app using it and retry"),
+                        true,
+                    )
+                })?;
             webbrowser::open(authorization_url.as_str())
                 .map_err(|_| integration_error("Could not open the system browser", true))?;
-            let (mut stream, _) = tokio::time::timeout(timeout, listener.accept())
-                .await
-                .map_err(|_| integration_error("SoundCloud authorization timed out", true))?
-                .map_err(|_| integration_error("OAuth callback could not be received", true))?;
-            let mut bytes = vec![0_u8; MAX_CALLBACK_URL_BYTES];
-            let count = tokio::io::AsyncReadExt::read(&mut stream, &mut bytes)
-                .await
-                .map_err(|_| integration_error("OAuth callback could not be read", true))?;
-            let request = std::str::from_utf8(&bytes[..count])
-                .map_err(|_| integration_error("OAuth callback was malformed", false))?;
-            let target = request
-                .lines()
-                .next()
-                .and_then(|line| line.strip_prefix("GET "))
-                .and_then(|line| line.split_once(' ').map(|(target, _)| target))
-                .ok_or_else(|| integration_error("OAuth callback was malformed", false))?;
-            let callback = redirect_uri
-                .join(target)
-                .map_err(|_| integration_error("OAuth callback URL was malformed", false))?;
-            let valid_path = callback.path() == redirect_uri.path();
-            let response = if valid_path {
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: 63\r\n\r\nAuthorization received. You can close this window and return to rec_bag."
-            } else {
-                "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: 25\r\n\r\nInvalid callback request."
-            };
-            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
-            if !valid_path {
-                return Err(integration_error(
-                    "OAuth callback path did not match",
-                    false,
-                ));
+            // Browsers open speculative connections and request extra paths such as
+            // /favicon.ico, so every connection is served independently until the real
+            // callback arrives or the overall timeout expires.
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<Url>(1);
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { continue };
+                        let sender = sender.clone();
+                        let redirect_uri = redirect_uri.clone();
+                        tokio::spawn(async move {
+                            if let Some(callback) = serve_callback_connection(stream, &redirect_uri).await {
+                                let _ = sender.send(callback).await;
+                            }
+                        });
+                    }
+                    Some(callback) = receiver.recv() => return Ok(callback),
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Err(integration_error("SoundCloud authorization timed out", true));
+                    }
+                }
             }
-            Ok(callback)
         })
     }
+}
+
+/// Reads one HTTP request and answers it. Returns the callback URL only for a GET to the
+/// registered redirect path; anything else gets a 404 and is ignored.
+#[cfg(feature = "desktop")]
+async fn serve_callback_connection(
+    mut stream: tokio::net::TcpStream,
+    redirect_uri: &Url,
+) -> Option<Url> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let read = tokio::time::timeout(CALLBACK_READ_TIMEOUT, async {
+        while !bytes.windows(2).any(|window| window == b"\r\n") {
+            let count = stream.read(&mut buffer).await.ok()?;
+            if count == 0 || bytes.len() + count > MAX_CALLBACK_URL_BYTES {
+                return None;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        Some(())
+    })
+    .await;
+    if !matches!(read, Ok(Some(()))) {
+        return None;
+    }
+    let callback = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|request| request.lines().next())
+        .and_then(|line| line.strip_prefix("GET "))
+        .and_then(|line| line.split_once(' ').map(|(target, _)| target))
+        .and_then(|target| redirect_uri.join(target).ok())
+        .filter(|callback| callback.path() == redirect_uri.path());
+    let (status, body) = match &callback {
+        Some(callback) if callback.query_pairs().any(|(key, _)| key == "error") => (
+            "200 OK",
+            "<h1>SoundCloud authorization was cancelled</h1><p>You can close this window and return to rec_bag.</p>",
+        ),
+        Some(_) => (
+            "200 OK",
+            "<h1>SoundCloud authorization received</h1><p>You can close this window and return to rec_bag.</p>",
+        ),
+        None => ("404 Not Found", "<h1>Not found</h1>"),
+    };
+    let page = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>rec_bag</title></head><body style=\"font-family:sans-serif;margin:3rem\">{body}</body></html>"
+    );
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{page}",
+        page.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+    callback
 }
 
 struct PendingAuthorization {
@@ -762,8 +856,16 @@ pub struct SoundCloudCatalogService {
     sign_out: Arc<dyn SoundCloudSignOutClient>,
     catalog: Arc<TursoCatalog>,
     pending: Mutex<HashMap<Uuid, PendingAuthorization>>,
+    prepared: Mutex<Option<PreparedConnection>>,
     operation_lock: AsyncMutex<()>,
     view: AsyncMutex<MusicManagementView>,
+}
+
+/// Credentials obtained by [`SoundCloudCatalogService::authorize`] but not yet persisted. The
+/// browser round-trip happens outside every catalog lock; persistence happens in `connect`.
+struct PreparedConnection {
+    source: CatalogSource,
+    credentials: StoredSoundCloudCredentials,
 }
 
 impl SoundCloudCatalogService {
@@ -802,6 +904,7 @@ impl SoundCloudCatalogService {
             sign_out: default_sign_out_client(),
             catalog,
             pending: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(None),
             operation_lock: AsyncMutex::new(()),
             view: AsyncMutex::new(empty_view()),
         }
@@ -856,15 +959,27 @@ impl SoundCloudCatalogService {
         self
     }
 
-    pub async fn connect(&self) -> Result<MusicManagementView, IntegrationError> {
-        let _operation = self.operation_lock.lock().await;
-        let config = self.config.lock().await.clone().ok_or_else(|| {
-            integration_error(
-                "SoundCloud is not configured. Open Music Management and choose Configure SoundCloud before connecting.",
-                false,
-            )
+    /// Saved desktop settings win; otherwise the broker supplies the public client ID and its
+    /// loopback redirect, so a fresh install needs no manual configuration.
+    async fn oauth_config(&self) -> Result<SoundCloudOAuthClientConfig, IntegrationError> {
+        if let Some(config) = self.config.lock().await.clone() {
+            return Ok(config);
+        }
+        let public = self.broker.public_config().await?;
+        let redirect_uri = Url::parse(&public.redirect_uri).map_err(|_| {
+            integration_error("SoundCloud broker returned an invalid redirect URI", false)
         })?;
-        let mut source = self
+        let config = SoundCloudOAuthClientConfig::new(public.client_id, redirect_uri)?;
+        *self.config.lock().await = Some(config.clone());
+        Ok(config)
+    }
+
+    /// Runs the browser authorization and code exchange. This takes no catalog or operation
+    /// lock, so the rest of the app keeps working while the user is in the browser. The result
+    /// is held in memory until [`Self::connect`] persists it.
+    pub async fn authorize(&self) -> Result<(), IntegrationError> {
+        let config = self.oauth_config().await?;
+        let source = self
             .existing_soundcloud_source()
             .await?
             .unwrap_or_else(|| CatalogSource::new("SoundCloud", CatalogSourceKind::SoundCloud));
@@ -877,7 +992,7 @@ impl SoundCloudCatalogService {
                 .map_err(|_| integration_error("OAuth state store is unavailable", true))?;
             if pending.contains_key(&source_id) {
                 return Err(integration_error(
-                    "SoundCloud authorization is already in progress",
+                    "SoundCloud authorization is already in progress; finish it in the browser",
                     false,
                 ));
             }
@@ -942,7 +1057,37 @@ impl SoundCloudCatalogService {
                 state: parsed.state,
             })
             .await?;
-        let stored = StoredSoundCloudCredentials::from_response(response, 0);
+        *self
+            .prepared
+            .lock()
+            .map_err(|_| integration_error("OAuth state store is unavailable", true))? =
+            Some(PreparedConnection {
+                source,
+                credentials: StoredSoundCloudCredentials::from_response(response, 0),
+            });
+        Ok(())
+    }
+
+    pub async fn connect(&self) -> Result<MusicManagementView, IntegrationError> {
+        let _operation = self.operation_lock.lock().await;
+        let already_prepared = self
+            .prepared
+            .lock()
+            .map_err(|_| integration_error("OAuth state store is unavailable", true))?
+            .is_some();
+        if !already_prepared {
+            self.authorize().await?;
+        }
+        let PreparedConnection {
+            mut source,
+            credentials: stored,
+        } = self
+            .prepared
+            .lock()
+            .map_err(|_| integration_error("OAuth state store is unavailable", true))?
+            .take()
+            .ok_or_else(|| integration_error("SoundCloud authorization was not completed", false))?;
+        let source_id = source.id;
         self.credentials
             .store(&credential_key(source_id), stored.encode()?)
             .await?;
@@ -969,22 +1114,40 @@ impl SoundCloudCatalogService {
         self.sync_locked(source_id, false).await
     }
 
+    /// Revokes access at SoundCloud when reachable, then removes local credentials and the
+    /// SoundCloud-derived catalog data. The API Terms require deleting a user's data after they
+    /// disconnect; canonical tracks and owned assets are kept, as with "Forget catalog data".
     pub async fn disconnect(
         &self,
         source_id: Uuid,
     ) -> Result<MusicManagementView, IntegrationError> {
         let _operation = self.operation_lock.lock().await;
         self.sign_out_and_disable(source_id, false).await?;
+        self.delete_provider_data(source_id).await?;
         self.project(None).await
     }
 
+    /// Like [`Self::disconnect`], but fails and keeps everything if SoundCloud cannot confirm
+    /// the revocation.
     pub async fn revoke_provider_grant(
         &self,
         source_id: Uuid,
     ) -> Result<MusicManagementView, IntegrationError> {
         let _operation = self.operation_lock.lock().await;
         self.sign_out_and_disable(source_id, true).await?;
+        self.delete_provider_data(source_id).await?;
         self.project(None).await
+    }
+
+    async fn delete_provider_data(&self, source_id: Uuid) -> Result<(), IntegrationError> {
+        self.pending
+            .lock()
+            .map_err(|_| integration_error("OAuth state store is unavailable", true))?
+            .remove(&source_id);
+        self.catalog
+            .delete_source_provider_data(source_id)
+            .await
+            .map_err(repository_error)
     }
 
     pub async fn clear_local_cache(
@@ -1022,37 +1185,36 @@ impl SoundCloudCatalogService {
                 return Err(integration_error("Source is not SoundCloud", false));
             }
         }
-        self.pending
-            .lock()
-            .map_err(|_| integration_error("OAuth state store is unavailable", true))?
-            .remove(&source_id);
-        self.catalog
-            .delete_source_provider_data(source_id)
-            .await
-            .map_err(repository_error)?;
+        self.delete_provider_data(source_id).await?;
         self.project(None).await
     }
 
+    /// `require_remote_revocation` decides whether a revocation SoundCloud did not confirm
+    /// (offline, unsupported) aborts the operation or is accepted as best effort.
     async fn sign_out_and_disable(
         &self,
         source_id: Uuid,
         require_remote_revocation: bool,
     ) -> Result<(), IntegrationError> {
         let mut source = self.require_soundcloud_source(source_id).await?;
-        if let Some(secret) = self.credentials.load(&credential_key(source_id)).await? {
-            let credentials = StoredSoundCloudCredentials::decode(secret)?;
-            let result = self
-                .sign_out
-                .revoke_grant(Secret::new(credentials.access_token.into_bytes()))
-                .await
-                .map_err(|error| {
-                    integration_error("SoundCloud remote sign-out failed", error.retryable)
-                })?;
-            if require_remote_revocation && result == ProviderGrantRevocation::Unsupported {
-                return Err(integration_error(
-                    "SoundCloud remote sign-out is unavailable; local credentials were retained",
-                    true,
-                ));
+        if self
+            .credentials
+            .load(&credential_key(source_id))
+            .await?
+            .is_some()
+        {
+            match self.revoke_remote_grant(source_id).await {
+                Ok(ProviderGrantRevocation::Revoked | ProviderGrantRevocation::AlreadyRevoked) => {}
+                Ok(_) if require_remote_revocation => {
+                    return Err(integration_error(
+                        "SoundCloud remote sign-out is unavailable; local credentials were retained",
+                        true,
+                    ));
+                }
+                Err(error) if require_remote_revocation => return Err(error),
+                Ok(_) | Err(_) => tracing::warn!(
+                    "SoundCloud did not confirm revocation; removing local credentials anyway"
+                ),
             }
         }
         self.credentials.delete(&credential_key(source_id)).await?;
@@ -1060,6 +1222,50 @@ impl SoundCloudCatalogService {
         SourceRepository::upsert(self.catalog.as_ref(), source)
             .await
             .map_err(repository_error)
+    }
+
+    /// Revokes with the stored access token. An expired access token is refreshed once so the
+    /// grant behind the refresh token is really revoked; a refresh SoundCloud rejects means the
+    /// grant is already gone.
+    async fn revoke_remote_grant(
+        &self,
+        source_id: Uuid,
+    ) -> Result<ProviderGrantRevocation, IntegrationError> {
+        let revoke = |access_token: String| async move {
+            self.sign_out
+                .revoke_grant(Secret::new(access_token.into_bytes()))
+                .await
+                .map_err(|error| {
+                    integration_error("SoundCloud remote sign-out failed", error.retryable)
+                })
+        };
+        let tokens = self.token_provider(source_id);
+        let access_token = tokens
+            .access_token()
+            .await
+            .map_err(|error| {
+                let retryable = error.is_retryable();
+                integration_error(error.message, retryable)
+            })?;
+        match revoke(access_token).await? {
+            ProviderGrantRevocation::AccessTokenRejected => {}
+            other => return Ok(other),
+        }
+        match tokens.refresh_access_token().await {
+            Ok(access_token) => match revoke(access_token).await? {
+                ProviderGrantRevocation::AccessTokenRejected => {
+                    Ok(ProviderGrantRevocation::AlreadyRevoked)
+                }
+                other => Ok(other),
+            },
+            Err(error) if error.kind == SourceErrorKind::AuthenticationRequired => {
+                Ok(ProviderGrantRevocation::AlreadyRevoked)
+            }
+            Err(_) => Err(integration_error(
+                "SoundCloud remote sign-out is temporarily unavailable",
+                true,
+            )),
+        }
     }
 
     async fn require_soundcloud_source(
@@ -1176,6 +1382,7 @@ impl SoundCloudCatalogService {
             .map_err(repository_error)?
         };
         let base_cursor = previous.as_ref().and_then(|run| run.sync_cursor.clone());
+        self.fail_interrupted_runs(source_id).await?;
         let mut run = SyncRun::new(SyncRunKind::CatalogSync, Some(source_id), None);
         run.start()
             .map_err(|error| integration_error(error.to_string(), false))?;
@@ -1187,6 +1394,8 @@ impl SoundCloudCatalogService {
             .clone()
             .map(|cursor| SourceSyncMode::Incremental { cursor })
             .unwrap_or(SourceSyncMode::Full);
+        let full_snapshot = matches!(mode, SourceSyncMode::Full);
+        let mut seen_relationships = HashSet::new();
         let mut page_cursor = None;
         loop {
             let page = match connector
@@ -1208,6 +1417,12 @@ impl SoundCloudCatalogService {
             };
             let next_page = page.next_page_cursor.clone();
             let complete_cursor = page.next_sync_cursor.clone();
+            if full_snapshot {
+                seen_relationships.extend(page.items.iter().filter_map(|item| match item {
+                    SourceSyncItem::Relationship(value) => Some(value.identity.clone()),
+                    _ => None,
+                }));
+            }
             if let Err(error) = self
                 .apply_page(source_id, page, &mut run, base_cursor.clone())
                 .await
@@ -1223,10 +1438,16 @@ impl SoundCloudCatalogService {
             }
             if next_page.is_none() {
                 if complete_cursor.is_none() {
-                    return Err(integration_error(
-                        "SoundCloud completed without a durable cursor",
+                    let error =
+                        integration_error("SoundCloud completed without a durable cursor", false);
+                    let _ = run.fail(SyncError::new(
+                        SyncErrorKind::InvalidData,
+                        "soundcloud",
+                        error.message.clone(),
                         false,
                     ));
+                    let _ = SyncRunRepository::upsert(self.catalog.as_ref(), run).await;
+                    return Err(error);
                 }
                 break;
             }
@@ -1236,6 +1457,18 @@ impl SoundCloudCatalogService {
             .map_err(|error| integration_error(error.to_string(), false))?;
         source.last_synced_at = run.finished_at;
         let transaction = self.catalog.begin().await.map_err(repository_error)?;
+        if full_snapshot {
+            // A full snapshot has no previous cursor to diff against, so relationships stored
+            // by earlier syncs (before a reconnect or a cleared cache) that SoundCloud no longer
+            // reports are removed here.
+            if let Err(error) =
+                remove_unseen_relationships(transaction.as_ref(), source_id, &seen_relationships)
+                    .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
         transaction
             .sources()
             .upsert(source)
@@ -1248,6 +1481,48 @@ impl SoundCloudCatalogService {
             .map_err(repository_error)?;
         transaction.commit().await.map_err(repository_error)?;
         self.project(Some(health)).await
+    }
+
+    /// A sync is synchronous and holds the operation lock, so any run still non-terminal when a
+    /// new one starts was interrupted (crash, quit, or a retry nothing executes). Leaving it would
+    /// keep the source card in the "Working" state forever.
+    async fn fail_interrupted_runs(&self, source_id: Uuid) -> Result<(), IntegrationError> {
+        let mut cursor = None;
+        loop {
+            let page = SyncRunRepository::list_filtered(
+                self.catalog.as_ref(),
+                SyncRunFilter {
+                    kind: Some(SyncRunKind::CatalogSync),
+                    status: None,
+                    source_id: Some(source_id),
+                    storage_id: None,
+                },
+                RepositoryPageRequest {
+                    cursor,
+                    limit: Some(200),
+                },
+            )
+            .await
+            .map_err(repository_error)?;
+            for mut run in page.items {
+                if run.status.is_terminal() {
+                    continue;
+                }
+                let _ = run.fail(SyncError::new(
+                    SyncErrorKind::Internal,
+                    "soundcloud_interrupted",
+                    "SoundCloud sync was interrupted before it finished",
+                    true,
+                ));
+                SyncRunRepository::upsert(self.catalog.as_ref(), run)
+                    .await
+                    .map_err(repository_error)?;
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Ok(());
+            }
+        }
     }
 
     async fn apply_page(
@@ -1499,7 +1774,23 @@ impl SoundCloudCatalogService {
                     None
                 };
                 let forgotten = source.config.contains_key(FORGOTTEN_CONFIG_KEY);
-                let collections = collection_views(self.catalog.as_ref(), source.id).await?;
+                let relationships = collect_relationships(self.catalog.as_ref(), source.id).await?;
+                let collections = collection_views(&relationships);
+                // Only what SoundCloud currently reports is shown: an unliked track or a deleted
+                // playlist keeps its occurrence row but loses every relationship.
+                let current_tracks: HashSet<&str> = relationships
+                    .iter()
+                    .filter(|value| value.identity.entity_kind == SourceEntityKind::Track)
+                    .map(|value| value.identity.entity_external_id.as_str())
+                    .collect();
+                let current_playlists: HashSet<&str> = relationships
+                    .iter()
+                    .filter(|value| {
+                        value.identity.entity_kind == SourceEntityKind::Playlist
+                            && value.identity.parent_external_id.is_none()
+                    })
+                    .map(|value| value.identity.entity_external_id.as_str())
+                    .collect();
                 let occurrences = if forgotten {
                     Vec::new()
                 } else {
@@ -1507,6 +1798,9 @@ impl SoundCloudCatalogService {
                 };
                 let mut status_by_track = HashMap::new();
                 for occurrence in occurrences {
+                    if !current_tracks.contains(occurrence.identity.external_id.as_str()) {
+                        continue;
+                    }
                     let Some(track_id) = occurrence.canonical_track_id else {
                         continue;
                     };
@@ -1559,7 +1853,10 @@ impl SoundCloudCatalogService {
                 } else {
                     collect_playlists(self.catalog.as_ref(), source.id).await?
                 };
-                for playlist in playlists {
+                for playlist in playlists
+                    .into_iter()
+                    .filter(|playlist| current_playlists.contains(playlist.external_id.as_str()))
+                {
                     let mut archived = 0_u32;
                     let mut total = 0_u32;
                     for entry in &playlist.entries {
@@ -1616,6 +1913,51 @@ impl SoundCloudCatalogService {
         view.completeness = counts;
         Ok(view.clone())
     }
+}
+
+async fn remove_unseen_relationships(
+    transaction: &dyn RepositoryTransaction,
+    source_id: Uuid,
+    seen: &HashSet<SourceCollectionRelationshipIdentity>,
+) -> Result<(), IntegrationError> {
+    let mut stale = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = transaction
+            .sources()
+            .list_collection_relationships(
+                SourceCollectionRelationshipFilter {
+                    source_id,
+                    account_external_id: None,
+                    collection: None,
+                    entity_kind: None,
+                },
+                RepositoryPageRequest {
+                    cursor,
+                    limit: Some(500),
+                },
+            )
+            .await
+            .map_err(repository_error)?;
+        stale.extend(
+            page.items
+                .into_iter()
+                .map(|relationship| relationship.identity)
+                .filter(|identity| !seen.contains(identity)),
+        );
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    for identity in stale {
+        transaction
+            .sources()
+            .remove_collection_relationship(identity)
+            .await
+            .map_err(repository_error)?;
+    }
+    Ok(())
 }
 
 async fn clear_source_checkpoints(
@@ -1733,11 +2075,11 @@ impl IntegrationSliceHandler for SoundCloudCatalogService {
                     view: Some(view),
                     message: Some(match request.event {
                         MusicManagementEvent::DisconnectSource { .. } => {
-                            "SoundCloud disconnected; imported catalog data was preserved"
+                            "SoundCloud disconnected; its catalog data was removed from this device. Canonical tracks and owned files were kept."
                                 .to_string()
                         }
                         MusicManagementEvent::RevokeProviderGrant { .. } => {
-                            "SoundCloud authorization was revoked and local credentials removed"
+                            "SoundCloud access was revoked; credentials and SoundCloud catalog data were removed from this device"
                                 .to_string()
                         }
                         MusicManagementEvent::ClearLocalCache { .. } => {
@@ -2086,10 +2428,37 @@ async fn collect_playlists(
     }
 }
 
-async fn collection_views(
+async fn collect_relationships(
     catalog: &TursoCatalog,
     source_id: Uuid,
-) -> Result<Vec<SourceCollectionView>, IntegrationError> {
+) -> Result<Vec<SourceCollectionRelationship>, IntegrationError> {
+    let mut values = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = SourceRepository::list_collection_relationships(
+            catalog,
+            SourceCollectionRelationshipFilter {
+                source_id,
+                account_external_id: None,
+                collection: None,
+                entity_kind: None,
+            },
+            RepositoryPageRequest {
+                cursor,
+                limit: Some(500),
+            },
+        )
+        .await
+        .map_err(repository_error)?;
+        values.extend(page.items);
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Ok(values);
+        }
+    }
+}
+
+fn collection_views(relationships: &[SourceCollectionRelationship]) -> Vec<SourceCollectionView> {
     let definitions = [
         (
             SourceCollection::UploadedTracks,
@@ -2112,44 +2481,23 @@ async fn collection_views(
             "Liked playlists",
         ),
     ];
-    let mut views = Vec::new();
-    for (collection, entity_kind, name) in definitions {
-        let mut count = 0_u32;
-        let mut cursor = None;
-        loop {
-            let page = SourceRepository::list_collection_relationships(
-                catalog,
-                SourceCollectionRelationshipFilter {
-                    source_id,
-                    account_external_id: None,
-                    collection: Some(collection),
-                    entity_kind: Some(entity_kind),
-                },
-                RepositoryPageRequest {
-                    cursor,
-                    limit: Some(200),
-                },
-            )
-            .await
-            .map_err(repository_error)?;
-            count = count.saturating_add(saturating_u32(
-                page.items
-                    .iter()
-                    .filter(|value| value.identity.parent_external_id.is_none())
-                    .count() as u64,
-            ));
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
-        }
-        views.push(SourceCollectionView {
+    definitions
+        .into_iter()
+        .map(|(collection, entity_kind, name)| SourceCollectionView {
             name: name.to_string(),
-            item_count: count,
+            item_count: saturating_u32(
+                relationships
+                    .iter()
+                    .filter(|value| {
+                        value.identity.collection == collection
+                            && value.identity.entity_kind == entity_kind
+                            && value.identity.parent_external_id.is_none()
+                    })
+                    .count() as u64,
+            ),
             read_only: true,
-        });
-    }
-    Ok(views)
+        })
+        .collect()
 }
 
 async fn has_verified_original(
@@ -2272,6 +2620,7 @@ fn source_view(
         last_sync: source.last_synced_at.map(|value| value.to_rfc3339()),
         next_sync: source
             .last_synced_at
+            .filter(|_| connected)
             .map(|value| (value + ChronoDuration::hours(6)).to_rfc3339()),
         progress: run.filter(|_| active).map(|run| JobProgressView {
             label: "Synchronizing SoundCloud".to_string(),
@@ -2341,7 +2690,7 @@ mod tests {
         );
     }
     use rec_core::{
-        MetadataOrigin, SourceAccount, SourceCollectionRelationship,
+        MetadataOrigin, SourceAccount,
         SourceCollectionRelationshipIdentity, SourceSyncPage, SyncCursor,
     };
 
@@ -2806,15 +3155,65 @@ mod tests {
         );
 
         let view = service.revoke_provider_grant(source.id).await.unwrap();
-        assert!(!view.sources[0].connected);
+        assert!(view.sources.is_empty(), "revoking removes the SoundCloud source");
         assert!(credentials
             .load(&credential_key(source.id))
             .await
             .unwrap()
             .is_none());
         assert_eq!(*sign_out.calls.lock().unwrap(), 2);
-        service.revoke_provider_grant(source.id).await.unwrap();
+        assert!(service.revoke_provider_grant(source.id).await.is_err());
         assert_eq!(*sign_out.calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn revoke_refreshes_a_rejected_access_token_before_revoking_again() {
+        let (service, _, broker, credentials, _) = fixture().await;
+        let source = CatalogSource::new("SoundCloud", CatalogSourceKind::SoundCloud);
+        SourceRepository::upsert(service.catalog.as_ref(), source.clone())
+            .await
+            .unwrap();
+        let stored =
+            StoredSoundCloudCredentials::from_response(token_response("expired", "refresh"), 0);
+        credentials
+            .store(&credential_key(source.id), stored.encode().unwrap())
+            .await
+            .unwrap();
+        let sign_out = Arc::new(MockSignOut::with_results([
+            Ok(ProviderGrantRevocation::AccessTokenRejected),
+            Ok(ProviderGrantRevocation::Revoked),
+        ]));
+        let service = service.with_sign_out_client(sign_out.clone());
+
+        service.revoke_provider_grant(source.id).await.unwrap();
+        assert_eq!(*broker.refreshes.lock().unwrap(), 1);
+        assert_eq!(*sign_out.calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn disconnect_succeeds_offline_and_still_removes_local_data() {
+        let (service, _, _, credentials, _) = fixture().await;
+        let source = CatalogSource::new("SoundCloud", CatalogSourceKind::SoundCloud);
+        SourceRepository::upsert(service.catalog.as_ref(), source.clone())
+            .await
+            .unwrap();
+        let stored =
+            StoredSoundCloudCredentials::from_response(token_response("access", "refresh"), 0);
+        credentials
+            .store(&credential_key(source.id), stored.encode().unwrap())
+            .await
+            .unwrap();
+        let service = service.with_sign_out_client(Arc::new(MockSignOut::with_results([Err(
+            integration_error("offline", true),
+        )])));
+
+        let view = service.disconnect(source.id).await.unwrap();
+        assert!(view.sources.is_empty());
+        assert!(credentials
+            .load(&credential_key(source.id))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2952,7 +3351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_sync_uses_last_successful_cursor_and_disconnect_preserves_catalog() {
+    async fn incremental_sync_uses_last_successful_cursor_and_disconnect_removes_provider_data() {
         let (service, _, _, credentials, connector) = fixture().await;
         let mut source = CatalogSource::new("SoundCloud", CatalogSourceKind::SoundCloud);
         source.capabilities = soundcloud_capabilities();
@@ -2985,7 +3384,7 @@ mod tests {
         ));
         drop(requests);
         let disconnected = service.disconnect(source.id).await.unwrap();
-        assert!(!disconnected.sources[0].connected);
+        assert!(disconnected.sources.is_empty());
         assert!(SourceRepository::get_occurrence(
             service.catalog.as_ref(),
             source.id,
@@ -2993,14 +3392,129 @@ mod tests {
         )
         .await
         .unwrap()
-        .is_some());
-        assert!(
+        .is_none());
+        assert_eq!(
             TrackRepository::list(service.catalog.as_ref(), RepositoryPageRequest::default())
                 .await
                 .unwrap()
                 .items
-                .len()
-                == 1
+                .len(),
+            1,
+            "canonical tracks survive a disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_removes_relationships_soundcloud_no_longer_reports() {
+        let (service, _, _, credentials, connector) = fixture().await;
+        let mut source = CatalogSource::new("SoundCloud", CatalogSourceKind::SoundCloud);
+        source.capabilities = soundcloud_capabilities();
+        SourceRepository::upsert(service.catalog.as_ref(), source.clone())
+            .await
+            .unwrap();
+        let stored =
+            StoredSoundCloudCredentials::from_response(token_response("access", "refresh"), 0);
+        credentials
+            .store(&credential_key(source.id), stored.encode().unwrap())
+            .await
+            .unwrap();
+        connector
+            .pages
+            .lock()
+            .unwrap()
+            .push_back(Ok(terminal_page(source.id)));
+        let view = service.sync(source.id).await.unwrap();
+        assert_eq!(view.tracks.len(), 1);
+
+        // The track is unliked while disconnected; a later full sync reports nothing.
+        let mut empty = terminal_page(source.id);
+        empty
+            .items
+            .retain(|item| matches!(item, SourceSyncItem::Account(_)));
+        connector.pages.lock().unwrap().push_back(Ok(empty));
+        let view = service.sync_locked(source.id, true).await.unwrap();
+        assert!(view.tracks.is_empty(), "unliked tracks leave the dashboard");
+        assert_eq!(view.sources[0].collections[2].item_count, 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_sync_fails_runs_left_running_by_an_interrupted_one() {
+        let (service, _, _, credentials, connector) = fixture().await;
+        let mut source = CatalogSource::new("SoundCloud", CatalogSourceKind::SoundCloud);
+        source.capabilities = soundcloud_capabilities();
+        SourceRepository::upsert(service.catalog.as_ref(), source.clone())
+            .await
+            .unwrap();
+        let stored =
+            StoredSoundCloudCredentials::from_response(token_response("access", "refresh"), 0);
+        credentials
+            .store(&credential_key(source.id), stored.encode().unwrap())
+            .await
+            .unwrap();
+        let mut stuck = SyncRun::new(SyncRunKind::CatalogSync, Some(source.id), None);
+        stuck.start().unwrap();
+        SyncRunRepository::upsert(service.catalog.as_ref(), stuck.clone())
+            .await
+            .unwrap();
+        connector
+            .pages
+            .lock()
+            .unwrap()
+            .push_back(Ok(terminal_page(source.id)));
+        service.sync(source.id).await.unwrap();
+        let stuck = SyncRunRepository::get(service.catalog.as_ref(), stuck.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stuck.status, SyncStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn connect_uses_broker_settings_when_nothing_is_saved() {
+        struct ConfiguredBroker(MockBroker);
+        impl SoundCloudBrokerClient for ConfiguredBroker {
+            fn exchange_authorization_code(
+                &self,
+                request: SoundCloudAuthorizationCodeExchange,
+            ) -> BoxFuture<'_, Result<SoundCloudTokenResponse, IntegrationError>> {
+                self.0.exchange_authorization_code(request)
+            }
+            fn refresh_token(
+                &self,
+                request: SoundCloudRefreshTokenExchange,
+            ) -> BoxFuture<'_, Result<SoundCloudTokenResponse, IntegrationError>> {
+                self.0.refresh_token(request)
+            }
+            fn public_config(
+                &self,
+            ) -> BoxFuture<'_, Result<SoundCloudPublicConfig, IntegrationError>> {
+                Box::pin(async {
+                    Ok(SoundCloudPublicConfig {
+                        client_id: "broker-client".to_string(),
+                        redirect_uri: "http://127.0.0.1:17841/oauth/soundcloud".to_string(),
+                    })
+                })
+            }
+        }
+        let user_agent = Arc::new(MockUserAgent::successful());
+        let service = SoundCloudCatalogService::new_with_optional_config(
+            None,
+            user_agent.clone(),
+            Arc::new(MemoryCredentialStore::default()),
+            Arc::new(ConfiguredBroker(MockBroker::default())),
+            Arc::new(FixedFactory(Arc::new(QueueConnector {
+                pages: Mutex::new(VecDeque::new()),
+                requests: Mutex::new(Vec::new()),
+            }))),
+            Arc::new(TursoCatalog::in_memory().await.unwrap()),
+        );
+        service.authorize().await.unwrap();
+        let opened = user_agent.opened.lock().unwrap()[0].clone();
+        let query: HashMap<_, _> = opened.query_pairs().into_owned().collect();
+        assert_eq!(query["client_id"], "broker-client");
+        assert_eq!(
+            query["redirect_uri"],
+            "http://127.0.0.1:17841/oauth/soundcloud"
         );
     }
 
@@ -3038,6 +3552,49 @@ mod tests {
             availability_status(SourceAvailability::Removed, true),
             TrackStorageStatusView::StoredAndVerified
         );
+    }
+
+    #[cfg(feature = "desktop")]
+    #[tokio::test]
+    async fn callback_receiver_ignores_preconnects_and_other_paths() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let redirect = Url::parse(&format!("http://{address}/oauth/soundcloud")).unwrap();
+        let request = |path: &'static str| async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        };
+
+        // A speculative connection that never sends anything is dropped, not fatal.
+        let preconnect = tokio::net::TcpStream::connect(address).await.unwrap();
+        drop(preconnect);
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(serve_callback_connection(stream, &redirect).await.is_none());
+
+        let favicon = tokio::spawn(request("/favicon.ico"));
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(serve_callback_connection(stream, &redirect).await.is_none());
+        assert!(favicon.await.unwrap().starts_with("HTTP/1.1 404"));
+
+        let denied = tokio::spawn(request("/oauth/soundcloud?error=access_denied&state=s"));
+        let (stream, _) = listener.accept().await.unwrap();
+        let callback = serve_callback_connection(stream, &redirect).await.unwrap();
+        assert!(callback.query_pairs().any(|(key, _)| key == "error"));
+        assert!(denied.await.unwrap().contains("cancelled"));
+
+        let granted = tokio::spawn(request("/oauth/soundcloud?code=c&state=s"));
+        let (stream, _) = listener.accept().await.unwrap();
+        let callback = serve_callback_connection(stream, &redirect).await.unwrap();
+        assert_eq!(callback.path(), "/oauth/soundcloud");
+        assert!(granted.await.unwrap().contains("authorization received"));
     }
 
     #[test]

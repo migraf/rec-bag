@@ -12,11 +12,21 @@ pub mod soundcloud_oauth;
 
 pub use soundcloud_oauth::{
     OAuthClientIp, SoundCloudAuthorizationCodeExchange, SoundCloudOAuthError,
-    SoundCloudOAuthErrorKind, SoundCloudRefreshTokenExchange, SoundCloudTokenResponse,
+    SoundCloudOAuthErrorKind, SoundCloudPublicConfig, SoundCloudRefreshTokenExchange,
+    SoundCloudTokenResponse,
 };
 
 /// A boxed sendable future used by the OAuth HTTP transport boundary.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Public SoundCloud desktop OAuth settings (client ID and loopback redirect URI), so the
+/// desktop app does not need them entered by hand.
+#[get("/api/soundcloud/oauth/config")]
+pub async fn soundcloud_public_config() -> Result<SoundCloudPublicConfig, ServerFnError> {
+    soundcloud_oauth::environment_broker()
+        .and_then(|broker| broker.public_config())
+        .map_err(server_error)
+}
 
 /// Exchange a SoundCloud authorization code using the server-only application credentials.
 ///
@@ -49,13 +59,16 @@ pub async fn refresh_soundcloud_token(
         .map_err(server_error)
 }
 
+/// Release builds require the trusted proxy's `X-Real-IP`. Debug builds (local `dx serve`, no
+/// proxy) treat a missing header as the loopback client; a present but malformed header is still
+/// rejected.
 #[cfg(feature = "server")]
 fn trusted_client_ip(headers: &HeaderMap) -> Result<OAuthClientIp, SoundCloudOAuthError> {
-    let value = headers
-        .get("x-real-ip")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    OAuthClientIp::parse(value)
+    match headers.get("x-real-ip") {
+        Some(value) => OAuthClientIp::parse(value.to_str().unwrap_or_default()),
+        None if cfg!(debug_assertions) => OAuthClientIp::parse("127.0.0.1"),
+        None => OAuthClientIp::parse(""),
+    }
 }
 
 #[cfg(feature = "server")]
@@ -74,6 +87,8 @@ mod tests {
     #[test]
     fn trusted_proxy_identity_is_required_and_must_be_one_ip() {
         let mut headers = HeaderMap::new();
+        assert_eq!(trusted_client_ip(&headers).is_ok(), cfg!(debug_assertions));
+        headers.insert("x-real-ip", "not-an-ip".parse().unwrap());
         assert!(trusted_client_ip(&headers).is_err());
         headers.insert("x-real-ip", "192.0.2.10".parse().unwrap());
         assert!(trusted_client_ip(&headers).is_ok());

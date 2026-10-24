@@ -440,6 +440,11 @@ enum LifecycleAction {
     DisconnectSource {
         source_id: String,
     },
+    /// Unlike other sources, disconnecting SoundCloud deletes its catalog data (API Terms).
+    DisconnectSoundCloud {
+        source_id: String,
+        source_name: String,
+    },
     DisconnectStorage {
         storage_id: String,
     },
@@ -473,6 +478,7 @@ impl LifecycleAction {
     fn title(&self) -> &'static str {
         match self {
             Self::DisconnectSource { .. } => "Disconnect source",
+            Self::DisconnectSoundCloud { .. } => "Disconnect SoundCloud",
             Self::DisconnectStorage { .. } => "Disconnect storage",
             Self::RevokeProviderGrant { .. } => "Revoke provider access",
             Self::ClearLocalCache { .. } => "Clear local cache",
@@ -484,7 +490,8 @@ impl LifecycleAction {
         match self {
             Self::RevokeProviderGrant { subject_name, .. } => Some(subject_name),
             Self::ClearLocalCache { source_name, .. }
-            | Self::ForgetProviderCatalogData { source_name, .. } => Some(source_name),
+            | Self::ForgetProviderCatalogData { source_name, .. }
+            | Self::DisconnectSoundCloud { source_name, .. } => Some(source_name),
             Self::DisconnectSource { .. } | Self::DisconnectStorage { .. } => None,
         }
     }
@@ -495,7 +502,10 @@ impl LifecycleAction {
                 "This revokes rec_bag's authorization at the provider. Synchronization will stop until you grant access again."
             }
             Self::ClearLocalCache { .. } => {
-                "Downloaded cache entries will be removed from this device. Catalog records and provider content are retained."
+                "Cached files and sync checkpoints on this device are removed; the next sync re-reads everything from the provider. Catalog records and provider content are retained."
+            }
+            Self::DisconnectSoundCloud { .. } => {
+                "rec_bag's SoundCloud access is revoked and SoundCloud tracks, likes, and playlists are removed from this device, as SoundCloud's API terms require. Canonical tracks, your own files, and everything on SoundCloud are kept. Reconnect at any time to import them again."
             }
             Self::ForgetProviderCatalogData { .. } => {
                 "Provider-derived tracks, playlists, and associations will be removed from the local catalog. Provider content is not deleted."
@@ -510,6 +520,9 @@ impl LifecycleAction {
         match self {
             Self::RevokeProviderGrant { .. } => "I understand provider access will be revoked.",
             Self::ClearLocalCache { .. } => "I understand cached content will be removed.",
+            Self::DisconnectSoundCloud { .. } => {
+                "I understand SoundCloud catalog data will be removed from this device."
+            }
             Self::ForgetProviderCatalogData { .. } => {
                 "I understand provider-derived catalog data will be removed."
             }
@@ -521,7 +534,8 @@ impl LifecycleAction {
 
     fn into_event(self) -> MusicManagementEvent {
         match self {
-            Self::DisconnectSource { source_id } => {
+            Self::DisconnectSource { source_id }
+            | Self::DisconnectSoundCloud { source_id, .. } => {
                 MusicManagementEvent::DisconnectSource { source_id }
             }
             Self::DisconnectStorage { storage_id } => {
@@ -911,6 +925,8 @@ fn SourceCard(props: SourceCardProps) -> Element {
     let clear_cache_id = props.source.id.clone();
     let forget_data_id = props.source.id.clone();
     let source_name = props.source.name.clone();
+    let disconnect_source_name = source_name.clone();
+    let is_soundcloud = props.source.provider == ProviderChoice::SoundCloud;
     let revoke_source_name = source_name.clone();
     let cache_source_name = source_name.clone();
     let forget_source_name = source_name.clone();
@@ -918,8 +934,10 @@ fn SourceCard(props: SourceCardProps) -> Element {
     let last_sync = props
         .source
         .last_sync
-        .clone()
+        .as_deref()
+        .map(display_timestamp)
         .unwrap_or_else(|| "Never".to_string());
+    let next_sync = props.source.next_sync.as_deref().map(display_timestamp);
     rsx! {
         article { class: "mm-card mm-source-card",
             div { class: "mm-card-header",
@@ -937,7 +955,7 @@ fn SourceCard(props: SourceCardProps) -> Element {
             p { class: "mm-detail", "{props.source.detail}" }
             div { class: "mm-source-times",
                 span { "Last sync: {last_sync}" }
-                if let Some(next_sync) = props.source.next_sync.clone() {
+                if let Some(next_sync) = next_sync {
                     span { "Next: {next_sync}" }
                 }
             }
@@ -965,12 +983,21 @@ fn SourceCard(props: SourceCardProps) -> Element {
                 }
             }
             div { class: "mm-card-actions",
-                button {
-                    class: "mm-button secondary",
-                    onclick: move |_| props.on_event.call(MusicManagementEvent::SyncSource(source_id.clone())),
-                    "Sync now"
+                if props.source.connected {
+                    button {
+                        class: "mm-button secondary",
+                        onclick: move |_| props.on_event.call(MusicManagementEvent::SyncSource(source_id.clone())),
+                        "Sync now"
+                    }
+                } else if is_soundcloud {
+                    button {
+                        class: "mm-button primary",
+                        onclick: move |_| props.on_event.call(MusicManagementEvent::AddSource(ProviderChoice::SoundCloud)),
+                        "Reconnect SoundCloud"
+                    }
                 }
-                if let Some(sync_run_id) = retry_sync_run_id.clone() {
+                // A SoundCloud sync is a fresh snapshot, so "Sync now" already is the retry.
+                if let Some(sync_run_id) = retry_sync_run_id.clone().filter(|_| !is_soundcloud) {
                     button {
                         class: "mm-button secondary",
                         onclick: move |_| props.on_event.call(MusicManagementEvent::RetrySyncRun {
@@ -979,7 +1006,18 @@ fn SourceCard(props: SourceCardProps) -> Element {
                         "Retry failed sync"
                     }
                 }
-                if props.source.connected {
+                if is_soundcloud {
+                    button {
+                        class: "mm-link-button",
+                        "aria-haspopup": "dialog",
+                        title: "Revokes SoundCloud access and removes SoundCloud catalog data from this device.",
+                        onclick: move |_| pending_lifecycle_action.set(Some(LifecycleAction::DisconnectSoundCloud {
+                            source_id: disconnect_id.clone(),
+                            source_name: disconnect_source_name.clone(),
+                        })),
+                        "Disconnect SoundCloud"
+                    }
+                } else if props.source.connected {
                     button {
                         class: "mm-link-button",
                         title: "Stops synchronization without deleting catalog data or cached files.",
@@ -1362,7 +1400,7 @@ fn SoundCloudConfigurationDialog(props: SoundCloudConfigurationDialogProps) -> E
     rsx! {
         Modal { title: "Configure SoundCloud".to_string(), on_close: props.on_close,
             p { class: "mm-message warning",
-                "Client ID and redirect URI are public desktop OAuth settings. The broker secret is never entered or stored here."
+                "Optional. By default rec_bag uses the client ID and redirect URI of its SoundCloud broker. Set them here only to override that; the broker secret is never entered or stored here."
             }
             label { class: "mm-field",
                 span { "Client ID" }
@@ -1871,6 +1909,17 @@ fn Modal(props: ModalProps) -> Element {
 /// The input is inspected only for broad classification. It is never included in
 /// the returned text, which prevents credentials, URLs, file paths, or response
 /// bodies from reaching the UI.
+/// Shows provider timestamps (RFC 3339) in local time; anything unparsable is shown as is.
+fn display_timestamp(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| value.to_string())
+}
+
 fn safe_error_guidance(untrusted: &str) -> &'static str {
     let normalized = untrusted.to_ascii_lowercase();
     if [
@@ -2334,6 +2383,28 @@ mod tests {
                 storage_id: "storage-1".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn soundcloud_disconnect_requires_confirmation_and_emits_a_source_disconnect() {
+        let action = LifecycleAction::DisconnectSoundCloud {
+            source_id: "source-1".to_string(),
+            source_name: "SoundCloud".to_string(),
+        };
+        assert!(action.requires_confirmation());
+        assert!(!action.can_confirm(false));
+        assert_eq!(
+            action.into_event(),
+            MusicManagementEvent::DisconnectSource {
+                source_id: "source-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn timestamps_render_in_local_time_and_fall_back_to_raw_text() {
+        assert_eq!(display_timestamp("not a date"), "not a date");
+        assert_eq!(display_timestamp("2026-10-24T08:30:00+00:00").len(), 16);
     }
 
     #[test]

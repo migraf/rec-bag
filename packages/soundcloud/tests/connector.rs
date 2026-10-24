@@ -247,7 +247,8 @@ async fn exhaustive_fixture_sync_covers_collections_access_order_and_duplicates(
     };
     assert_eq!(
         availability("soundcloud:tracks:10"),
-        SourceAvailability::Obtainable
+        SourceAvailability::StreamingOnly,
+        "downloadable SoundCloud tracks are never archivable under the API Terms"
     );
     assert_eq!(
         availability("soundcloud:tracks:20"),
@@ -360,8 +361,8 @@ async fn exhaustive_fixture_sync_covers_collections_access_order_and_duplicates(
     assert!(urls[3].contains("/me/playlists?"));
     assert!(urls[4].contains("/me/likes/tracks?"));
     assert!(urls[5].contains("/me/likes/playlists?"));
-    assert!(urls[3].contains("show_tracks=true"));
-    assert!(urls[5].contains("show_tracks=true"));
+    assert!(urls[3].contains("show_tracks=false"));
+    assert!(urls[5].contains("show_tracks=false"));
 }
 
 #[tokio::test]
@@ -540,14 +541,16 @@ async fn playlist_snapshot_diff_authoritatively_replaces_ordered_entry_relations
 }
 
 #[tokio::test]
-async fn playlist_without_embedded_tracks_is_fetched_from_the_typed_detail_endpoint() {
-    let list =
-        r#"{"collection":[{"urn":"soundcloud:playlists:9","title":"Set"}],"next_href":null}"#;
-    let detail = r#"{"urn":"soundcloud:playlists:9","title":"Set","tracks":[{"urn":"soundcloud:tracks:1","access":"playable"}]}"#;
+async fn playlist_tracks_are_paged_from_the_tracks_endpoint_when_not_embedded() {
+    let list = r#"{"collection":[{"urn":"soundcloud:playlists:9","title":"Set","track_count":2,"tracks":[]}],"next_href":null}"#;
+    let tracks_one = r#"{"collection":[{"urn":"soundcloud:tracks:1","access":"playable"}],"next_href":"https://api.soundcloud.com/playlists/soundcloud:playlists:9/tracks?cursor=2"}"#;
+    let tracks_two =
+        r#"{"collection":[{"urn":"soundcloud:tracks:2","access":"blocked"}],"next_href":null}"#;
     let transport = Arc::new(MockTransport::with_responses([
         response(200, include_str!("fixtures/me_current.json")),
         response(200, list),
-        response(200, detail),
+        response(200, tracks_one),
+        response(200, tracks_two),
     ]));
     let connector = connector(
         transport.clone(),
@@ -559,14 +562,35 @@ async fn playlist_without_embedded_tracks_is_fetched_from_the_typed_detail_endpo
         .sync_page(full_request(vec![SourceCollection::LikedPlaylists]))
         .await
         .unwrap();
-    assert!(page.items.iter().any(|item| matches!(
-        item,
-        SourceSyncItem::PlaylistEntry { playlist_external_id, .. }
-            if playlist_external_id == "soundcloud:playlists:9"
-    )));
+    let positions: Vec<_> = page
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SourceSyncItem::PlaylistEntry {
+                playlist_external_id,
+                entry,
+                ..
+            } if playlist_external_id == "soundcloud:playlists:9" => {
+                Some((entry.position, entry.track.external_id.clone()))
+            }
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        transport.requests()[2].url,
-        "https://api.soundcloud.com/playlists/soundcloud:playlists:9?show_tracks=true"
+        positions,
+        vec![
+            (0, "soundcloud:tracks:1".to_string()),
+            (1, "soundcloud:tracks:2".to_string())
+        ]
+    );
+    let requests = transport.requests();
+    assert_eq!(
+        requests[2].url,
+        "https://api.soundcloud.com/playlists/soundcloud:playlists:9/tracks?linked_partitioning=true&limit=200&access=playable%2Cpreview%2Cblocked"
+    );
+    assert_eq!(
+        requests[3].url,
+        "https://api.soundcloud.com/playlists/soundcloud:playlists:9/tracks?cursor=2"
     );
 }
 

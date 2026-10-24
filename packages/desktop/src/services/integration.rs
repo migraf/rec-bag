@@ -470,6 +470,18 @@ impl DesktopIntegration {
             ));
         }
         self.require_ownership(Some(&request))?;
+        if matches!(
+            request.event,
+            ui::MusicManagementEvent::AddSource(ui::ProviderChoice::SoundCloud)
+        ) {
+            // The browser round-trip can take minutes; it must not hold the catalog lock that
+            // every other integration and the scheduler need.
+            self.soundcloud.authorize().await.map_err(|mut error| {
+                error.request_id = Some(request.id);
+                error.slice = Some(request.slice);
+                error
+            })?;
+        }
         let _catalog_operation = self.catalog_operation_lock.lock().await;
         let handler = self.registry.handler(request.slice).ok_or_else(|| {
             IntegrationError::for_request(

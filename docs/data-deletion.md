@@ -10,9 +10,9 @@
 
 | Action | Local credentials | Local catalog | Local cache | Local primary/backups | Google Drive files | Provider account data |
 | --- | --- | --- | --- | --- | --- | --- |
-| Disconnect SoundCloud source | Removed after sign-out handling succeeds | Retained; source disabled | Sync checkpoints retained unless separately cleared | Retained | Not applicable | Not deleted |
+| Disconnect SoundCloud | Removed (remote revocation attempted; best effort when offline) | SoundCloud source and derived rows deleted; canonical owned tracks/assets preserved | Sync checkpoints deleted | Retained | Not applicable | Not deleted |
 | Disconnect Google storage | Retained | Retained; storage disabled | Retained | Other local storage retained | Retained | Not deleted |
-| Revoke SoundCloud access | Removed after provider revocation/sign-out succeeds | Retained; source disabled | Retained | Retained | Not applicable | SoundCloud tracks/playlists/likes not deleted |
+| Revoke SoundCloud access | Removed after SoundCloud confirms revocation | SoundCloud source and derived rows deleted; canonical owned tracks/assets preserved | Sync checkpoints deleted | Retained | Not applicable | SoundCloud tracks/playlists/likes not deleted |
 | Revoke Google access | Removed; matching Drive storages disabled | Retained | Retained until cleared/profile deletion | Local storage retained | Retained | Google account content not deleted |
 | Clear local cache | Retained | Retained; SoundCloud checkpoints or Drive cached bytes cleared as applicable | Cleared for selected connection | Originals/backups retained | Retained | Not deleted |
 | Forget provider catalog data | Retained unless separately revoked | Current provider source/storage and derived rows plus current catalog snapshots deleted; canonical owned tracks/assets preserved | Provider cache for the forgotten Drive storage deleted | Owned originals/backups retained | Retained | Not deleted |
@@ -25,11 +25,11 @@ Always make and verify any desired export before deletion. Deletion can be irrev
 
 In **Music Management**:
 
-1. choose **Disconnect source** for SoundCloud, or **Disconnect Google storage** for Drive;
+1. choose **Disconnect Google storage** for Drive;
 2. confirm the connection is disabled;
 3. understand that catalog data, caches, local files, backups, and provider files remain.
 
-SoundCloud disconnect removes the local credential after remote sign-out handling completes. Google storage disconnect intentionally retains the account credential so other matching Drive storages or reconnection can continue; use revocation to remove it.
+SoundCloud is different: **Disconnect SoundCloud** asks for confirmation, revokes access at SoundCloud (`POST /disconnect`) when reachable, removes the local credential, and deletes the SoundCloud-derived catalog data, because the SoundCloud API Terms require deleting a user's data after they disconnect. Canonical owned tracks and assets are kept; reconnecting imports the SoundCloud catalog again. Google storage disconnect intentionally retains the account credential so other matching Drive storages or reconnection can continue; use revocation to remove it.
 
 ## Revoke provider access
 
@@ -45,9 +45,9 @@ Revocation does not delete the `rec_bag Music` folder, its audio, local catalog 
 ### SoundCloud
 
 1. In Music Management choose **Revoke provider access** and confirm.
-2. rec_bag requests provider sign-out/revocation.
-3. If remote revocation is unavailable or fails, rec_bag retains local credentials and reports the failure rather than claiming completion.
-4. After success, the local keyring credential is removed and the source is disabled.
+2. rec_bag calls SoundCloud's `POST https://api.soundcloud.com/disconnect`, refreshing an expired access token once first.
+3. If remote revocation is unavailable or fails, rec_bag retains local credentials and data and reports the failure rather than claiming completion.
+4. After success, the local keyring credential and the SoundCloud-derived catalog data are removed.
 5. Verify/revoke rec_bag in SoundCloud connected-application settings: [[REQUIRED: CURRENT SOUNDCLOUD HELP/SETTINGS URL]].
 
 Revocation does not delete SoundCloud uploads, playlists, likes, canonical owned tracks, local assets, or backups.
