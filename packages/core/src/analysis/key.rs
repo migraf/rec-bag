@@ -1,22 +1,38 @@
-//! Key detection using chromagram analysis and key profile matching.
+//! Key detection from a harmonic pitch-class profile.
 //!
 //! The algorithm works in several stages:
-//! 1. Compute chromagram (12 pitch class profile) from FFT
-//! 2. Average chromagram across all frames
-//! 3. Correlate with Krumhansl-Kessler key profiles
-//! 4. Return the key with highest correlation
+//! 1. Find the spectral peaks of each frame. Only peaks that stand above the
+//!    local spectral level count, so the broadband noise of kicks and hats,
+//!    which in dance music carries most of the energy, adds nothing.
+//! 2. Measure the track's tuning from where the peaks fall between semitones,
+//!    so a master a few cents off concert pitch does not smear into its
+//!    neighbouring keys.
+//! 3. Fold each peak into a 12-bin pitch-class profile. Each frame is
+//!    normalised before summing, so a loud drop does not outweigh a melodic
+//!    breakdown.
+//! 4. Correlate with Krumhansl-Kessler key profiles.
 
+use super::fft::{moving_average, Stft};
 use super::traits::{Analyzer, AnalyzerOutput};
 use super::types::{AnalysisError, MusicalKey};
-use rustfft::{num_complex::Complex, FftPlanner};
+use std::f32::consts::PI;
 
-/// Key analyzer using chromagram and key profile correlation.
-pub struct KeyAnalyzer {
-    /// FFT window size for spectral analysis.
-    fft_size: usize,
-    /// Hop size between FFT frames.
-    hop_size: usize,
-}
+/// ~186 ms at 44.1 kHz: 5.4 Hz bins, enough to separate notes down to ~90 Hz.
+const FRAME: usize = 8192;
+const HOP: usize = 4096;
+/// Peaks are taken from this range. Below it bins are wider than semitones,
+/// above it there is little but cymbal noise.
+const MIN_HZ: f32 = 80.0;
+const MAX_HZ: f32 = 5000.0;
+/// Width in bins of the local spectral level a peak must stand above.
+const LEVEL_WIDTH: usize = 41;
+/// How far above the local level a peak must stand to count.
+const PEAK_RATIO: f32 = 2.0;
+/// Width in semitones over which a peak spreads into neighbouring pitch classes.
+const SPREAD: f32 = 4.0 / 3.0;
+
+/// Key analyzer using a harmonic pitch-class profile and key-profile matching.
+pub struct KeyAnalyzer;
 
 impl Default for KeyAnalyzer {
     fn default() -> Self {
@@ -24,160 +40,133 @@ impl Default for KeyAnalyzer {
     }
 }
 
+/// A spectral peak: frequency in Hz and how far it stands above its surroundings.
+#[derive(Debug, Clone, Copy)]
+struct Peak {
+    hz: f32,
+    weight: f32,
+}
+
 impl KeyAnalyzer {
-    /// Create a new key analyzer with default settings.
     pub fn new() -> Self {
-        Self {
-            fft_size: 4096,
-            hop_size: 2048,
-        }
+        Self
     }
 
-    /// Krumhansl-Kessler major key profile.
-    /// Weights for each pitch class (C, C#, D, ..., B) in a major key.
+    /// Krumhansl-Kessler major key profile (C major)
     const MAJOR_PROFILE: [f32; 12] = [
         6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
     ];
 
-    /// Krumhansl-Kessler minor key profile.
-    /// Weights for each pitch class (C, C#, D, ..., B) in a minor key.
+    /// Krumhansl-Kessler minor key profile (C minor)
     const MINOR_PROFILE: [f32; 12] = [
         6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
     ];
 
-    /// Compute chromagram from audio samples.
-    fn compute_chromagram(&self, samples: &[f32], sample_rate: u32) -> [f32; 12] {
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(self.fft_size);
+    /// Spectral peaks of every frame.
+    fn frame_peaks(&self, samples: &[f32], sample_rate: u32) -> Vec<Vec<Peak>> {
+        let mut stft = Stft::new(FRAME, HOP);
+        let bin_hz = stft.bin_hz(sample_rate);
+        let lo = ((MIN_HZ / bin_hz) as usize).max(1);
+        let hi = ((MAX_HZ / bin_hz) as usize).min(stft.bins() - 2);
 
-        // Hann window
-        let window: Vec<f32> = (0..self.fft_size)
-            .map(|i| {
-                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / self.fft_size as f32).cos())
-            })
-            .collect();
-
-        let mut chroma_sum = [0.0f32; 12];
-        let mut frame_count = 0;
-
-        // Frequency resolution
-        let freq_resolution = sample_rate as f32 / self.fft_size as f32;
-
-        // Process frames
-        let mut pos = 0;
-        while pos + self.fft_size <= samples.len() {
-            // Apply window and prepare complex buffer
-            let mut buffer: Vec<Complex<f32>> = samples[pos..pos + self.fft_size]
-                .iter()
-                .zip(window.iter())
-                .map(|(s, w)| Complex::new(s * w, 0.0))
-                .collect();
-
-            // Compute FFT
-            fft.process(&mut buffer);
-
-            // Compute magnitudes and accumulate into pitch classes
-            let frame_chroma = self.fft_to_chroma(&buffer, freq_resolution);
-
-            for (i, val) in frame_chroma.iter().enumerate() {
-                chroma_sum[i] += val;
+        let mut frames = Vec::with_capacity(stft.frame_count(samples.len()));
+        stft.for_each_frame(samples, |_, mags| {
+            let level = moving_average(mags, LEVEL_WIDTH);
+            let loudest = mags[lo..=hi].iter().copied().fold(0.0f32, f32::max);
+            let mut peaks = Vec::new();
+            if loudest > 1e-6 {
+                for b in lo..=hi {
+                    let m = mags[b];
+                    if m > mags[b - 1] && m >= mags[b + 1] && m > PEAK_RATIO * level[b] && m > 1e-3 * loudest {
+                        // Refine the frequency between bins on the log spectrum.
+                        let (a, c) = (mags[b - 1].max(1e-12).ln(), mags[b + 1].max(1e-12).ln());
+                        let mid = m.ln();
+                        let denom = a - 2.0 * mid + c;
+                        let offset = if denom.abs() > f32::EPSILON {
+                            (0.5 * (a - c) / denom).clamp(-0.5, 0.5)
+                        } else {
+                            0.0
+                        };
+                        peaks.push(Peak {
+                            hz: (b as f32 + offset) * bin_hz,
+                            weight: m / level[b],
+                        });
+                    }
+                }
             }
-
-            frame_count += 1;
-            pos += self.hop_size;
-        }
-
-        // Average chromagram
-        if frame_count > 0 {
-            for val in &mut chroma_sum {
-                *val /= frame_count as f32;
-            }
-        }
-
-        // Normalize chromagram
-        let max_val = chroma_sum
-            .iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .copied()
-            .unwrap_or(1.0)
-            .max(0.001);
-
-        for val in &mut chroma_sum {
-            *val /= max_val;
-        }
-
-        chroma_sum
+            frames.push(peaks);
+        });
+        frames
     }
 
-    /// Convert FFT magnitudes to chroma bins.
-    fn fft_to_chroma(&self, fft_buffer: &[Complex<f32>], freq_resolution: f32) -> [f32; 12] {
-        let mut chroma = [0.0f32; 12];
-
-        // Only process positive frequencies up to Nyquist
-        let num_bins = self.fft_size / 2;
-
-        for bin in 1..num_bins {
-            let freq = bin as f32 * freq_resolution;
-
-            // Only consider frequencies in musical range (roughly 50Hz - 5000Hz)
-            if freq < 50.0 || freq > 5000.0 {
-                continue;
-            }
-
-            // Convert frequency to pitch class (0 = C, 1 = C#, etc.)
-            let pitch_class = self.freq_to_pitch_class(freq);
-            let magnitude = fft_buffer[bin].norm();
-
-            // Use magnitude squared for more weight on strong frequencies
-            chroma[pitch_class] += magnitude * magnitude;
+    /// The track's deviation from A440 in cents, from where its peaks fall
+    /// between semitones (a circular mean: -50 and +50 cents are neighbours).
+    fn tuning_cents(frames: &[Vec<Peak>]) -> f32 {
+        let (mut x, mut y) = (0.0f64, 0.0f64);
+        for peak in frames.iter().flatten() {
+            let cents = 1200.0 * (peak.hz / 440.0).log2();
+            let angle = 2.0 * PI * cents / 100.0;
+            x += (peak.weight * angle.cos()) as f64;
+            y += (peak.weight * angle.sin()) as f64;
         }
-
-        chroma
+        if x == 0.0 && y == 0.0 {
+            0.0
+        } else {
+            (y.atan2(x) as f32) * 100.0 / (2.0 * PI)
+        }
     }
 
-    /// Convert frequency (Hz) to pitch class (0-11).
-    fn freq_to_pitch_class(&self, freq: f32) -> usize {
-        // A4 = 440 Hz, A is pitch class 9
-        // MIDI note number = 69 + 12 * log2(freq / 440)
-        // Pitch class = MIDI note number % 12
-
-        let midi_note = 69.0 + 12.0 * (freq / 440.0).log2();
-        let pitch_class = (midi_note.round() as i32).rem_euclid(12) as usize;
-        pitch_class
+    /// Sum of per-frame normalised pitch-class profiles, normalised to a peak of 1.
+    fn chromagram(frames: &[Vec<Peak>], tuning_cents: f32) -> [f32; 12] {
+        let reference = 440.0 * 2f32.powf(tuning_cents / 1200.0);
+        let mut total = [0.0f32; 12];
+        for peaks in frames {
+            let mut chroma = [0.0f32; 12];
+            for peak in peaks {
+                let semitone = 69.0 + 12.0 * (peak.hz / reference).log2();
+                let nearest = semitone.round();
+                for pitch in [nearest - 1.0, nearest, nearest + 1.0] {
+                    let d = semitone - pitch;
+                    if d.abs() < SPREAD / 2.0 {
+                        let w = (PI * d / SPREAD).cos();
+                        chroma[(pitch as i32).rem_euclid(12) as usize] += peak.weight * w * w;
+                    }
+                }
+            }
+            let max = chroma.iter().copied().fold(0.0f32, f32::max);
+            if max > 0.0 {
+                for (t, c) in total.iter_mut().zip(chroma) {
+                    *t += c / max;
+                }
+            }
+        }
+        let max = total.iter().copied().fold(0.0f32, f32::max).max(1e-9);
+        total.map(|t| t / max)
     }
 
-    /// Correlate chromagram with key profiles and find best match.
+    /// Find the key whose profile best matches the chromagram.
     fn find_best_key(&self, chroma: &[f32; 12]) -> (MusicalKey, f32) {
         let mut best_key = MusicalKey::CMajor;
         let mut best_correlation = f32::NEG_INFINITY;
 
-        // Test all 24 keys (12 major + 12 minor)
         for root in 0..12 {
-            // Rotate the chromagram so root becomes index 0
             let rotated = self.rotate_chroma(chroma, root);
 
-            // Test major key
             let major_corr = self.pearson_correlation(&rotated, &Self::MAJOR_PROFILE);
-            let major_key = Self::pitch_class_to_major_key(root);
-
             if major_corr > best_correlation {
                 best_correlation = major_corr;
-                best_key = major_key;
+                best_key = Self::pitch_class_to_major_key(root);
             }
 
-            // Test minor key
             let minor_corr = self.pearson_correlation(&rotated, &Self::MINOR_PROFILE);
-            let minor_key = Self::pitch_class_to_minor_key(root);
-
             if minor_corr > best_correlation {
                 best_correlation = minor_corr;
-                best_key = minor_key;
+                best_key = Self::pitch_class_to_minor_key(root);
             }
         }
 
-        // Convert correlation to confidence (correlation is typically 0.3-0.9)
+        // Map correlation into a 0.0 to 1.0 confidence.
         let confidence = ((best_correlation - 0.3) / 0.6).clamp(0.0, 1.0);
-
         (best_key, confidence)
     }
 
@@ -190,7 +179,7 @@ impl KeyAnalyzer {
         rotated
     }
 
-    /// Compute Pearson correlation coefficient.
+    /// Compute Pearson correlation coefficient between two arrays.
     fn pearson_correlation(&self, a: &[f32; 12], b: &[f32; 12]) -> f32 {
         let mean_a: f32 = a.iter().sum::<f32>() / 12.0;
         let mean_b: f32 = b.iter().sum::<f32>() / 12.0;
@@ -266,16 +255,12 @@ impl Analyzer for KeyAnalyzer {
             return Err(AnalysisError::InsufficientData);
         }
 
-        // Use middle portion of the track (skip intro/outro which may be in different keys)
-        let start = samples.len() / 4;
-        let end = (samples.len() * 3) / 4;
-        let analysis_samples = &samples[start..end];
-
-        // Compute chromagram
-        let chromagram = self.compute_chromagram(analysis_samples, sample_rate);
-
-        // Find best matching key
-        let (key, confidence) = self.find_best_key(&chromagram);
+        let frames = self.frame_peaks(samples, sample_rate);
+        if frames.iter().all(Vec::is_empty) {
+            return Err(AnalysisError::InsufficientData);
+        }
+        let chroma = Self::chromagram(&frames, Self::tuning_cents(&frames));
+        let (key, confidence) = self.find_best_key(&chroma);
 
         Ok(AnalyzerOutput::Key { key, confidence })
     }
@@ -284,25 +269,83 @@ impl Analyzer for KeyAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::test_signals::{add_kick, add_tone, beat_times, silence};
 
-    #[test]
-    fn test_key_analyzer_creation() {
-        let analyzer = KeyAnalyzer::new();
-        assert_eq!(analyzer.fft_size, 4096);
+    const RATE: u32 = 44_100;
+
+    fn key_of(samples: &[f32]) -> MusicalKey {
+        match KeyAnalyzer::new().analyze(samples, RATE) {
+            Ok(AnalyzerOutput::Key { key, .. }) => key,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn hz(midi: f32, cents: f32) -> f32 {
+        440.0 * 2f32.powf((midi - 69.0 + cents / 100.0) / 12.0)
+    }
+
+    /// Chords (as MIDI notes) for two seconds each, over a kick on every beat.
+    fn progression(chords: &[&[f32]], cents: f32) -> Vec<f32> {
+        let secs = 2.0 * chords.len() as f64 * 2.0;
+        let mut samples = silence(RATE, secs);
+        for (i, chord) in chords.iter().cycle().take(chords.len() * 2).enumerate() {
+            let from = i as f64 * 2.0;
+            for &note in chord.iter() {
+                add_tone(&mut samples, RATE, from, from + 2.0, hz(note, cents), 0.1);
+                add_tone(&mut samples, RATE, from, from + 2.0, hz(note + 12.0, cents), 0.04);
+            }
+        }
+        for t in beat_times(128.0, 0.0, secs) {
+            add_kick(&mut samples, RATE, t, 0.8);
+        }
+        samples
     }
 
     #[test]
-    fn test_freq_to_pitch_class() {
-        let analyzer = KeyAnalyzer::new();
+    fn an_a_minor_progression_is_a_minor() {
+        // Am - F - C - G - Am - Dm - E
+        let chords: [&[f32]; 7] = [
+            &[57.0, 60.0, 64.0],
+            &[53.0, 57.0, 60.0],
+            &[48.0, 52.0, 55.0],
+            &[55.0, 59.0, 62.0],
+            &[57.0, 60.0, 64.0],
+            &[50.0, 53.0, 57.0],
+            &[52.0, 56.0, 59.0],
+        ];
+        assert_eq!(key_of(&progression(&chords, 0.0)), MusicalKey::AMinor);
+    }
 
-        // A4 = 440 Hz should map to pitch class 9 (A)
-        assert_eq!(analyzer.freq_to_pitch_class(440.0), 9);
+    #[test]
+    fn a_d_major_progression_is_d_major() {
+        // D - G - A - D - Bm - G - A - D
+        let chords: [&[f32]; 8] = [
+            &[50.0, 54.0, 57.0],
+            &[55.0, 59.0, 62.0],
+            &[57.0, 61.0, 64.0],
+            &[50.0, 54.0, 57.0],
+            &[59.0, 62.0, 66.0],
+            &[55.0, 59.0, 62.0],
+            &[57.0, 61.0, 64.0],
+            &[50.0, 54.0, 57.0],
+        ];
+        assert_eq!(key_of(&progression(&chords, 0.0)), MusicalKey::DMajor);
+    }
 
-        // C4 = 261.63 Hz should map to pitch class 0 (C)
-        assert_eq!(analyzer.freq_to_pitch_class(261.63), 0);
-
-        // E4 = 329.63 Hz should map to pitch class 4 (E)
-        assert_eq!(analyzer.freq_to_pitch_class(329.63), 4);
+    #[test]
+    fn a_detuned_master_keeps_its_key() {
+        // Fm - Bbm - C - Fm, 40 cents sharp: nearly a semitone up to F#m.
+        let chords: [&[f32]; 4] = [
+            &[53.0, 56.0, 60.0],
+            &[58.0, 61.0, 65.0],
+            &[48.0, 52.0, 55.0],
+            &[53.0, 56.0, 60.0],
+        ];
+        let samples = progression(&chords, 40.0);
+        let frames = KeyAnalyzer::new().frame_peaks(&samples, RATE);
+        let tuning = KeyAnalyzer::tuning_cents(&frames);
+        assert!((tuning - 40.0).abs() < 8.0, "{tuning}");
+        assert_eq!(key_of(&samples), MusicalKey::FMinor);
     }
 
     #[test]

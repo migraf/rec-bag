@@ -30,7 +30,7 @@ use rec_core::{
     FrequencyWaveformData, LibraryEntry, Playlist, Track, TrackAnalysis, WaveformPeaks,
 };
 use std::collections::HashSet;
-use std::sync::{mpsc, Arc, Mutex as StdMutex};
+use std::sync::{mpsc, Arc, Mutex as StdMutex, OnceLock};
 use uuid::Uuid;
 
 /// What one background analysis produced.
@@ -518,8 +518,46 @@ pub fn use_app_state() -> AppState {
     use_context::<AppState>()
 }
 
-/// Spawn background track analysis (waveform, BPM, key, beat grid detection).
-/// Uses std::thread::spawn for CPU-intensive work as per Dioxus docs.
+/// Work for one of the analysis threads.
+type AnalysisJob = Box<dyn FnOnce() + Send>;
+
+/// Run `job` on the shared analysis threads, started on first use.
+///
+/// A track's analysis already spreads its passes over several cores and holds
+/// the whole decoded track in memory, so a large selection is queued onto a
+/// few threads rather than given a thread per track.
+fn queue_analysis(job: AnalysisJob) {
+    static QUEUE: OnceLock<mpsc::Sender<AnalysisJob>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<AnalysisJob>();
+        let rx = Arc::new(StdMutex::new(rx));
+        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 4).clamp(1, 4));
+        for i in 0..workers {
+            let rx = Arc::clone(&rx);
+            let spawned = std::thread::Builder::new()
+                .name(format!("analysis-{i}"))
+                .spawn(move || loop {
+                    let job = match rx.lock() {
+                        Ok(rx) => rx.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(job) = job else { return };
+                    // A panicking track must not take the worker down with it.
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                        tracing::error!("track analysis panicked");
+                    }
+                });
+            if let Err(error) = spawned {
+                tracing::error!(%error, "could not start an analysis thread");
+            }
+        }
+        tx
+    });
+    let _ = queue.send(job);
+}
+
+/// Queue background track analysis (waveform, BPM, key, beat grid detection).
+/// Runs off the UI thread, as Dioxus asks of CPU-intensive work.
 /// Results are sent via channel and processed by `use_app_state_provider`'s poll loop.
 pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, audio: AudioInput, persist: bool) {
     if app_state.is_analyzing(track_id) {
@@ -530,10 +568,7 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, audio: AudioInp
     // Clone the sender before spawning (Sender is Send)
     let tx = (*app_state.analysis_tx.read()).clone();
 
-    // Spawn on a separate thread to avoid blocking UI
-    // As per Dioxus docs: "If you have an expensive task you need to run,
-    // you should spawn it on a separate thread using std::thread::spawn"
-    std::thread::spawn(move || {
+    queue_analysis(Box::new(move || {
         tracing::debug!(%track_id, ?audio, "starting track analysis");
 
         let result = match &audio {
@@ -556,6 +591,7 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, audio: AudioInp
                         first_beat_ms: bg.first_beat_ms,
                         beat_interval_ms: bg.beat_interval_ms,
                         beats: bg.beats,
+                        downbeat_index: bg.downbeat_index,
                     }),
                     bpm: result.bpm.map(|b| b.bpm),
                     key: result.key.map(|k| k.key.to_string()),
@@ -581,5 +617,5 @@ pub fn spawn_track_analysis(app_state: AppState, track_id: Uuid, audio: AudioInp
                 });
             }
         }
-    });
+    }));
 }

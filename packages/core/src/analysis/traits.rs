@@ -25,6 +25,7 @@ pub enum AnalyzerOutput {
         first_beat_ms: f64,
         beat_interval_ms: f64,
         beats: Vec<f64>,
+        downbeat_index: usize,
     },
 }
 

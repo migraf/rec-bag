@@ -150,6 +150,7 @@ pub fn DeckControl(props: DeckControlProps) -> Element {
     let beat_grid = props.track.as_ref().and_then(|t| {
         t.beat_grid.as_ref().map(|bg| BeatGrid {
             beats: bg.beats.clone(),
+            downbeat_index: bg.downbeat_index,
         })
     });
 

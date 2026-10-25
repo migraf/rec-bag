@@ -248,6 +248,7 @@ fn deck_info(deck: &Deck) -> DeckInfo {
         }),
         beat_grid: track.beat_grid.as_ref().map(|bg| BeatGrid {
             beats: bg.beats.clone(),
+            downbeat_index: bg.downbeat_index,
         }),
         bpm: track.bpm,
     }

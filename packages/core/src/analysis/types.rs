@@ -184,6 +184,9 @@ pub struct BeatGridResult {
     pub beat_interval_ms: f64,
     /// All beat positions in milliseconds.
     pub beats: Vec<f64>,
+    /// Index in `beats` of the first downbeat; bars start every four beats from it.
+    #[serde(default)]
+    pub downbeat_index: usize,
 }
 
 impl BeatGridResult {
@@ -202,9 +205,9 @@ impl BeatGridResult {
         self.beats.len() / 4
     }
 
-    /// Check if a beat is the start of a bar (every 4th beat).
+    /// Check if a beat is the start of a bar (every 4th beat from the downbeat).
     pub fn is_bar_start(&self, beat_index: usize) -> bool {
-        beat_index % 4 == 0
+        beat_index % 4 == self.downbeat_index % 4
     }
 
     /// Get beat position as fraction of total duration.

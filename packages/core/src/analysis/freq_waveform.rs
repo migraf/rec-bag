@@ -3,7 +3,7 @@
 //! Extracts three frequency bands (low/mid/high) for Serato/rekordbox-style
 //! colored waveform display.
 
-use super::fft::{normalize, FftProcessor, FrequencyBands, WindowType};
+use super::fft::{normalize, FrequencyBands, Stft};
 use super::traits::{Analyzer, AnalyzerOutput};
 use super::types::AnalysisError;
 
@@ -31,7 +31,7 @@ impl FrequencyWaveformAnalyzer {
     pub fn new() -> Self {
         Self {
             points_per_second: POINTS_PER_SECOND,
-            fft_size: 2048,
+            fft_size: 1024,
             bands: FrequencyBands::default(),
         }
     }
@@ -56,56 +56,31 @@ impl FrequencyWaveformAnalyzer {
     }
 
     /// Extract frequency bands from audio samples.
+    ///
+    /// One frame is centred on each output point. The frame is longer than a
+    /// point so the bass band still spans a few bins; neighbouring frames
+    /// overlap, which also keeps the drawing smooth.
     fn extract_bands(&self, samples: &[f32], sample_rate: u32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let samples_per_point = sample_rate as usize / self.points_per_second;
-        let hop_size = self.fft_size / 4; // 75% overlap for smooth results
-
-        let mut processor = FftProcessor::with_bands(self.fft_size, WindowType::Hann, self.bands);
-
-        let mut low_peaks = Vec::new();
-        let mut mid_peaks = Vec::new();
-        let mut high_peaks = Vec::new();
-
-        // Process in chunks corresponding to output points
         let num_points = samples.len() / samples_per_point;
 
+        let mut stft = Stft::new(self.fft_size, samples_per_point);
+        let bin_hz = stft.bin_hz(sample_rate);
+        let bins = stft.bins();
+        let low_bin = ((self.bands.low_cutoff / bin_hz) as usize).clamp(1, bins);
+        let high_bin = ((self.bands.high_cutoff / bin_hz) as usize).clamp(low_bin, bins);
+        let rms = |band: &[f32]| (band.iter().map(|m| m * m).sum::<f32>() / band.len().max(1) as f32).sqrt();
+
+        let mut low_peaks = Vec::with_capacity(num_points);
+        let mut mid_peaks = Vec::with_capacity(num_points);
+        let mut high_peaks = Vec::with_capacity(num_points);
+        let mut mags = vec![0.0f32; bins];
         for point_idx in 0..num_points {
-            let chunk_start = point_idx * samples_per_point;
-            let chunk_end = (chunk_start + samples_per_point).min(samples.len());
-
-            // Accumulate band energies over multiple FFT frames in this chunk
-            let mut low_acc = 0.0f32;
-            let mut mid_acc = 0.0f32;
-            let mut high_acc = 0.0f32;
-            let mut frame_count = 0;
-
-            let mut frame_start = chunk_start;
-            while frame_start + self.fft_size <= chunk_end {
-                let frame = &samples[frame_start..frame_start + self.fft_size];
-                let energies = processor.process_frame(frame, sample_rate);
-
-                low_acc = low_acc.max(energies.low);
-                mid_acc = mid_acc.max(energies.mid);
-                high_acc = high_acc.max(energies.high);
-                frame_count += 1;
-
-                frame_start += hop_size;
-            }
-
-            // If no complete frames in chunk, use partial frame
-            if frame_count == 0 && chunk_end > chunk_start {
-                let mut padded = vec![0.0f32; self.fft_size];
-                let available = chunk_end - chunk_start;
-                padded[..available].copy_from_slice(&samples[chunk_start..chunk_end]);
-                let energies = processor.process_frame(&padded, sample_rate);
-                low_acc = energies.low;
-                mid_acc = energies.mid;
-                high_acc = energies.high;
-            }
-
-            low_peaks.push(low_acc);
-            mid_peaks.push(mid_acc);
-            high_peaks.push(high_acc);
+            let centre = point_idx * samples_per_point + samples_per_point / 2;
+            stft.magnitudes_at(samples, centre, &mut mags);
+            low_peaks.push(rms(&mags[..low_bin]));
+            mid_peaks.push(rms(&mags[low_bin..high_bin]));
+            high_peaks.push(rms(&mags[high_bin..]));
         }
 
         // Normalize each band independently

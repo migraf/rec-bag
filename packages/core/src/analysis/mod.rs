@@ -1,20 +1,27 @@
 //! Audio analysis module for waveform, BPM, key, and beat grid detection.
 //!
-//! This module provides a unified analysis pipeline that extracts multiple
-//! features from audio files in a single pass.
+//! A track is decoded once. Every pass that reads only the audio (waveforms,
+//! onset envelope, kick transients, band energies, key) then runs at the same
+//! time on its own thread; the tempo, grid and downbeat stages, which build on
+//! those passes, follow.
 
+mod attack;
 mod beatgrid;
 mod bpm;
+mod downbeat;
 mod fft;
 mod freq_waveform;
 mod key;
+mod onset;
+#[cfg(test)]
+mod test_signals;
 mod traits;
 mod types;
 mod waveform;
 
 pub use beatgrid::BeatGridAnalyzer;
 pub use bpm::BpmAnalyzer;
-pub use fft::{BandEnergies, FftProcessor, FrequencyBands, WindowType};
+pub use fft::FrequencyBands;
 pub use freq_waveform::FrequencyWaveformAnalyzer;
 pub use key::KeyAnalyzer;
 pub use traits::{Analyzer, AnalyzerOutput};
@@ -29,9 +36,14 @@ pub use waveform::WaveformAnalyzer;
 /// Files longer than this are analyzed using only the first portion.
 const MAX_DECODE_SAMPLES: usize = 100_000_000;
 
+use attack::Transients;
+use beatgrid::fit_grid;
+use downbeat::{band_frames, downbeat_phase};
+use onset::onset_envelope;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
+use std::thread::ScopedJoinHandle;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -55,6 +67,21 @@ pub fn analyze_audio_bytes(bytes: Arc<[u8]>) -> Result<AnalysisResult, AnalysisE
     analyze_samples(samples, sample_rate)
 }
 
+/// The result of a stage run on its own thread; a panic there is reported as a
+/// failed stage rather than taking the caller's thread down with it.
+fn joined<T>(handle: ScopedJoinHandle<'_, Result<T, AnalysisError>>) -> Result<T, AnalysisError> {
+    handle
+        .join()
+        .unwrap_or_else(|_| Err(AnalysisError::AnalysisFailed("analysis stage panicked".into())))
+}
+
+/// Log a failed stage and carry on without its result.
+fn logged<T>(stage: &str, result: Result<T, AnalysisError>) -> Option<T> {
+    result
+        .map_err(|e| eprintln!("{stage} analysis failed: {e}"))
+        .ok()
+}
+
 /// Run every analyzer over decoded mono samples.
 fn analyze_samples(samples: Vec<f32>, sample_rate: u32) -> Result<AnalysisResult, AnalysisError> {
     if samples.is_empty() {
@@ -62,82 +89,67 @@ fn analyze_samples(samples: Vec<f32>, sample_rate: u32) -> Result<AnalysisResult
     }
 
     let duration_secs = samples.len() as f64 / sample_rate as f64;
+    let samples = samples.as_slice();
 
-    // Run analyzers
-    let waveform_analyzer = WaveformAnalyzer::new();
-    let freq_waveform_analyzer = FrequencyWaveformAnalyzer::new();
-    let bpm_analyzer = BpmAnalyzer::new();
-    let key_analyzer = KeyAnalyzer::new();
-    let beat_grid_analyzer = BeatGridAnalyzer::new();
+    let (waveform, freq_waveform, key, transients, frames, onsets) = std::thread::scope(|scope| {
+        let waveform = scope.spawn(|| WaveformAnalyzer::new().analyze(samples, sample_rate));
+        let freq_waveform =
+            scope.spawn(|| FrequencyWaveformAnalyzer::new().analyze(samples, sample_rate));
+        let key = scope.spawn(|| KeyAnalyzer::new().analyze(samples, sample_rate));
+        let transients = scope.spawn(|| Ok(Transients::new(samples, sample_rate)));
+        let frames = scope.spawn(|| Ok(band_frames(samples, sample_rate)));
+        let onsets = onset_envelope(samples, sample_rate);
+        (
+            joined(waveform),
+            joined(freq_waveform),
+            joined(key),
+            joined(transients),
+            joined(frames),
+            onsets,
+        )
+    });
 
-    // Extract simple waveform (for backward compatibility)
-    let waveform_peaks = match waveform_analyzer.analyze(&samples, sample_rate) {
-        Ok(AnalyzerOutput::Waveform { peaks }) => peaks,
-        Ok(_) => Vec::new(),
-        Err(e) => {
-            eprintln!("Waveform analysis failed: {}", e);
-            Vec::new()
-        }
+    let waveform_peaks = match logged("Waveform", waveform) {
+        Some(AnalyzerOutput::Waveform { peaks }) => peaks,
+        _ => Vec::new(),
     };
-
-    // Extract frequency-band waveform
-    let freq_waveform = match freq_waveform_analyzer.analyze(&samples, sample_rate) {
-        Ok(AnalyzerOutput::FrequencyWaveform { low, mid, high }) => {
+    let freq_waveform = match logged("Frequency waveform", freq_waveform) {
+        Some(AnalyzerOutput::FrequencyWaveform { low, mid, high }) => {
             Some(FrequencyWaveform { low, mid, high })
         }
-        Ok(_) => None,
-        Err(e) => {
-            eprintln!("Frequency waveform analysis failed: {}", e);
-            None
-        }
+        _ => None,
+    };
+    let key = match logged("Key", key) {
+        Some(AnalyzerOutput::Key { key, confidence }) => Some(KeyResult { key, confidence }),
+        _ => None,
     };
 
-    // Detect BPM
-    let bpm = match bpm_analyzer.analyze(&samples, sample_rate) {
-        Ok(AnalyzerOutput::Bpm { bpm, confidence }) => Some(BpmResult { bpm, confidence }),
-        Ok(_) => None,
-        Err(e) => {
-            eprintln!("BPM detection failed: {}", e);
-            None
+    // Tempo from the whole track, then a grid fitted on the kicks, whose
+    // period is the precise BPM.
+    let estimate = BpmAnalyzer::new().estimate(&onsets);
+    let grid = match (estimate, logged("Transient", transients)) {
+        (Some(estimate), Some(transients)) => {
+            fit_grid(&onsets, &transients, estimate.bpm, duration_secs).map(|mut grid| {
+                if let Some(frames) = logged("Band", frames) {
+                    grid.downbeat = downbeat_phase(&frames, &grid, &transients, duration_secs);
+                }
+                grid
+            })
         }
+        _ => None,
     };
-
-    // Detect key
-    let key = match key_analyzer.analyze(&samples, sample_rate) {
-        Ok(AnalyzerOutput::Key { key, confidence }) => Some(KeyResult { key, confidence }),
-        Ok(_) => None,
-        Err(e) => {
-            eprintln!("Key detection failed: {}", e);
-            None
-        }
-    };
-
-    // Generate beat grid (requires BPM)
-    let beat_grid = if let Some(ref bpm_result) = bpm {
-        match beat_grid_analyzer.analyze_with_bpm(&samples, sample_rate, bpm_result.bpm) {
-            Ok(AnalyzerOutput::BeatGrid {
-                first_beat_ms,
-                beat_interval_ms,
-                beats,
-            }) => Some(BeatGridResult {
-                first_beat_ms,
-                beat_interval_ms,
-                beats,
-            }),
-            Ok(_) => None,
-            Err(e) => {
-                eprintln!("Beat grid detection failed: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let bpm = estimate.map(|estimate| BpmResult {
+        bpm: (grid.map_or(estimate.bpm, |g| g.bpm()) * 100.0).round() as f32 / 100.0,
+        confidence: estimate.confidence,
+    });
+    if bpm.is_none() {
+        eprintln!("BPM detection failed: no clear tempo");
+    }
 
     Ok(AnalysisResult {
         waveform_peaks,
         freq_waveform,
-        beat_grid,
+        beat_grid: grid.map(|g| g.to_result(duration_secs)),
         duration_secs,
         sample_rate,
         bpm,
@@ -183,6 +195,7 @@ fn decode_stream(mss: MediaSourceStream, hint: Hint) -> Result<(Vec<f32>, u32), 
     let track_id = track.id;
     let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
     let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+    let expected_frames = track.codec_params.n_frames.unwrap_or(0) as usize;
 
     // Create a decoder
     let mut decoder = symphonia::default::get_codecs()
@@ -190,7 +203,7 @@ fn decode_stream(mss: MediaSourceStream, hint: Hint) -> Result<(Vec<f32>, u32), 
         .map_err(|e| AnalysisError::Decoder(e.to_string()))?;
 
     // Collect all samples, capped at MAX_DECODE_SAMPLES to prevent OOM on very large files.
-    let mut all_samples: Vec<f32> = Vec::new();
+    let mut all_samples: Vec<f32> = Vec::with_capacity(expected_frames.min(MAX_DECODE_SAMPLES));
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     // Read all packets
