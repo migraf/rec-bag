@@ -7,7 +7,7 @@
 
 use crate::services::catalog::LoadedTrack;
 use dioxus::prelude::*;
-use rec_core::{AudioEngine, AudioInput, DeckState, Track};
+use rec_core::{AudioEngine, AudioInput, ChannelMix, DeckState, Track};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use ui::{DeckDisplayState, StreamCredit};
@@ -28,10 +28,15 @@ pub trait DeckAudio {
     fn stop(&mut self, index: usize);
     fn seek(&mut self, index: usize, position: Duration);
     fn set_volume(&mut self, index: usize, volume: f32);
+    fn set_mix(&mut self, index: usize, mix: ChannelMix);
     fn state(&self, index: usize) -> DeckState;
     fn position(&self, index: usize) -> Duration;
     fn volume(&self, index: usize) -> f32;
+    fn mix(&self, index: usize) -> ChannelMix;
     fn is_finished(&self, index: usize) -> bool;
+    /// Move the crossfader, from -1 (only deck one) to 1 (only deck two).
+    fn set_crossfader(&mut self, position: f32);
+    fn crossfader(&self) -> f32;
 }
 
 impl DeckAudio for AudioEngine {
@@ -61,6 +66,12 @@ impl DeckAudio for AudioEngine {
         let _ = AudioEngine::set_volume(self, index, volume);
     }
 
+    fn set_mix(&mut self, index: usize, mix: ChannelMix) {
+        if let Ok(deck) = self.deck_mut(index) {
+            deck.set_mix(mix);
+        }
+    }
+
     fn state(&self, index: usize) -> DeckState {
         self.deck(index)
             .map(|deck| deck.state())
@@ -77,10 +88,22 @@ impl DeckAudio for AudioEngine {
         self.deck(index).map(|deck| deck.volume()).unwrap_or(1.0)
     }
 
+    fn mix(&self, index: usize) -> ChannelMix {
+        self.deck(index).map(|deck| deck.mix()).unwrap_or_default()
+    }
+
     fn is_finished(&self, index: usize) -> bool {
         self.deck(index)
             .map(|deck| deck.is_finished())
             .unwrap_or(false)
+    }
+
+    fn set_crossfader(&mut self, position: f32) {
+        AudioEngine::set_crossfader(self, position);
+    }
+
+    fn crossfader(&self) -> f32 {
+        AudioEngine::crossfader(self)
     }
 }
 
@@ -93,6 +116,7 @@ pub struct DeckSnapshot {
     pub state: DeckDisplayState,
     pub position: Duration,
     pub volume: f32,
+    pub mix: ChannelMix,
 }
 
 impl Default for DeckSnapshot {
@@ -101,6 +125,7 @@ impl Default for DeckSnapshot {
             state: DeckDisplayState::Empty,
             position: Duration::ZERO,
             volume: 1.0,
+            mix: ChannelMix::neutral(),
         }
     }
 }
@@ -185,6 +210,11 @@ impl Deck {
 
     pub fn volume(&self) -> f32 {
         self.live.read().volume
+    }
+
+    /// Where this deck's channel strip knobs sit.
+    pub fn mix(&self) -> ChannelMix {
+        self.live.read().mix
     }
 
     pub fn is_playing(&self) -> bool {
@@ -293,6 +323,12 @@ impl Deck {
         self.refresh();
     }
 
+    /// Turn this deck's trim and EQ knobs.
+    pub fn set_mix(&self, mix: ChannelMix) {
+        self.with_audio(|audio, index| audio.set_mix(index, mix));
+        self.refresh();
+    }
+
     /// Apply `edit` to the Loaded Track when this deck holds `track_id`.
     ///
     /// Analysis results and metadata edits reach a playing track through here, so
@@ -361,6 +397,44 @@ fn observe(audio: &dyn DeckAudio, index: usize) -> DeckSnapshot {
         state,
         position: audio.position(index),
         volume: audio.volume(index),
+        mix: audio.mix(index),
+    }
+}
+
+/// The crossfader between deck one and deck two.
+#[derive(Clone, Copy)]
+pub struct Crossfader {
+    audio: Signal<SharedAudio>,
+    position: Signal<f32>,
+}
+
+impl Crossfader {
+    /// Open the crossfader on the given audio output. Must run inside a Dioxus scope.
+    pub fn new(audio: Signal<SharedAudio>) -> Self {
+        let position = audio
+            .read()
+            .lock()
+            .map(|audio| audio.crossfader())
+            .unwrap_or(0.0);
+        Self {
+            audio,
+            position: Signal::new(position),
+        }
+    }
+
+    /// Where the crossfader sits, from -1 (only deck one) to 1 (only deck two).
+    pub fn position(&self) -> f32 {
+        *self.position.read()
+    }
+
+    pub fn set(&self, position: f32) {
+        let shared = self.audio.read().clone();
+        let Ok(mut audio) = shared.lock() else {
+            return;
+        };
+        audio.set_crossfader(position);
+        let mut slot = self.position;
+        slot.set(audio.crossfader());
     }
 }
 
@@ -375,6 +449,7 @@ mod tests {
     #[derive(Default)]
     pub(super) struct FakeAudio {
         pub(super) decks: Vec<FakeDeck>,
+        crossfader: f32,
         calls: Vec<String>,
     }
 
@@ -383,6 +458,7 @@ mod tests {
         state: DeckState,
         pub(super) position: Duration,
         volume: f32,
+        mix: ChannelMix,
         finished: bool,
         refuse_load: bool,
         loaded_from: Option<AudioInput>,
@@ -394,6 +470,7 @@ mod tests {
                 state: DeckState::Empty,
                 position: Duration::ZERO,
                 volume: 1.0,
+                mix: ChannelMix::neutral(),
                 finished: false,
                 refuse_load: false,
                 loaded_from: None,
@@ -405,6 +482,7 @@ mod tests {
         pub(super) fn new() -> Self {
             Self {
                 decks: vec![FakeDeck::default(); DECK_COUNT],
+                crossfader: 0.0,
                 calls: Vec::new(),
             }
         }
@@ -440,6 +518,9 @@ mod tests {
         fn set_volume(&mut self, index: usize, volume: f32) {
             self.decks[index].volume = volume;
         }
+        fn set_mix(&mut self, index: usize, mix: ChannelMix) {
+            self.decks[index].mix = mix;
+        }
         fn state(&self, index: usize) -> DeckState {
             self.decks[index].state
         }
@@ -449,8 +530,17 @@ mod tests {
         fn volume(&self, index: usize) -> f32 {
             self.decks[index].volume
         }
+        fn mix(&self, index: usize) -> ChannelMix {
+            self.decks[index].mix
+        }
         fn is_finished(&self, index: usize) -> bool {
             self.decks[index].finished
+        }
+        fn set_crossfader(&mut self, position: f32) {
+            self.crossfader = position.clamp(-1.0, 1.0);
+        }
+        fn crossfader(&self) -> f32 {
+            self.crossfader
         }
     }
 
@@ -668,6 +758,37 @@ mod tests {
             decks[1].set_volume(0.25);
             assert_eq!(decks[1].volume(), 0.25);
             assert_eq!(decks[0].volume(), 1.0);
+        });
+    }
+
+    #[test]
+    fn a_turned_knob_reaches_its_own_deck_only() {
+        with_decks(|decks, fake| {
+            let mix = ChannelMix {
+                low: -1.0,
+                ..ChannelMix::neutral()
+            };
+            decks[0].set_mix(mix);
+            assert_eq!(decks[0].mix(), mix);
+            assert_eq!(decks[1].mix(), ChannelMix::neutral());
+            assert_eq!(fake.lock().unwrap().decks[0].mix, mix);
+        });
+    }
+
+    #[test]
+    fn the_crossfader_shows_where_the_audio_output_put_it() {
+        with_runtime(|| {
+            let fake = Arc::new(StdMutex::new(FakeAudio::new()));
+            let shared: SharedAudio = fake.clone();
+            let crossfader = Crossfader {
+                audio: Signal::new_in_scope(shared, ScopeId::ROOT),
+                position: Signal::new_in_scope(0.0, ScopeId::ROOT),
+            };
+            crossfader.set(-0.5);
+            assert_eq!(crossfader.position(), -0.5);
+            crossfader.set(3.0);
+            assert_eq!(crossfader.position(), 1.0);
+            assert_eq!(fake.lock().unwrap().crossfader, 1.0);
         });
     }
 }

@@ -20,7 +20,7 @@ pub mod projection;
 pub mod test_support;
 
 use crate::services::catalog::{Catalog, CatalogError};
-use deck::{Deck, SharedAudio, DECK_COUNT};
+use deck::{Crossfader, Deck, SharedAudio, DECK_COUNT};
 use diagnostics::Diagnostics;
 use dioxus::prelude::*;
 use metadata::MetadataEdit;
@@ -56,6 +56,8 @@ pub type AnalysisReceiver = mpsc::Receiver<TrackAnalysisResult>;
 pub struct AppState {
     /// The playback decks, in deck order.
     decks: [Deck; DECK_COUNT],
+    /// The crossfader between deck one and deck two.
+    crossfader: Crossfader,
     /// The one Catalog, once the integration runtime has opened it.
     catalog: Signal<Option<Arc<Catalog>>>,
     /// The live Catalog projection every view browses.
@@ -83,6 +85,7 @@ impl AppState {
 
         Self {
             decks: std::array::from_fn(|index| Deck::new(audio, index)),
+            crossfader: Crossfader::new(audio),
             catalog: Signal::new(None),
             projection,
             diagnostics: Diagnostics::new(projection),
@@ -187,6 +190,11 @@ impl AppState {
             .checked_sub(1)
             .and_then(|index| self.decks.get(index))
             .copied()
+    }
+
+    /// The crossfader between deck one and deck two.
+    pub fn crossfader(&self) -> Crossfader {
+        self.crossfader
     }
 
     /// Re-read every deck's live state from the audio output.

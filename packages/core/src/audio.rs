@@ -2,7 +2,8 @@
 //!
 //! Provides configurable deck-based playback for DJ applications.
 
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use crate::mixer::{crossfader_gains, ChannelControls, ChannelMix, MixedSource};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
@@ -88,6 +89,12 @@ pub struct Deck {
     /// The audio currently decoded, kept so `stop` can rewind by re-decoding it.
     source: Option<AudioInput>,
     volume: f32,
+    /// Where the channel strip's knobs sit.
+    mix: ChannelMix,
+    /// How loud the crossfader lets this deck play.
+    crossfader_gain: f32,
+    /// The channel strip as the audio thread reads it, shared by every track loaded here.
+    controls: Arc<ChannelControls>,
     /// Track if audio has been loaded (separate from track metadata)
     has_audio: bool,
 }
@@ -104,8 +111,19 @@ impl Deck {
             state: DeckState::Empty,
             source: None,
             volume: 1.0,
+            mix: ChannelMix::neutral(),
+            crossfader_gain: 1.0,
+            controls: Arc::new(ChannelControls::default()),
             has_audio: false,
         })
+    }
+
+    /// Decode `input` through this deck's channel strip.
+    fn decode(&self, input: &AudioInput) -> Result<impl Source<Item = f32> + Send, AudioError> {
+        Ok(MixedSource::new(
+            input.decode()?.convert_samples(),
+            self.controls.clone(),
+        ))
     }
 
     /// Decode `input` onto this deck.
@@ -115,7 +133,7 @@ impl Deck {
     /// the catalog, not to audio output.
     pub fn load(&mut self, input: &AudioInput) -> Result<(), AudioError> {
         // Decode first, so a failure leaves the current track playing.
-        let source = input.decode()?;
+        let source = self.decode(input)?;
         // Create a fresh sink to ensure clean state
         self.sink = Sink::try_new(&self.stream_handle).map_err(|_| AudioError::StreamInit)?;
 
@@ -158,7 +176,7 @@ impl Deck {
 
         // Reload the audio if we have some
         if let Some(input) = &self.source {
-            if let Ok(source) = input.decode() {
+            if let Ok(source) = self.decode(input) {
                 self.sink.append(source);
                 self.sink.pause();
                 self.has_audio = true;
@@ -177,6 +195,22 @@ impl Deck {
     /// Get current volume.
     pub fn volume(&self) -> f32 {
         self.volume
+    }
+
+    /// Turn the channel strip's knobs.
+    pub fn set_mix(&mut self, mix: ChannelMix) {
+        self.mix = mix;
+        self.controls.set(self.mix, self.crossfader_gain);
+    }
+
+    /// Where the channel strip's knobs sit.
+    pub fn mix(&self) -> ChannelMix {
+        self.mix
+    }
+
+    fn set_crossfader_gain(&mut self, gain: f32) {
+        self.crossfader_gain = gain;
+        self.controls.set(self.mix, self.crossfader_gain);
     }
 
     /// Get current state.
@@ -220,6 +254,7 @@ pub struct AudioEngine {
     _stream: OutputStream,
     stream_handle: Arc<OutputStreamHandle>,
     decks: Vec<Deck>,
+    crossfader: f32,
 }
 
 impl AudioEngine {
@@ -238,6 +273,7 @@ impl AudioEngine {
             _stream: stream,
             stream_handle,
             decks,
+            crossfader: 0.0,
         })
     }
 
@@ -307,6 +343,23 @@ impl AudioEngine {
     pub fn set_volume(&mut self, deck_index: usize, volume: f32) -> Result<(), AudioError> {
         self.deck_mut(deck_index)?.set_volume(volume);
         Ok(())
+    }
+
+    /// Move the crossfader, from -1 (only deck one) to 1 (only deck two).
+    ///
+    /// Deck one sits on the left of the crossfader and deck two on the right; any
+    /// further deck bypasses it.
+    pub fn set_crossfader(&mut self, position: f32) {
+        self.crossfader = position.clamp(-1.0, 1.0);
+        let (left, right) = crossfader_gains(self.crossfader);
+        for (index, deck) in self.decks.iter_mut().enumerate().take(2) {
+            deck.set_crossfader_gain(if index == 0 { left } else { right });
+        }
+    }
+
+    /// Where the crossfader sits.
+    pub fn crossfader(&self) -> f32 {
+        self.crossfader
     }
 
     /// Stop all decks.

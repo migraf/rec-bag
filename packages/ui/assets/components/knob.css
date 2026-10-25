@@ -1,0 +1,69 @@
+/* Rotary knob for bipolar controls such as EQ and trim */
+
+.knob {
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    cursor: ns-resize;
+    touch-action: none;
+    user-select: none;
+    outline: none;
+}
+
+.knob:focus-visible {
+    box-shadow: 0 0 0 2px var(--knob-accent, var(--accent-primary));
+}
+
+.knob-dial {
+    display: block;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+}
+
+.knob-track,
+.knob-fill {
+    fill: none;
+    stroke-width: 3;
+    stroke-linecap: round;
+}
+
+.knob-track {
+    stroke: var(--bg-primary);
+}
+
+.knob-fill {
+    stroke: var(--knob-accent, var(--accent-primary));
+}
+
+.knob-cap {
+    fill: var(--bg-tertiary);
+    stroke: var(--border-color);
+    stroke-width: 1;
+    transition: stroke var(--transition-fast);
+}
+
+.knob:hover .knob-cap,
+.knob-dragging .knob-cap {
+    stroke: var(--knob-accent, var(--accent-primary));
+}
+
+.knob-pointer {
+    stroke: var(--text-primary);
+    stroke-width: 2;
+    stroke-linecap: round;
+}
+
+/* Turned all the way down: the band is killed */
+.knob-at-min .knob-pointer {
+    stroke: var(--danger);
+}
+
+/* Keeps a drag going when the pointer leaves the knob */
+.knob-drag-surface {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    cursor: ns-resize;
+}

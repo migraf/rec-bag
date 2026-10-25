@@ -17,8 +17,14 @@ pub use echo::Echo;
 mod deck;
 pub use deck::{DeckControl, DeckControlProps, DeckDisplayState, StreamCredit};
 
+mod knob;
+pub use knob::{Knob, KnobProps};
+
+mod mixer;
+pub use mixer::{Mixer, MixerProps};
+
 mod playlist_browser;
-pub use playlist_browser::{PlaylistBrowser, PlaylistBrowserProps, SourceBadge};
+pub use playlist_browser::{PlaylistBrowser, PlaylistBrowserProps};
 
 mod track_list;
 pub use track_list::{

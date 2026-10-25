@@ -15,6 +15,7 @@ pub mod audio;
 pub mod catalog;
 pub mod doctor;
 pub mod folder;
+pub mod mixer;
 pub mod playlist;
 pub mod provider;
 pub mod reconciliation;
@@ -57,6 +58,7 @@ pub use doctor::{
     WavExtensibleCheck,
 };
 pub use folder::{build_folder_tree, is_audio_extension, FolderNode};
+pub use mixer::ChannelMix;
 pub use playlist::{Playlist, PlaylistOrigin};
 pub use provider::{
     BoxFuture, ByteRange, CatalogAssetReadRequest, CatalogAssetReadResult, CatalogAssetReader,

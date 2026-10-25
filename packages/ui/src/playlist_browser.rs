@@ -5,7 +5,6 @@ use rec_core::{Playlist, SourceType};
 use uuid::Uuid;
 
 const PLAYLIST_BROWSER_CSS: Asset = asset!("/assets/components/playlist-browser.css");
-const SOURCE_BADGE_CSS: Asset = asset!("/assets/components/source-badge.css");
 
 /// Props for the PlaylistBrowser component.
 #[derive(Props, Clone, PartialEq)]
@@ -22,32 +21,44 @@ pub struct PlaylistBrowserProps {
     pub on_delete: EventHandler<Uuid>,
 }
 
-/// Names the catalog source a playlist or track comes from, linking to its page there.
-#[component]
-pub fn SourceBadge(source_type: SourceType, url: Option<String>) -> Element {
-    let (label, class) = match source_type {
-        SourceType::SoundCloud => ("SoundCloud", "source-badge source-soundcloud"),
-        SourceType::GoogleDrive => ("Drive", "source-badge"),
-        SourceType::Dropbox => ("Dropbox", "source-badge"),
-        SourceType::Local => ("Local", "source-badge"),
-        _ => ("Remote", "source-badge"),
-    };
-    rsx! {
-        document::Stylesheet { href: SOURCE_BADGE_CSS }
-        if let Some(url) = url {
-            a {
-                class: "{class}",
-                href: "{url}",
-                target: "_blank",
-                rel: "noopener noreferrer",
-                title: "Open on {label}",
-                onclick: move |e| e.stop_propagation(),
-                "{label}"
-            }
-        } else {
-            span { class: "{class}", "{label}" }
+/// The playlists sharing an origin: created here (`None`), or mirrored from one kind of source.
+struct PlaylistGroup<'a> {
+    source: Option<SourceType>,
+    playlists: Vec<&'a Playlist>,
+}
+
+impl PlaylistGroup<'_> {
+    fn label(&self) -> &'static str {
+        match self.source {
+            None => "My playlists",
+            Some(SourceType::SoundCloud) => "SoundCloud",
+            Some(SourceType::GoogleDrive) => "Google Drive",
+            Some(SourceType::Dropbox) => "Dropbox",
+            Some(SourceType::Local) => "Local",
+            Some(_) => "Remote",
         }
     }
+
+    fn class(&self) -> &'static str {
+        match self.source {
+            Some(SourceType::SoundCloud) => "playlist-group source-soundcloud",
+            _ => "playlist-group",
+        }
+    }
+}
+
+/// Groups playlists by origin, own playlists first, keeping their order within a group.
+fn group_by_origin(playlists: &[Playlist]) -> Vec<PlaylistGroup<'_>> {
+    let mut groups = vec![PlaylistGroup { source: None, playlists: Vec::new() }];
+    for playlist in playlists {
+        let source = playlist.origin.as_ref().map(|o| o.source_type);
+        match groups.iter_mut().find(|g| g.source == source) {
+            Some(group) => group.playlists.push(playlist),
+            None => groups.push(PlaylistGroup { source, playlists: vec![playlist] }),
+        }
+    }
+    groups.retain(|g| !g.playlists.is_empty());
+    groups
 }
 
 /// Playlist browser sidebar component.
@@ -55,6 +66,8 @@ pub fn SourceBadge(source_type: SourceType, url: Option<String>) -> Element {
 pub fn PlaylistBrowser(props: PlaylistBrowserProps) -> Element {
     let mut new_playlist_name = use_signal(|| String::new());
     let mut show_create_form = use_signal(|| false);
+    let mut collapsed_groups = use_signal(Vec::<Option<SourceType>>::new);
+    let groups = group_by_origin(&props.playlists);
 
     rsx! {
         document::Stylesheet { href: PLAYLIST_BROWSER_CSS }
@@ -105,36 +118,76 @@ pub fn PlaylistBrowser(props: PlaylistBrowserProps) -> Element {
                 }
             }
 
-            ul { class: "playlist-list",
-                for playlist in props.playlists.iter() {
+            div { class: "playlist-list",
+                for group in groups.iter() {
                     {
-                        let id = playlist.id;
-                        let is_selected = props.selected_id == Some(id);
-                        let origin = playlist.origin.clone();
+                        let source = group.source;
+                        let collapsed = collapsed_groups.read().contains(&source);
                         rsx! {
-                            li {
-                                key: "{id}",
-                                class: if is_selected { "playlist-item selected" } else { "playlist-item" },
-                                onclick: move |_| props.on_select.call(id),
-                                div { class: "playlist-info",
-                                    span { class: "playlist-name", "{playlist.name}" }
-                                    span { class: "playlist-count", "({playlist.tracks.len()})" }
-                                }
-                                if let Some(origin) = origin {
-                                    // Mirrored from a source: credited and linked back to it,
-                                    // and read-only because the next sync owns its contents.
-                                    SourceBadge {
-                                        source_type: origin.source_type,
-                                        url: origin.external_url,
-                                    }
-                                } else {
+                            section { key: "{group.label()}", class: "{group.class()}",
+                                // A lone group of own playlists needs no heading.
+                                if groups.len() > 1 || source.is_some() {
                                     button {
-                                        class: "btn-delete",
-                                        onclick: move |e| {
-                                            e.stop_propagation();
-                                            props.on_delete.call(id);
+                                        class: "playlist-group-header",
+                                        "aria-expanded": "{!collapsed}",
+                                        onclick: move |_| {
+                                            let mut collapsed = collapsed_groups.write();
+                                            match collapsed.iter().position(|s| *s == source) {
+                                                Some(i) => { collapsed.remove(i); }
+                                                None => collapsed.push(source),
+                                            }
                                         },
-                                        "×"
+                                        span { class: "playlist-group-chevron", if collapsed { "▸" } else { "▾" } }
+                                        span { class: "playlist-group-label", "{group.label()}" }
+                                        span { class: "playlist-group-count", "{group.playlists.len()}" }
+                                    }
+                                }
+                                if !collapsed {
+                                    ul {
+                                        for playlist in group.playlists.iter() {
+                                            {
+                                                let id = playlist.id;
+                                                let is_selected = props.selected_id == Some(id);
+                                                let label = group.label();
+                                                rsx! {
+                                                    li {
+                                                        key: "{id}",
+                                                        class: if is_selected { "playlist-item selected" } else { "playlist-item" },
+                                                        title: if source.is_some() { "Synced from {label}; edit it there" },
+                                                        onclick: move |_| props.on_select.call(id),
+                                                        span { class: "playlist-name", "{playlist.name}" }
+                                                        span { class: "playlist-count", "{playlist.tracks.len()}" }
+                                                        if let Some(origin) = &playlist.origin {
+                                                            // Mirrored playlists are read-only because the next
+                                                            // sync owns their contents; link back to the source instead.
+                                                            if let Some(url) = &origin.external_url {
+                                                                a {
+                                                                    class: "playlist-action",
+                                                                    href: "{url}",
+                                                                    target: "_blank",
+                                                                    rel: "noopener noreferrer",
+                                                                    title: "Open on {label}",
+                                                                    "aria-label": "Open {playlist.name} on {label}",
+                                                                    onclick: move |e| e.stop_propagation(),
+                                                                    "↗"
+                                                                }
+                                                            }
+                                                        } else {
+                                                            button {
+                                                                class: "playlist-action btn-delete",
+                                                                title: "Delete playlist",
+                                                                "aria-label": "Delete {playlist.name}",
+                                                                onclick: move |e| {
+                                                                    e.stop_propagation();
+                                                                    props.on_delete.call(id);
+                                                                },
+                                                                "×"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }

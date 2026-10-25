@@ -1,12 +1,13 @@
 //! Main DJ view with deck controls.
 
 use crate::state::browser::{use_library_browser, BrowseScope};
+use crate::state::deck::Deck;
 use crate::state::use_app_state;
 use crate::views::{load_selection_to_deck, use_context_menu};
 use dioxus::prelude::*;
 use ui::{
-    ContextMenu, ContextMenuAction, ContextMenuEvent, DeckControl, PlaylistBrowser, PlaylistInfo,
-    SearchBar, SelectionEvent, TrackList,
+    ContextMenu, ContextMenuAction, ContextMenuEvent, DeckControl, Mixer, PlaylistBrowser,
+    PlaylistInfo, SearchBar, SelectionEvent, TrackList,
 };
 use uuid::Uuid;
 
@@ -62,26 +63,44 @@ pub fn DjView() -> Element {
         "Library"
     };
 
+    let decks = app_state.decks();
+    let crossfader = app_state.crossfader();
+    let deck_control = |deck: Deck| {
+        rsx! {
+            DeckControl {
+                deck_number: deck.number(),
+                state: deck.state(),
+                track: deck.track(),
+                position: deck.position(),
+                volume: deck.volume(),
+                stream: deck.stream(),
+                loading: deck.loading(),
+                on_play: move |_| { deck.play() },
+                on_pause: move |_| { deck.pause() },
+                on_stop: move |_| { deck.stop() },
+                on_volume_change: move |volume| { deck.set_volume(volume) },
+                on_seek: move |position| { deck.seek(position) },
+                on_file_drop: |_| {}
+            }
+        }
+    };
+
     rsx! {
         div { class: "dj-view",
             div { class: "decks-container",
-                for deck in app_state.decks() {
-                    DeckControl {
-                        deck_number: deck.number(),
-                        state: deck.state(),
-                        track: deck.track(),
-                        position: deck.position(),
-                        volume: deck.volume(),
-                        stream: deck.stream(),
-                        loading: deck.loading(),
-                        on_play: move |_| { deck.play() },
-                        on_pause: move |_| { deck.pause() },
-                        on_stop: move |_| { deck.stop() },
-                        on_volume_change: move |volume| { deck.set_volume(volume) },
-                        on_seek: move |position| { deck.seek(position) },
-                        on_file_drop: |_| {}
-                    }
+                {deck_control(decks[0])}
+                Mixer {
+                    deck1: decks[0].mix(),
+                    deck2: decks[1].mix(),
+                    crossfader: crossfader.position(),
+                    on_mix_change: move |(number, mix)| {
+                        if let Some(deck) = app_state.deck(number) {
+                            deck.set_mix(mix);
+                        }
+                    },
+                    on_crossfader_change: move |position| crossfader.set(position)
                 }
+                {deck_control(decks[1])}
             }
 
             div { class: "browser-container",
