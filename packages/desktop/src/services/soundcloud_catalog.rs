@@ -536,6 +536,9 @@ impl CredentialStore for MemoryCredentialStore {
 
 /// Native OS credential-store adapter. The complete token generation is stored as one value so
 /// access and single-use refresh tokens cannot be observed from different generations.
+///
+/// Not the store the desktop composes: that is `services::credentials`, whose
+/// keyring addressing differs (see its module docs), so the two are not merged.
 #[cfg(feature = "desktop")]
 #[derive(Clone)]
 pub struct KeyringCredentialStore {

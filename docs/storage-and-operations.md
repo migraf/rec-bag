@@ -4,12 +4,14 @@
 
 A profile has zero or one active primary and any number of backups. Local directories and Google Drive folders can fill either role.
 
-- **Primary:** authoritative original audio assets.
-- **Backup:** verified replicas plus catalog snapshots; never promoted automatically.
-- **Drive cache:** disposable, size-limited local playback/analysis cache; not a backup.
-- **Catalog:** local `library.db`; contains metadata, mappings, jobs, checksums, and non-secret provider configuration.
+- **Primary:** authoritative original audio assets. Playback reads only the primary (or, for a track that is not on the primary yet, a catalog source file).
+- **Backup:** verified replicas plus catalog snapshots; never promoted automatically and never played from. When only a backup holds a track, rec_bag says so: copy the track to the primary, which restores it from the backup, instead of playing the backup copy.
+- **Offline cache:** disposable, size-limited local copies of primary files that are not on this computer (such as a Google Drive primary), under `cache/offline/<storage id>` in the profile; not a backup. Any storage can be cached; a local storage plays in place and needs none.
+- **Catalog:** local `library.db`; contains metadata, mappings, jobs, checksums, and non-secret provider configuration. Per-storage settings that rec_bag keeps for itself, such as transfer checkpoints, use the provider-neutral `storage.<storage id>.` key prefix.
 
 Existing folders are inventoried in place. rec_bag does not move files merely because a folder is selected. Source copy policy defaults to `AskBeforeCopying`; alternatives are `CheckOnly` and `AutomaticallyCopyEligibleFiles`.
+
+The primary can be replaced but not removed: disconnecting it, revoking an authorization it uses, or forgetting its data is refused. Migrate to another primary first (see [Primary migration](#primary-migration)), then release the old one.
 
 A verified primary write queues automatic backups. Scheduled and manual replication modes are also modeled. Unavailable storage retains its last known inventory and pending work; absence is not interpreted as deletion.
 
@@ -25,7 +27,7 @@ On removable/network storage, mount at a stable path before launching rec_bag. I
 
 ## Google Drive primary and backup
 
-After Google authorization, rec_bag creates a dedicated My Drive folder named `rec_bag Music`. It limits traversal to that app-created folder subtree, uses private `appProperties`, and disables Shared Drive behavior. Drive primary playback downloads to a verified local cache (default configured maximum: 10 GiB per storage).
+After Google authorization, rec_bag creates a dedicated My Drive folder named `rec_bag Music`. It limits traversal to that app-created folder subtree, uses private `appProperties`, and disables Shared Drive behavior. Drive primary playback downloads to the verified offline cache (default maximum: 10 GiB per storage).
 
 Before production use:
 
@@ -35,7 +37,7 @@ Before production use:
 4. Confirm the file remains private and under the app-created folder.
 5. Exercise cache eviction and offline failure behavior.
 
-Do not treat Google revision history or the Drive cache as an independent backup. Configure a second storage/provider and test restore.
+Do not treat Google revision history or the offline cache as an independent backup. Configure a second storage/provider and test restore.
 
 ## Primary migration
 
@@ -48,8 +50,10 @@ Use only the application migration flow:
 5. create a catalog snapshot;
 6. review final status and confirm;
 7. atomically switch roles;
-8. retain the old primary as a backup by default;
+8. retain the old primary as a backup by default (refused, before anything is copied, when the old primary sits in a catalog source's folder, because a backup must stay separate from every source; migrate without keeping it as a backup instead);
 9. run backup-gap reconciliation.
+
+A failed migration leaves the candidate configured but unused; retrying with the same location reuses it.
 
 Do not manually edit storage roles in SQLite. Do not delete or repurpose the old primary until catalog, asset, and playback checks pass and an independent backup is verified.
 
@@ -114,10 +118,10 @@ Review exact storage/object/version candidates before approval. Take a snapshot 
 The confirmed **Forget provider catalog data** action is destructive to current local provider-derived state:
 
 - SoundCloud deletes the source row and its account, occurrence, collection, external-playlist, sync, auth-metadata, and provider-provenance rows.
-- Google Drive disconnects the storage, purges its local cache/runtime, and deletes the storage row, inventory, locations, reconciliation findings, transfer/job history, and upload checkpoints.
+- A music storage of any provider is disconnected, its offline cache is purged, and its storage row, inventory, locations, reconciliation findings, transfer/job history, and settings (`storage.<storage id>.` and legacy `google_drive.upload.<storage id>.` keys) are deleted. The active primary cannot be forgotten; migrate first.
 - Both paths clear current catalog snapshot rows/triggers so stale snapshots are not presented as the current post-forget state.
 - Canonical tracks/playlists, owned original assets, and credentials are preserved unless separately revoked/deleted.
-- No SoundCloud or Google Drive remote file/account content is deleted. Independent exported/off-device snapshot copies require separate retention/deletion handling.
+- No stored audio files and no SoundCloud or Google Drive remote file/account content are deleted. Independent exported/off-device snapshot copies require separate retention/deletion handling.
 
 Create any required export before forgetting provider data. A new post-forget snapshot can be generated after the transaction commits.
 

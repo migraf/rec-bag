@@ -305,41 +305,6 @@ fn oversized_json_response_is_rejected() {
 }
 
 #[test]
-fn playback_cache_uses_verified_download_and_then_hits_locally() {
-    let directory = tempdir().unwrap();
-    let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-    let transport = MockTransport::new([
-        response(
-            200,
-            &format!(
-                r#"{{"id":"file","name":"file.mp3","sha256Checksum":"{expected}","capabilities":{{"canDownload":true}}}}"#
-            ),
-        ),
-        DriveHttpResponse {
-            status: 200,
-            headers: BTreeMap::new(),
-            body: b"abc".to_vec(),
-        },
-    ]);
-    let mut config =
-        GoogleDriveStoreConfig::new(Uuid::nil(), GoogleDriveFolder::new("restricted-root"));
-    config.cache = Some(CacheConfig {
-        directory: directory.path().join("cache"),
-        max_bytes: 10,
-    });
-    config.retry = RetryPolicy {
-        max_attempts: 1,
-        initial_backoff: Duration::ZERO,
-        max_backoff: Duration::ZERO,
-    };
-    let store = GoogleDriveMusicStore::new(config, transport, Tokens).unwrap();
-    let path = block_on(store.cache_for_playback("file")).unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), b"abc");
-    assert_eq!(store.cached_playback_path("file").unwrap(), Some(path));
-    assert_eq!(store.transport.requests().len(), 2);
-}
-
-#[test]
 fn api_pagination_resume_uses_one_page_token_and_deduplicates_ids() {
     let transport = MockTransport::new([
         response(
@@ -646,37 +611,6 @@ fn ranged_download_uses_exclusive_end_and_requires_partial_content() {
 }
 
 #[test]
-fn cache_keys_eviction_pinning_and_corruption_recovery_are_safe() {
-    let directory = tempdir().unwrap();
-    let cache = crate::cache::PlaybackCache::new(CacheConfig {
-        directory: directory.path().join("cache"),
-        max_bytes: 6,
-    })
-    .unwrap();
-    let hash = |bytes: &[u8]| {
-        use sha2::Digest;
-        ContentHash::sha256(format!("{:x}", sha2::Sha256::digest(bytes))).unwrap()
-    };
-    let first = cache.path_for("a/b");
-    assert_ne!(first, cache.path_for("a?b"));
-    std::fs::write(&first, b"aaa").unwrap();
-    cache.record("a/b", &first, 3, hash(b"aaa")).unwrap();
-    cache.set_pinned("a/b", true).unwrap();
-    let second = cache.path_for("second");
-    std::fs::write(&second, b"bbb").unwrap();
-    cache.record("second", &second, 3, hash(b"bbb")).unwrap();
-    let third = cache.path_for("third");
-    std::fs::write(&third, b"ccc").unwrap();
-    cache.record("third", &third, 3, hash(b"ccc")).unwrap();
-    assert!(cache.cached_path("a/b").unwrap().is_some());
-    assert!(cache.cached_path("second").unwrap().is_none());
-    std::fs::write(&first, b"bad").unwrap();
-    assert!(cache.cached_path("a/b").unwrap().is_none());
-    std::fs::write(directory.path().join("cache/cache-index.json"), b"not-json").unwrap();
-    assert!(cache.cached_path("third").unwrap().is_none());
-}
-
-#[test]
 fn download_verifies_provider_md5_and_removes_corrupt_temporary_file() {
     let directory = tempdir().unwrap();
     let store = store(MockTransport::new([
@@ -703,6 +637,84 @@ fn download_verifies_provider_md5_and_removes_corrupt_temporary_file() {
     assert!(!destination.exists());
 }
 
+const WRITABLE_FOLDER: &str = r#"{"id":"restricted-root","mimeType":"application/vnd.google-apps.folder","trashed":false,"capabilities":{"canAddChildren":true,"canListChildren":true,"canEdit":true,"canDownload":true}}"#;
+
+#[test]
+fn health_reports_probed_folder_capabilities() {
+    let transport = MockTransport::new([response(200, WRITABLE_FOLDER)]);
+    let store = store(transport);
+    let health = block_on(store.health()).unwrap();
+
+    assert_eq!(health.status, HealthStatus::Healthy);
+    assert_eq!(health.message, None);
+    assert!(health.capabilities.can_store_and_verify());
+    assert!(health.capabilities.supports_change_tracking);
+    assert!(!health.capabilities.can_create_containers);
+    assert!(health.capabilities.reports_hash(&HashAlgorithm::Sha256));
+    let requests = store.transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+    assert!(requests[0].url.contains("/files/restricted-root?"));
+    assert!(requests[0].url.contains("canAddChildren"));
+    assert!(requests[0].url.contains("canListChildren"));
+}
+
+#[test]
+fn read_only_folder_is_degraded_and_cannot_store() {
+    let transport = MockTransport::new([response(
+        200,
+        r#"{"id":"restricted-root","mimeType":"application/vnd.google-apps.folder","trashed":false,"capabilities":{"canAddChildren":false,"canListChildren":true,"canEdit":false,"canDownload":true}}"#,
+    )]);
+    let health = block_on(store(transport).health()).unwrap();
+
+    assert_eq!(health.status, HealthStatus::Degraded);
+    assert_eq!(health.message.as_deref(), Some("Drive folder is read-only"));
+    assert!(!health.capabilities.can_upload);
+    assert!(health.capabilities.can_inventory);
+    assert!(!health.capabilities.can_store_and_verify());
+}
+
+#[test]
+fn failed_probe_reports_no_capabilities() {
+    let cases = [
+        (
+            response(
+                404,
+                r#"{"error":{"message":"File not found: restricted-root."}}"#,
+            ),
+            HealthStatus::Unavailable,
+        ),
+        (
+            response(500, r#"{"error":{"message":"backend error"}}"#),
+            HealthStatus::Degraded,
+        ),
+        (response(200, "not json"), HealthStatus::Unavailable),
+    ];
+    for (failure, expected) in cases {
+        // Retryable failures are retried once by the test policy.
+        let transport = MockTransport::new([failure.clone(), failure]);
+        let health = block_on(store(transport).health()).unwrap();
+
+        assert_eq!(health.status, expected);
+        assert!(health.message.is_some());
+        assert_eq!(health.capabilities, StorageCapabilities::default());
+    }
+}
+
+#[test]
+fn trashed_or_non_folder_root_is_unavailable() {
+    for body in [
+        r#"{"id":"restricted-root","mimeType":"application/vnd.google-apps.folder","trashed":true,"capabilities":{"canAddChildren":true,"canListChildren":true,"canEdit":true}}"#,
+        r#"{"id":"restricted-root","mimeType":"audio/mpeg","trashed":false,"capabilities":{"canAddChildren":false,"canListChildren":false,"canEdit":true}}"#,
+    ] {
+        let transport = MockTransport::new([response(200, body)]);
+        let health = block_on(store(transport).health()).unwrap();
+
+        assert_eq!(health.status, HealthStatus::Unavailable);
+        assert_eq!(health.capabilities, StorageCapabilities::default());
+    }
+}
+
 #[test]
 fn satisfies_shared_music_asset_store_contract() {
     let directory = tempdir().unwrap();
@@ -710,7 +722,7 @@ fn satisfies_shared_music_asset_store_contract() {
     std::fs::write(&source, b"abc").unwrap();
     let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
     let transport = MockTransport::new([
-        response(200, r#"{"user":{"permissionId":"user"}}"#),
+        response(200, WRITABLE_FOLDER),
         response(200, r#"{"files":[]}"#),
         response_with_header(200, "Location", "https://upload/session", b""),
         response(
@@ -898,19 +910,4 @@ fn metadata_reads_legacy_asset_id_and_current_revision_is_identified() {
     .unwrap();
     assert!(!versions.versions[0].is_current);
     assert!(versions.versions[1].is_current);
-}
-
-#[test]
-fn playback_cache_runtime_is_usable_as_a_registry_trait_object() {
-    let directory = tempdir().unwrap();
-    let mut config =
-        GoogleDriveStoreConfig::new(Uuid::nil(), GoogleDriveFolder::new("restricted-root"));
-    config.cache = Some(CacheConfig {
-        directory: directory.path().join("cache"),
-        max_bytes: 10,
-    });
-    let store = GoogleDriveMusicStore::new(config, MockTransport::new([]), Tokens).unwrap();
-    let runtime: &dyn PlaybackCacheRuntime = &store;
-    assert_eq!(runtime.cached_playback_path("missing").unwrap(), None);
-    runtime.evict_playback_cache().unwrap();
 }

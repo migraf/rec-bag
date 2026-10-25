@@ -13,32 +13,29 @@ use std::{
 };
 
 use chrono::Utc;
-use music_storage_local::LocalMusicStorage;
+use music_storage::{
+    is_migrated_synthetic_storage, LiveStores, MusicStorages, MusicStoragesConfig,
+    ReplicationHandoff, StorageDrivers, StorageFault,
+};
 use rec_core::{
     AssetLocationFilter, AssetRepository, BoxFuture, CatalogSource, CatalogSourceKind,
-    MusicAssetStore, MusicStorageKind, MusicStorageRepository, RepositoryPageRequest,
-    SourceRepository, StorageRole, StorageVerificationStatus,
+    MusicStorageRepository, RepositoryPageRequest, SourceRepository, StorageRole,
+    StorageVerificationStatus,
 };
 use rec_persistence::TursoCatalog;
 use rec_sync::{VerificationCadence, VerificationRequest};
-use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Notify};
 use ui::{CleanupItemView, MusicManagementView};
 use uuid::Uuid;
 
 use super::{
-    backup::{BackupProviderRegistry, BackupService, DatabaseBackup, RetentionReview},
-    catalog_projection::CatalogViewBuilder,
-    google_drive::{
-        DriveFolderSelection, DriveRuntimeFactory, DriveRuntimeRegistry, GoogleCredential,
-        GoogleDriveFolderSelector, GoogleDrivePaths, GoogleDriveProvisioner, GoogleDriveService,
-        GoogleDriveServiceError, GoogleOAuth, GoogleOAuthCallback, GoogleOAuthRequest,
-        ProvisionedDrive, SelectedDriveFolder,
-    },
+    backup::{BackupService, DatabaseBackup, RetentionReview},
+    catalog_projection::project_dashboard,
     local_library::{
         LocalLibraryError, LocalLibraryService, LocalSelectionProvider, LocalSourceSelection,
         SelectionFuture,
     },
+    music_storage_slice::MusicStorageService,
     profile_manager::{
         AssumeOwnershipConfirmation, HeartbeatHandle, ManagerIdentity, OwnershipLease,
         OwnershipStatus, ProfileManager, ProfileManagerError,
@@ -52,10 +49,14 @@ use super::{
         ApiSoundCloudBrokerClient, OAuthUserAgent, ProductionSoundCloudConnectorFactory,
         SoundCloudCatalogService,
     },
+    storage_drivers::{google_drive::production_drive_driver, local::LocalDriver},
 };
 use crate::state::integration::{
     IntegrationError, IntegrationOutcome, IntegrationRequest, IntegrationSlice,
 };
+
+/// Offline cache budget for storages that do not set their own (10 GiB).
+const DEFAULT_OFFLINE_CACHE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 pub type IntegrationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<IntegrationOutcome, IntegrationError>> + Send + 'a>>;
@@ -134,28 +135,6 @@ pub trait CredentialStore: Send + Sync {
     fn delete<'a>(&'a self, key: &'a CredentialKey) -> CredentialFuture<'a, ()>;
 }
 
-/// Stable reference to an asset location without exposing provider SDK types.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AssetReference {
-    pub storage_id: String,
-    pub asset_id: String,
-}
-
-/// A playable local path or URL and whether it is a disposable cache entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedAsset {
-    pub uri: String,
-    pub cached: bool,
-}
-
-pub type AssetFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ResolvedAsset, IntegrationError>> + Send + 'a>>;
-
-/// Storage slices implement resolution; playback depends only on this interface.
-pub trait AssetResolver: Send + Sync {
-    fn resolve<'a>(&'a self, asset: &'a AssetReference) -> AssetFuture<'a>;
-}
-
 #[derive(Clone)]
 pub enum DesktopStartup {
     Ready(Arc<DesktopIntegration>),
@@ -194,19 +173,16 @@ pub struct DesktopIntegration {
     /// Where the catalog database lives, so a restore knows what it is replacing.
     catalog_path: PathBuf,
     registry: Arc<ProviderRegistry>,
-    projector: Arc<LocalLibraryService>,
     soundcloud: Arc<SoundCloudCatalogService>,
     backup: Arc<BackupService>,
     profile_manager: ProfileManager,
     ownership_lease: Mutex<OwnershipLease>,
     previous_owner_device: Option<String>,
-    drive_registry: Arc<DriveRuntimeRegistry>,
-    backup_providers: Arc<BackupProviderRegistry>,
+    storages: MusicStorages,
     /// Turso's local connection rejects concurrent operations. All UI and scheduler catalog
     /// access shares this gate while the desktop runtime owns the profile.
     catalog_operation_lock: Arc<Mutex<()>>,
     projection_lock: Mutex<()>,
-    asset_resolver: Arc<dyn AssetResolver>,
     wakes: BTreeMap<IntegrationSlice, Arc<Notify>>,
     shutdown: AtomicBool,
     shutdown_notify: Notify,
@@ -293,14 +269,42 @@ impl DesktopIntegration {
         tracing::info!("desktop integration startup: catalog opened and migrations completed");
         let mut startup_errors = Vec::new();
 
-        tracing::debug!("desktop integration startup: creating local-library services");
+        tracing::debug!("desktop integration startup: composing music storages");
         let credentials = production_credentials();
+        let selection = production_local_selection();
+        let live_stores = Arc::new(LiveStores::default());
+        let backup = Arc::new(BackupService::new(
+            catalog.clone(),
+            live_stores.clone(),
+            paths.staging.join("backup"),
+        ));
+        let drivers = StorageDrivers::new(vec![
+            Arc::new(LocalDriver::new(selection.clone())),
+            Arc::new(production_drive_driver(credentials.clone())?),
+        ]);
+        remove_legacy_drive_cache(&paths.root);
+        let storages = MusicStorages::new(
+            catalog.clone(),
+            drivers,
+            MusicStoragesConfig {
+                cache_root: paths.offline_cache.clone(),
+                staging_root: paths.staging.join("storage"),
+                default_cache_max_bytes: DEFAULT_OFFLINE_CACHE_MAX_BYTES,
+            },
+            live_stores,
+            backup.clone(),
+        );
+
+        tracing::debug!("desktop integration startup: creating local-library and storage services");
         let local = Arc::new(LocalLibraryService::new(
             catalog.clone(),
-            production_local_selection(),
+            selection,
+            storages.clone(),
         ));
+        let storage = Arc::new(MusicStorageService::new(catalog.clone(), storages.clone()));
         tracing::debug!("desktop integration startup: checking local-library migration");
-        match adopt_migrated_local_library(catalog.as_ref(), local.as_ref()).await {
+        match adopt_migrated_local_library(catalog.as_ref(), local.as_ref(), storage.as_ref()).await
+        {
             Ok(StartupAdoption::NotNeeded | StartupAdoption::Adopted) => {}
             Ok(StartupAdoption::NeedsSelection(message)) => {
                 startup_errors.push(provider_error(IntegrationSlice::LocalLibrary, message))
@@ -310,29 +314,6 @@ impl DesktopIntegration {
 
         tracing::debug!("desktop integration startup: loading SoundCloud configuration");
         let soundcloud = Arc::new(soundcloud_service(catalog.clone(), credentials.clone()).await?);
-        let google_oauth = production_google_oauth();
-        let drive_factory = production_drive_factory(
-            credentials.clone(),
-            google_oauth.clone(),
-            paths.drive_cache.clone(),
-        );
-        let drive_registry = Arc::new(DriveRuntimeRegistry::new(drive_factory));
-        let drive = Arc::new(GoogleDriveService::new(
-            catalog.clone(),
-            credentials.clone(),
-            production_google_provisioner(google_oauth, credentials)?,
-            drive_registry.clone(),
-            GoogleDrivePaths {
-                cache_root: paths.drive_cache,
-                staging_root: paths.staging.join("drive"),
-            },
-        ));
-        let backup_providers = Arc::new(BackupProviderRegistry::default());
-        let backup = Arc::new(BackupService::new(
-            catalog.clone(),
-            backup_providers.clone(),
-            paths.staging.join("backup"),
-        ));
         tracing::debug!(staging_path = %paths.staging.display(), "desktop integration startup: reconciling staging files");
         reconcile_staging(&paths.staging).map_err(|error| {
             startup_error(format!("Could not reconcile staging directory: {error}"))
@@ -342,39 +323,26 @@ impl DesktopIntegration {
         let mut registry = ProviderRegistry::default();
         registry.register(local.clone());
         registry.register(soundcloud.clone());
-        registry.register(drive.clone());
+        registry.register(storage);
         registry.register(backup.clone());
         registry.register(reconciliation);
 
-        tracing::debug!("desktop integration startup: registering configured storage providers");
-        initialize_storage_registries(
-            catalog.as_ref(),
-            drive_registry.clone(),
-            backup_providers.clone(),
-            &mut startup_errors,
-        )
-        .await;
+        tracing::debug!("desktop integration startup: opening configured storages");
+        open_storages(&storages, &mut startup_errors).await;
 
         tracing::info!(
             startup_warnings = startup_errors.len(),
             "desktop integration startup: services ready"
         );
-        let resolver = Arc::new(DesktopAssetResolver {
-            catalog: catalog.clone(),
-            drive,
-        });
         Ok(Arc::new(Self::from_parts(
             catalog,
             Arc::new(registry),
-            local,
             soundcloud,
             backup,
             manager,
             lease,
             previous_owner_device,
-            drive_registry,
-            backup_providers,
-            resolver,
+            storages,
             startup_errors,
         )))
     }
@@ -382,15 +350,12 @@ impl DesktopIntegration {
     fn from_parts(
         catalog: Arc<TursoCatalog>,
         registry: Arc<ProviderRegistry>,
-        projector: Arc<LocalLibraryService>,
         soundcloud: Arc<SoundCloudCatalogService>,
         backup: Arc<BackupService>,
         profile_manager: ProfileManager,
         ownership_lease: OwnershipLease,
         previous_owner_device: Option<String>,
-        drive_registry: Arc<DriveRuntimeRegistry>,
-        backup_providers: Arc<BackupProviderRegistry>,
-        asset_resolver: Arc<dyn AssetResolver>,
+        storages: MusicStorages,
         startup_errors: Vec<IntegrationError>,
     ) -> Self {
         let wakes = IntegrationSlice::ALL
@@ -401,17 +366,14 @@ impl DesktopIntegration {
             catalog_path: catalog.path().map(Path::to_path_buf).unwrap_or_default(),
             catalog,
             registry,
-            projector,
             soundcloud,
             backup,
             profile_manager,
             ownership_lease: Mutex::new(ownership_lease),
             previous_owner_device,
-            drive_registry,
-            backup_providers,
+            storages,
             catalog_operation_lock: Arc::new(Mutex::new(())),
             projection_lock: Mutex::new(()),
-            asset_resolver,
             wakes,
             shutdown: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
@@ -431,8 +393,9 @@ impl DesktopIntegration {
         &self.registry
     }
 
-    pub fn asset_resolver(&self) -> Arc<dyn AssetResolver> {
-        self.asset_resolver.clone()
+    /// Every music storage workflow, for every provider.
+    pub fn storages(&self) -> &MusicStorages {
+        &self.storages
     }
 
     /// Where tracks with no local file are streamed from.
@@ -542,47 +505,17 @@ impl DesktopIntegration {
         request: &IntegrationRequest,
         outcome: &mut IntegrationOutcome,
     ) {
-        let storage_changed = matches!(
-            request.event,
-            ui::MusicManagementEvent::CreatePrimary(_)
-                | ui::MusicManagementEvent::AddBackup(_)
-                | ui::MusicManagementEvent::PreparePrimaryMigration(_)
-        );
-        if storage_changed {
-            let mut registration_errors = Vec::new();
-            initialize_storage_registries(
-                self.catalog.as_ref(),
-                self.drive_registry.clone(),
-                self.backup_providers.clone(),
-                &mut registration_errors,
-            )
-            .await;
-            if !registration_errors.is_empty() {
-                append_outcome_message(
-                    outcome,
-                    format!(
-                        "Provider refresh deferred for {} storage(s): {}",
-                        registration_errors.len(),
-                        registration_errors
-                            .into_iter()
-                            .map(|error| error.message)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                );
+        match &request.event {
+            // Copies and migrations already hand their verified writes to
+            // replication; the report is part of the handler's message.
+            ui::MusicManagementEvent::CopyToPrimary(_)
+            | ui::MusicManagementEvent::PreparePrimaryMigration(_) => {}
+            ui::MusicManagementEvent::ApproveExternalChange { .. } => {
+                let report = self.backup.verified_primary_write(&[]).await;
+                append_outcome_message(outcome, report.message());
             }
-        }
-
-        let track_id = match &request.event {
-            ui::MusicManagementEvent::CopyToPrimary(track_id) => Uuid::parse_str(track_id).ok(),
-            ui::MusicManagementEvent::PreparePrimaryMigration(_)
-            | ui::MusicManagementEvent::ApproveExternalChange { .. } => None,
             _ => return,
-        };
-        let status =
-            plan_catalog_verified_writes(self.catalog.as_ref(), self.backup.as_ref(), track_id)
-                .await;
-        append_outcome_message(outcome, status.message());
+        }
 
         // One wake gives already-due durable work a chance to advance. Deferred jobs remain
         // persisted for the Stage 4 scheduler; this never changes primary-write success.
@@ -673,22 +606,13 @@ impl DesktopIntegration {
 
     /// Project the catalog into the dashboard view.
     ///
-    /// Reconciliation of the primary storage still belongs to the local slice, but the
-    /// view itself is provider-neutral: every Catalog Source and Music Storage is
-    /// included, and health is probed through each storage's registered store rather
-    /// than by asking one provider's slice to describe the others.
+    /// The view is provider-neutral: every Catalog Source and Music Storage is
+    /// included, reconciliation runs against the active primary, and health is
+    /// probed through each storage's open store.
     async fn project_catalog_view(&self) -> Result<MusicManagementView, IntegrationError> {
-        let projection = self.projector.reconcile_primary().await.map_err(|error| {
-            startup_error(format!("Could not reconcile the primary storage: {error}"))
-        })?;
-        CatalogViewBuilder {
-            catalog: self.catalog.as_ref(),
-            report: &projection.report,
-            providers: Some(self.backup_providers.as_ref()),
-        }
-        .build()
-        .await
-        .map_err(|error| startup_error(format!("Could not project the catalog: {error}")))
+        project_dashboard(self.catalog.as_ref(), &self.storages)
+            .await
+            .map_err(|error| startup_error(format!("Could not project the catalog: {error}")))
     }
 
     pub fn begin_shutdown(&self) {
@@ -957,84 +881,6 @@ impl SchedulerTasks for RuntimeSchedulerTasks {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct BackupHandoffStatus {
-    planned_assets: usize,
-    queued_jobs: usize,
-    deferred_targets: usize,
-    warnings: Vec<String>,
-}
-
-impl BackupHandoffStatus {
-    fn message(&self) -> String {
-        if self.planned_assets == 0 && self.warnings.is_empty() {
-            return "Backup handoff complete: no verified primary assets required planning".into();
-        }
-        let mut message = format!(
-            "Backup handoff: {} verified asset(s), {} durable job(s) queued, {} unavailable target(s) deferred",
-            self.planned_assets, self.queued_jobs, self.deferred_targets
-        );
-        if !self.warnings.is_empty() {
-            message.push_str("; non-blocking issues: ");
-            message.push_str(&self.warnings.join("; "));
-        }
-        message
-    }
-}
-
-async fn plan_catalog_verified_writes(
-    catalog: &TursoCatalog,
-    backup: &BackupService,
-    track_id: Option<Uuid>,
-) -> BackupHandoffStatus {
-    let mut status = BackupHandoffStatus::default();
-    let asset_ids = match track_id {
-        Some(track_id) => {
-            match AssetRepository::list_originals_for_track(catalog, track_id).await {
-                Ok(assets) => assets
-                    .into_iter()
-                    .map(|asset| asset.id())
-                    .collect::<Vec<_>>(),
-                Err(error) => {
-                    status
-                        .warnings
-                        .push(format!("could not resolve copied track assets: {error}"));
-                    return status;
-                }
-            }
-        }
-        None => Vec::new(),
-    };
-    if track_id.is_some() && asset_ids.is_empty() {
-        status
-            .warnings
-            .push("the copied track has no original asset to hand off".into());
-        return status;
-    }
-
-    let targets: Vec<Option<Uuid>> = if track_id.is_some() {
-        asset_ids.into_iter().map(Some).collect()
-    } else {
-        vec![None]
-    };
-    for asset_id in targets {
-        match backup
-            .handoff_verified_primary_assets(asset_id, Utc::now())
-            .await
-        {
-            Ok(handoff) => {
-                status.planned_assets += handoff.considered_assets;
-                status.queued_jobs += handoff.queued_jobs;
-                status.deferred_targets += handoff.deferred_targets;
-            }
-            Err(error) => status
-                .warnings
-                .push(format!("backup planning remains deferred: {error}")),
-        }
-    }
-    status
-}
-
 fn retention_candidate_views(review: &RetentionReview) -> Vec<CleanupItemView> {
     let mut rows = review
         .items
@@ -1237,7 +1083,8 @@ fn reconcile_staging(path: &std::path::Path) -> std::io::Result<()> {
 struct DesktopPaths {
     root: PathBuf,
     catalog: PathBuf,
-    drive_cache: PathBuf,
+    /// The offline cache root; one directory per storage.
+    offline_cache: PathBuf,
     staging: PathBuf,
 }
 
@@ -1258,10 +1105,21 @@ impl DesktopPaths {
         };
         Ok(Self {
             catalog: root.join("library.db"),
-            drive_cache: root.join("cache").join("google-drive"),
+            offline_cache: root.join("cache").join("offline"),
             staging: root.join("staging"),
             root,
         })
+    }
+}
+
+/// Deletes the offline cache Google Drive kept before the cache moved into
+/// `music_storage`. It is derived data, so failing to delete it only costs space.
+fn remove_legacy_drive_cache(data_root: &Path) {
+    let legacy = data_root.join("cache").join("google-drive");
+    if legacy.is_dir() {
+        if let Err(error) = std::fs::remove_dir_all(&legacy) {
+            tracing::warn!(path = %legacy.display(), %error, "could not delete the legacy Google Drive cache");
+        }
     }
 }
 
@@ -1340,6 +1198,7 @@ enum StartupAdoption {
 async fn adopt_migrated_local_library(
     catalog: &TursoCatalog,
     local: &LocalLibraryService,
+    storage: &MusicStorageService,
 ) -> Result<StartupAdoption, IntegrationError> {
     if MusicStorageRepository::get_active_primary(catalog)
         .await
@@ -1400,14 +1259,25 @@ async fn adopt_migrated_local_library(
         organize_by_artist: false,
         verify_after_copy: true,
     };
-    local
-        .adopt_migrated_library(source.id, &configuration)
-        .await
-        .map_err(|error| {
-            migration_adoption_error(format!(
-                "automatic in-place adoption failed: {error}. No files were moved; choose the existing library folder in Music Management to retry"
-            ))
-        })?;
+    // The primary is connected exactly at the source root, so connecting
+    // inventories the library where it is and reconciliation verifies every
+    // scanned file in place; nothing is copied or moved.
+    let adopted = async {
+        local
+            .scan_local_source(source.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        storage
+            .create_primary(&configuration)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    adopted.map_err(|error| {
+        migration_adoption_error(format!(
+            "automatic in-place adoption failed: {error}. No files were moved; choose the existing library folder in Music Management to retry"
+        ))
+    })?;
     Ok(StartupAdoption::Adopted)
 }
 
@@ -1481,13 +1351,6 @@ async fn configured_local_sources(
     Ok(sources)
 }
 
-fn is_migrated_synthetic_storage(storage: &rec_core::MusicStorage) -> bool {
-    storage.kind == MusicStorageKind::LocalDirectory
-        && storage.role == rec_core::StorageRole::Unassigned
-        && storage.name == "Migrated local files"
-        && storage.root_identifier.is_none()
-}
-
 fn migration_selection_notice(reason: &str) -> StartupAdoption {
     StartupAdoption::NeedsSelection(format!(
         "Migrated local-library records were preserved, but {reason}. Open Music Management, choose the existing library folder, and retry adoption; rec_bag will not move files during this step."
@@ -1507,7 +1370,7 @@ fn migration_adoption_error(message: impl Into<String>) -> IntegrationError {
 fn production_credentials() -> Arc<dyn CredentialStore> {
     #[cfg(feature = "desktop")]
     {
-        Arc::new(super::google_drive::KeyringCredentialStore::new("rec_bag"))
+        Arc::new(super::credentials::KeyringCredentialStore::new("rec_bag"))
     }
     #[cfg(not(feature = "desktop"))]
     {
@@ -1693,871 +1556,25 @@ fn production_local_selection() -> Arc<dyn LocalSelectionProvider> {
     }
 }
 
-#[cfg(not(feature = "desktop"))]
-struct EnvironmentGoogleProvisioner;
-
-#[cfg(not(feature = "desktop"))]
-impl GoogleDriveProvisioner for EnvironmentGoogleProvisioner {
-    fn provision<'a>(
-        &'a self,
-        configuration: &'a ui::PrimaryConfigurationView,
-    ) -> Pin<Box<dyn Future<Output = Result<ProvisionedDrive, GoogleDriveServiceError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let access_token = std::env::var("REC_BAG_GOOGLE_ACCESS_TOKEN").map_err(|_| {
-                GoogleDriveServiceError::Authentication(
-                    "Interactive Google authorization requires the desktop feature. For server or test injection, set REC_BAG_GOOGLE_ACCESS_TOKEN and REC_BAG_GOOGLE_CLIENT_ID.".into(),
-                )
-            })?;
-            let identity = if configuration.location.trim().is_empty() {
-                std::env::var("REC_BAG_GOOGLE_DRIVE_FOLDER").map_err(|_| {
-                    GoogleDriveServiceError::FolderSelection(
-                        "Google Drive backup needs a folder ID or link. Set REC_BAG_GOOGLE_DRIVE_FOLDER for this headless build and retry.".into(),
-                    )
-                })?
-            } else {
-                configuration.location.clone()
-            };
-            let folder_id = normalize_drive_folder_identity(&identity)?;
-            let account =
-                std::env::var("REC_BAG_GOOGLE_ACCOUNT").unwrap_or_else(|_| "default".into());
-            Ok(ProvisionedDrive {
-                credential_account: account.clone(),
-                credential: GoogleCredential {
-                    access_token,
-                    refresh_token: std::env::var("REC_BAG_GOOGLE_REFRESH_TOKEN").ok(),
-                    expires_at: None,
-                    account_id: Some(account),
-                },
-                folder: SelectedDriveFolder {
-                    id: folder_id,
-                    display_name: configuration.name.clone(),
-                },
-            })
-        })
+/// Opens every configured storage, reporting each one that cannot be used
+/// right now as a non-fatal error.
+async fn open_storages(storages: &MusicStorages, errors: &mut Vec<IntegrationError>) {
+    match storages.open_all().await {
+        Ok(faults) => errors.extend(faults.iter().map(storage_fault_error)),
+        Err(error) => errors.push(startup_error(format!(
+            "Could not load persisted storage providers: {error}"
+        ))),
     }
 }
 
-trait GoogleCallbackSession: Send + Sync {
-    fn redirect_uri(&self) -> url::Url;
-    fn receive<'a>(
-        &'a self,
-        request: &'a GoogleOAuthRequest,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<GoogleOAuthCallback, GoogleDriveServiceError>> + Send + 'a>,
-    >;
-}
-
-trait GoogleCallbackSessionFactory: Send + Sync {
-    fn prepare(
-        &self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Box<dyn GoogleCallbackSession>, GoogleDriveServiceError>>
-                + Send
-                + '_,
-        >,
-    >;
-}
-
-trait DriveFolderSelectorFactory: Send + Sync {
-    fn selector(
-        &self,
-        identity: &str,
-    ) -> Result<Arc<dyn GoogleDriveFolderSelector>, GoogleDriveServiceError>;
-}
-
-trait DriveFolderIdentityProvider: Send + Sync {
-    fn request<'a>(
-        &'a self,
-        configured: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, GoogleDriveServiceError>> + Send + 'a>>;
-}
-
-#[derive(Default)]
-struct CallbackStates(std::sync::Mutex<BTreeSet<String>>);
-
-impl CallbackStates {
-    fn register(&self, state: String) -> Result<(), GoogleDriveServiceError> {
-        let mut states = self.0.lock().map_err(|_| callback_state_unavailable())?;
-        if !states.insert(state) {
-            return Err(GoogleDriveServiceError::Authentication(
-                "Google OAuth state was already pending".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn consume(&self, expected: &str, actual: &str) -> Result<(), GoogleDriveServiceError> {
-        let mut states = self.0.lock().map_err(|_| callback_state_unavailable())?;
-        if !states.remove(expected) {
-            return Err(GoogleDriveServiceError::Authentication(
-                "Google OAuth callback was expired or replayed".into(),
-            ));
-        }
-        if !bool::from(expected.as_bytes().ct_eq(actual.as_bytes())) {
-            return Err(GoogleDriveServiceError::Authentication(
-                "Google OAuth callback state did not match".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn cancel(&self, state: &str) {
-        if let Ok(mut states) = self.0.lock() {
-            states.remove(state);
-        }
-    }
-}
-
-fn callback_state_unavailable() -> GoogleDriveServiceError {
-    GoogleDriveServiceError::Authentication("Google OAuth state store is unavailable".into())
-}
-
-struct InteractiveGoogleProvisioner {
-    oauth: Arc<dyn GoogleOAuth>,
-    sessions: Arc<dyn GoogleCallbackSessionFactory>,
-    folders: Arc<dyn DriveFolderSelectorFactory>,
-    identities: Arc<dyn DriveFolderIdentityProvider>,
-    states: CallbackStates,
-}
-
-#[cfg(feature = "desktop")]
-struct ProductionGoogleProvisioner {
-    oauth: Arc<dyn GoogleOAuth>,
-    sessions: Arc<dyn GoogleCallbackSessionFactory>,
-    states: CallbackStates,
-}
-
-#[cfg(feature = "desktop")]
-impl GoogleDriveProvisioner for ProductionGoogleProvisioner {
-    fn provision<'a>(
-        &'a self,
-        configuration: &'a ui::PrimaryConfigurationView,
-    ) -> Pin<Box<dyn Future<Output = Result<ProvisionedDrive, GoogleDriveServiceError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let session = self.sessions.prepare().await?;
-            let request = self.oauth.begin(session.redirect_uri()).await?;
-            self.states.register(request.state.clone())?;
-            let callback = match session.receive(&request).await {
-                Ok(callback) => callback,
-                Err(error) => {
-                    self.states.cancel(&request.state);
-                    return Err(error);
-                }
-            };
-            self.states.consume(&request.state, &callback.state)?;
-            let credential = self.oauth.exchange(&request, callback).await?;
-            let folder = match production_drive_folder_selection(configuration) {
-                DriveFolderSelection::CreateDedicated { name } => {
-                    super::google_drive::DriveApiFolderSelector::create_dedicated(name)
-                        .select_folder(&credential.access_token)
-                        .await?
-                }
-                DriveFolderSelection::PickerGranted { .. } => {
-                    unreachable!("production folder selection never asserts Picker provenance")
-                }
-            };
-            let account = credential
-                .account_id
-                .clone()
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
-            Ok(ProvisionedDrive {
-                credential_account: account,
-                credential,
-                folder,
-            })
-        })
-    }
-}
-
-fn production_drive_folder_selection(
-    configuration: &ui::PrimaryConfigurationView,
-) -> DriveFolderSelection {
-    let name = configuration.name.trim();
-    DriveFolderSelection::CreateDedicated {
-        name: if name.is_empty() {
-            "rec_bag Music".into()
-        } else {
-            name.to_owned()
-        },
-    }
-}
-
-impl GoogleDriveProvisioner for InteractiveGoogleProvisioner {
-    fn provision<'a>(
-        &'a self,
-        configuration: &'a ui::PrimaryConfigurationView,
-    ) -> Pin<Box<dyn Future<Output = Result<ProvisionedDrive, GoogleDriveServiceError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let identity = self.identities.request(&configuration.location).await?;
-            let folder_id = normalize_drive_folder_identity(&identity)?;
-            let session = self.sessions.prepare().await?;
-            let request = self.oauth.begin(session.redirect_uri()).await?;
-            self.states.register(request.state.clone())?;
-            let callback = match session.receive(&request).await {
-                Ok(callback) => callback,
-                Err(error) => {
-                    self.states.cancel(&request.state);
-                    return Err(error);
-                }
-            };
-            self.states.consume(&request.state, &callback.state)?;
-            let credential = self.oauth.exchange(&request, callback).await?;
-            let folder = self
-                .folders
-                .selector(&folder_id)?
-                .select_folder(&credential.access_token)
-                .await?;
-            let account = credential
-                .account_id
-                .clone()
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
-            Ok(ProvisionedDrive {
-                credential_account: account,
-                credential,
-                folder,
-            })
-        })
-    }
-}
-
-fn normalize_drive_folder_identity(value: &str) -> Result<String, GoogleDriveServiceError> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(GoogleDriveServiceError::FolderSelection(
-            "Paste a Google Drive folder link or stable folder ID in the storage location field"
-                .into(),
-        ));
-    }
-    if let Ok(url) = url::Url::parse(value) {
-        if !url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("drive.google.com")
-                || host.eq_ignore_ascii_case("docs.google.com")
-        }) {
-            return Err(GoogleDriveServiceError::FolderSelection(
-                "The selected folder link must be a Google Drive URL".into(),
-            ));
-        }
-        let path_id = url.path_segments().and_then(|segments| {
-            let segments = segments.collect::<Vec<_>>();
-            segments
-                .windows(2)
-                .find(|parts| parts[0] == "folders")
-                .map(|parts| parts[1].to_owned())
-        });
-        let query_id = url
-            .query_pairs()
-            .find(|(key, _)| key == "id")
-            .map(|(_, id)| id.into_owned());
-        if let Some(id) = path_id.or(query_id).filter(|id| !id.is_empty()) {
-            return Ok(id);
-        }
-        return Err(GoogleDriveServiceError::FolderSelection(
-            "Could not find a stable folder ID in the Google Drive link".into(),
-        ));
-    }
-    if value.chars().any(char::is_whitespace) || value.contains('/') {
-        return Err(GoogleDriveServiceError::FolderSelection(
-            "The Drive folder ID is malformed; paste the folder link or its stable ID".into(),
-        ));
-    }
-    Ok(value.to_owned())
-}
-
-fn parse_google_callback(
-    callback: &url::Url,
-) -> Result<GoogleOAuthCallback, GoogleDriveServiceError> {
-    if let Some(error) = callback
-        .query_pairs()
-        .find(|(key, _)| key == "error")
-        .map(|(_, value)| value.into_owned())
-    {
-        let detail = callback
-            .query_pairs()
-            .find(|(key, _)| key == "error_description")
-            .map(|(_, value)| value.into_owned())
-            .unwrap_or(error);
-        return Err(GoogleDriveServiceError::Authentication(format!(
-            "Google authorization was cancelled or denied: {detail}"
-        )));
-    }
-    let code = callback
-        .query_pairs()
-        .find(|(key, _)| key == "code")
-        .map(|(_, value)| value.into_owned())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            GoogleDriveServiceError::Authentication(
-                "Google OAuth callback did not include an authorization code".into(),
-            )
-        })?;
-    let state = callback
-        .query_pairs()
-        .find(|(key, _)| key == "state")
-        .map(|(_, value)| value.into_owned())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            GoogleDriveServiceError::Authentication(
-                "Google OAuth callback did not include state".into(),
-            )
-        })?;
-    Ok(GoogleOAuthCallback { code, state })
-}
-
-#[cfg(feature = "desktop")]
-struct LoopbackGoogleSessionFactory {
-    redirect_uri: url::Url,
-}
-
-#[cfg(feature = "desktop")]
-impl GoogleCallbackSessionFactory for LoopbackGoogleSessionFactory {
-    fn prepare(
-        &self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Box<dyn GoogleCallbackSession>, GoogleDriveServiceError>>
-                + Send
-                + '_,
-        >,
-    > {
-        Box::pin(async move {
-            let host_is_loopback = self.redirect_uri.scheme() == "http"
-                && self.redirect_uri.host_str().is_some_and(|host| {
-                    host.eq_ignore_ascii_case("localhost")
-                        || host
-                            .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| ip.is_loopback())
-                });
-            if !host_is_loopback {
-                return Err(GoogleDriveServiceError::Authentication(
-                    "REC_BAG_GOOGLE_REDIRECT_URI must be an HTTP loopback URL".into(),
-                ));
-            }
-            let port = self.redirect_uri.port().ok_or_else(|| {
-                GoogleDriveServiceError::Authentication(
-                    "REC_BAG_GOOGLE_REDIRECT_URI must include a loopback port".into(),
-                )
-            })?;
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .map_err(|error| {
-                    GoogleDriveServiceError::Authentication(format!(
-                        "Could not listen for the Google OAuth callback on port {port}: {error}"
-                    ))
-                })?;
-            Ok(Box::new(LoopbackGoogleSession {
-                redirect_uri: self.redirect_uri.clone(),
-                listener: Mutex::new(Some(listener)),
-            }) as Box<dyn GoogleCallbackSession>)
-        })
-    }
-}
-
-#[cfg(feature = "desktop")]
-struct LoopbackGoogleSession {
-    redirect_uri: url::Url,
-    listener: Mutex<Option<tokio::net::TcpListener>>,
-}
-
-#[cfg(feature = "desktop")]
-impl GoogleCallbackSession for LoopbackGoogleSession {
-    fn redirect_uri(&self) -> url::Url {
-        self.redirect_uri.clone()
-    }
-
-    fn receive<'a>(
-        &'a self,
-        _request: &'a GoogleOAuthRequest,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<GoogleOAuthCallback, GoogleDriveServiceError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            let listener = self.listener.lock().await.take().ok_or_else(|| {
-                GoogleDriveServiceError::Authentication(
-                    "Google OAuth callback was already consumed".into(),
-                )
-            })?;
-            let (mut stream, _) =
-                tokio::time::timeout(std::time::Duration::from_secs(180), listener.accept())
-                    .await
-                    .map_err(|_| {
-                        GoogleDriveServiceError::Authentication(
-                            "Google authorization timed out or was cancelled".into(),
-                        )
-                    })?
-                    .map_err(|error| {
-                        GoogleDriveServiceError::Authentication(format!(
-                            "Could not receive the Google OAuth callback: {error}"
-                        ))
-                    })?;
-            let mut bytes = vec![0_u8; 16 * 1024];
-            let count = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                tokio::io::AsyncReadExt::read(&mut stream, &mut bytes),
-            )
-            .await
-            .map_err(|_| {
-                GoogleDriveServiceError::Authentication(
-                    "Google OAuth callback read timed out or was cancelled".into(),
-                )
-            })?
-            .map_err(|error| {
-                GoogleDriveServiceError::Authentication(format!(
-                    "Could not read the Google OAuth callback: {error}"
-                ))
-            })?;
-            let request = std::str::from_utf8(&bytes[..count]).map_err(|_| {
-                GoogleDriveServiceError::Authentication(
-                    "Google OAuth callback was malformed".into(),
-                )
-            })?;
-            let target = request
-                .lines()
-                .next()
-                .and_then(|line| line.strip_prefix("GET "))
-                .and_then(|line| line.split_once(' ').map(|(target, _)| target))
-                .ok_or_else(|| {
-                    GoogleDriveServiceError::Authentication(
-                        "Google OAuth callback was malformed".into(),
-                    )
-                })?;
-            let callback = self.redirect_uri.join(target).map_err(|_| {
-                GoogleDriveServiceError::Authentication(
-                    "Google OAuth callback URL was malformed".into(),
-                )
-            })?;
-            if callback.path() != self.redirect_uri.path() {
-                write_google_callback_response(&mut stream, 400, "Invalid callback request.").await;
-                return Err(GoogleDriveServiceError::Authentication(
-                    "Google OAuth callback path did not match".into(),
-                ));
-            }
-            let parsed = parse_google_callback(&callback);
-            let (status, message) = if parsed.is_ok() {
-                (
-                    200,
-                    "Authorization received. You can close this window and return to rec_bag.",
-                )
-            } else {
-                (400, "Authorization was cancelled or could not be completed. Return to rec_bag for details.")
-            };
-            write_google_callback_response(&mut stream, status, message).await;
-            parsed
-        })
-    }
-}
-
-#[cfg(feature = "desktop")]
-async fn write_google_callback_response(
-    stream: &mut tokio::net::TcpStream,
-    status: u16,
-    message: &str,
-) {
-    let reason = if status == 200 { "OK" } else { "Bad Request" };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{message}",
-        message.len()
-    );
-    let _ = tokio::io::AsyncWriteExt::write_all(stream, response.as_bytes()).await;
-}
-
-#[cfg(feature = "desktop")]
-struct NativeDriveFolderIdentityProvider;
-
-#[cfg(feature = "desktop")]
-impl DriveFolderIdentityProvider for NativeDriveFolderIdentityProvider {
-    fn request<'a>(
-        &'a self,
-        configured: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, GoogleDriveServiceError>> + Send + 'a>> {
-        Box::pin(async move {
-            if !configured.trim().is_empty() {
-                return Ok(configured.to_owned());
-            }
-            if let Ok(identity) = std::env::var("REC_BAG_GOOGLE_DRIVE_FOLDER") {
-                if !identity.trim().is_empty() {
-                    return Ok(identity);
-                }
-            }
-            let selected = tokio::task::spawn_blocking(native_drive_folder_identity_dialog)
-                .await
-                .map_err(|error| {
-                    GoogleDriveServiceError::FolderSelection(format!(
-                        "The Google Drive folder prompt failed: {error}"
-                    ))
-                })??;
-            selected.ok_or_else(|| {
-                GoogleDriveServiceError::FolderSelection(
-                    "Google Drive folder selection was cancelled. Paste or select a Drive folder ID/link and retry Add backup.".into(),
-                )
-            })
-        })
-    }
-}
-
-#[cfg(all(feature = "desktop", target_os = "windows"))]
-fn native_drive_folder_identity_dialog() -> Result<Option<String>, GoogleDriveServiceError> {
-    run_drive_identity_prompt(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::InputBox('Paste the Google Drive folder ID or link','Google Drive backup','')",
-        ],
+fn storage_fault_error(fault: &StorageFault) -> IntegrationError {
+    provider_error(
+        IntegrationSlice::MusicStorage,
+        format!(
+            "Could not initialize music storage {}: {}",
+            fault.name, fault.error
+        ),
     )
-}
-
-#[cfg(all(feature = "desktop", target_os = "macos"))]
-fn native_drive_folder_identity_dialog() -> Result<Option<String>, GoogleDriveServiceError> {
-    run_drive_identity_prompt(
-        "osascript",
-        &[
-            "-e",
-            "text returned of (display dialog \"Paste the Google Drive folder ID or link\" default answer \"\" with title \"Google Drive backup\")",
-        ],
-    )
-}
-
-#[cfg(all(
-    feature = "desktop",
-    not(any(target_os = "windows", target_os = "macos"))
-))]
-fn native_drive_folder_identity_dialog() -> Result<Option<String>, GoogleDriveServiceError> {
-    match run_drive_identity_prompt(
-        "zenity",
-        &[
-            "--entry",
-            "--title=Google Drive backup",
-            "--text=Paste the Google Drive folder ID or link",
-        ],
-    ) {
-        Err(_) => run_drive_identity_prompt(
-            "kdialog",
-            &[
-                "--inputbox",
-                "Paste the Google Drive folder ID or link",
-                "",
-                "--title",
-                "Google Drive backup",
-            ],
-        )
-        .map_err(|_| {
-            GoogleDriveServiceError::FolderSelection(
-                "No native text prompt is available. Install zenity or kdialog, or set REC_BAG_GOOGLE_DRIVE_FOLDER and retry.".into(),
-            )
-        }),
-        result => result,
-    }
-}
-
-#[cfg(feature = "desktop")]
-fn run_drive_identity_prompt(
-    program: &str,
-    arguments: &[&str],
-) -> Result<Option<String>, GoogleDriveServiceError> {
-    let output = std::process::Command::new(program)
-        .args(arguments)
-        .output()
-        .map_err(|error| {
-            GoogleDriveServiceError::FolderSelection(format!(
-                "Native Google Drive folder prompt {program} could not start: {error}"
-            ))
-        })?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let value = String::from_utf8(output.stdout).map_err(|_| {
-        GoogleDriveServiceError::FolderSelection(
-            "The native Google Drive folder prompt returned invalid text".into(),
-        )
-    })?;
-    let value = value.trim();
-    Ok((!value.is_empty()).then(|| value.to_owned()))
-}
-
-#[cfg(feature = "desktop")]
-struct DriveApiSelectorFactory;
-
-#[cfg(feature = "desktop")]
-impl DriveFolderSelectorFactory for DriveApiSelectorFactory {
-    fn selector(
-        &self,
-        identity: &str,
-    ) -> Result<Arc<dyn GoogleDriveFolderSelector>, GoogleDriveServiceError> {
-        Ok(Arc::new(super::google_drive::DriveApiFolderSelector::new(
-            identity,
-        )))
-    }
-}
-
-fn production_google_provisioner(
-    oauth: Arc<dyn GoogleOAuth>,
-    _credentials: Arc<dyn CredentialStore>,
-) -> Result<Arc<dyn GoogleDriveProvisioner>, IntegrationError> {
-    #[cfg(feature = "desktop")]
-    {
-        let redirect_uri = std::env::var("REC_BAG_GOOGLE_REDIRECT_URI")
-            .unwrap_or_else(|_| "http://127.0.0.1:17842/oauth/google".into());
-        let redirect_uri = url::Url::parse(&redirect_uri).map_err(|error| {
-            provider_error(
-                IntegrationSlice::GoogleDrive,
-                format!("REC_BAG_GOOGLE_REDIRECT_URI is invalid: {error}"),
-            )
-        })?;
-        Ok(Arc::new(ProductionGoogleProvisioner {
-            oauth,
-            sessions: Arc::new(LoopbackGoogleSessionFactory { redirect_uri }),
-            states: CallbackStates::default(),
-        }))
-    }
-    #[cfg(not(feature = "desktop"))]
-    {
-        let _ = (oauth, _credentials);
-        Ok(Arc::new(EnvironmentGoogleProvisioner))
-    }
-}
-
-struct MissingGoogleOAuth;
-
-impl GoogleOAuth for MissingGoogleOAuth {
-    fn begin(
-        &self,
-        _redirect_uri: url::Url,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<GoogleOAuthRequest, GoogleDriveServiceError>> + Send + '_>,
-    > {
-        Box::pin(async { Err(missing_google_client()) })
-    }
-
-    fn exchange<'a>(
-        &'a self,
-        _request: &'a GoogleOAuthRequest,
-        _callback: GoogleOAuthCallback,
-    ) -> Pin<Box<dyn Future<Output = Result<GoogleCredential, GoogleDriveServiceError>> + Send + 'a>>
-    {
-        Box::pin(async { Err(missing_google_client()) })
-    }
-
-    fn refresh<'a>(
-        &'a self,
-        _refresh_token: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<GoogleCredential, GoogleDriveServiceError>> + Send + 'a>>
-    {
-        Box::pin(async { Err(missing_google_client()) })
-    }
-}
-
-fn missing_google_client() -> GoogleDriveServiceError {
-    GoogleDriveServiceError::Authentication(
-        "Google OAuth is not configured. Set REC_BAG_GOOGLE_CLIENT_ID to the installed-app OAuth client ID, register the loopback redirect URI, then restart rec_bag.".into(),
-    )
-}
-
-fn production_google_oauth() -> Arc<dyn GoogleOAuth> {
-    let client_id = std::env::var("REC_BAG_GOOGLE_CLIENT_ID").ok();
-    #[cfg(feature = "desktop")]
-    if let Some(client_id) = client_id {
-        return Arc::new(super::google_drive::ReqwestGoogleOAuth::new(
-            client_id, None,
-        ));
-    }
-    let _ = client_id;
-    Arc::new(MissingGoogleOAuth)
-}
-
-fn production_drive_factory(
-    credentials: Arc<dyn CredentialStore>,
-    oauth: Arc<dyn GoogleOAuth>,
-    cache_root: PathBuf,
-) -> Arc<dyn DriveRuntimeFactory> {
-    #[cfg(feature = "desktop")]
-    {
-        Arc::new(super::google_drive::ProductionDriveRuntimeFactory::new(
-            credentials,
-            oauth,
-            cache_root,
-        ))
-    }
-    #[cfg(not(feature = "desktop"))]
-    {
-        let _ = (credentials, oauth, cache_root);
-        Arc::new(UnavailableDriveRuntimeFactory)
-    }
-}
-
-#[cfg(not(feature = "desktop"))]
-struct UnavailableDriveRuntimeFactory;
-
-#[cfg(not(feature = "desktop"))]
-impl DriveRuntimeFactory for UnavailableDriveRuntimeFactory {
-    fn open<'a>(
-        &'a self,
-        _storage: &'a rec_core::MusicStorage,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        Arc<dyn super::google_drive::DriveRuntime>,
-                        GoogleDriveServiceError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async {
-            Err(GoogleDriveServiceError::Runtime(
-                "Google Drive runtime requires the desktop feature".into(),
-            ))
-        })
-    }
-}
-
-async fn initialize_storage_registries(
-    catalog: &TursoCatalog,
-    drive_registry: Arc<DriveRuntimeRegistry>,
-    backup_registry: Arc<BackupProviderRegistry>,
-    errors: &mut Vec<IntegrationError>,
-) {
-    let storages = match MusicStorageRepository::list(catalog).await {
-        Ok(storages) => storages,
-        Err(error) => {
-            errors.push(startup_error(format!(
-                "Could not load persisted storage providers: {error}"
-            )));
-            return;
-        }
-    };
-    for storage in storages {
-        // This migration evidence remains persisted for recovery/reconciliation but is
-        // deliberately not a usable provider and must never become authoritative.
-        if !storage.enabled || is_migrated_synthetic_storage(&storage) {
-            drive_registry.remove(storage.id);
-            backup_registry.remove(storage.id);
-            continue;
-        }
-        match storage.kind {
-            MusicStorageKind::LocalDirectory => {
-                drive_registry.remove(storage.id);
-                let Some(root) = storage.root_identifier.as_deref() else {
-                    errors.push(provider_error(
-                        IntegrationSlice::LocalLibrary,
-                        format!("Local storage {} has no persisted root path", storage.name),
-                    ));
-                    continue;
-                };
-                match LocalMusicStorage::new(storage.id, root) {
-                    Ok(provider) => {
-                        backup_registry.register(storage.id, Arc::new(provider));
-                    }
-                    Err(error) => {
-                        backup_registry.remove(storage.id);
-                        errors.push(provider_error(
-                            IntegrationSlice::LocalLibrary,
-                            format!(
-                                "Could not initialize local storage {}: {error}",
-                                storage.name
-                            ),
-                        ));
-                    }
-                }
-            }
-            MusicStorageKind::GoogleDrive => match drive_registry.get_or_open(&storage).await {
-                Ok(provider) => {
-                    let provider: Arc<dyn MusicAssetStore> = provider;
-                    backup_registry.register(storage.id, provider);
-                }
-                Err(error) => {
-                    backup_registry.remove(storage.id);
-                    errors.push(provider_error(
-                        IntegrationSlice::GoogleDrive,
-                        format!(
-                            "Could not initialize Google Drive storage {}: {error}",
-                            storage.name
-                        ),
-                    ));
-                }
-            },
-            MusicStorageKind::Other(ref kind) => {
-                drive_registry.remove(storage.id);
-                backup_registry.remove(storage.id);
-                errors.push(startup_error(format!(
-                    "Storage {} uses unsupported provider kind {kind}",
-                    storage.name
-                )));
-            }
-        }
-    }
-}
-
-struct DesktopAssetResolver {
-    catalog: Arc<TursoCatalog>,
-    drive: Arc<GoogleDriveService>,
-}
-
-impl AssetResolver for DesktopAssetResolver {
-    fn resolve<'a>(&'a self, asset: &'a AssetReference) -> AssetFuture<'a> {
-        Box::pin(async move {
-            let storage_id = parse_id("storage", &asset.storage_id)?;
-            let asset_id = parse_id("asset", &asset.asset_id)?;
-            let storage = MusicStorageRepository::get(self.catalog.as_ref(), storage_id)
-                .await
-                .map_err(|error| startup_error(format!("Could not load asset storage: {error}")))?
-                .ok_or_else(|| startup_error(format!("Storage {storage_id} was not found")))?;
-            match storage.kind {
-                MusicStorageKind::GoogleDrive => {
-                    let resolved = self
-                        .drive
-                        .resolve(storage_id, asset_id)
-                        .await
-                        .map_err(IntegrationError::from)?;
-                    Ok(ResolvedAsset {
-                        uri: resolved.local_path.to_string_lossy().into_owned(),
-                        cached: true,
-                    })
-                }
-                MusicStorageKind::LocalDirectory => {
-                    let location =
-                        AssetRepository::list_locations_for_asset(self.catalog.as_ref(), asset_id)
-                            .await
-                            .map_err(|error| {
-                                startup_error(format!("Could not load asset location: {error}"))
-                            })?
-                            .into_iter()
-                            .find(|location| location.storage_id == storage_id)
-                            .ok_or_else(|| {
-                                startup_error("The asset has no location in that local storage")
-                            })?;
-                    let root = storage.root_identifier.as_deref().ok_or_else(|| {
-                        startup_error("The local storage has no configured root path")
-                    })?;
-                    let provider = LocalMusicStorage::new(storage_id, root).map_err(|error| {
-                        startup_error(format!("Could not open local storage: {error}"))
-                    })?;
-                    let path = provider
-                        .playback_path(&location.object_id)
-                        .map_err(|error| {
-                            startup_error(format!(
-                                "Could not resolve local playback asset: {error}"
-                            ))
-                        })?;
-                    Ok(ResolvedAsset {
-                        uri: path.to_string_lossy().into_owned(),
-                        cached: false,
-                    })
-                }
-                MusicStorageKind::Other(kind) => Err(startup_error(format!(
-                    "Storage provider {kind} cannot resolve playback assets"
-                ))),
-            }
-        })
-    }
-}
-
-fn parse_id(kind: &str, value: &str) -> Result<Uuid, IntegrationError> {
-    Uuid::parse_str(value).map_err(|error| startup_error(format!("Invalid {kind} ID: {error}")))
 }
 
 #[cfg(test)]
@@ -2571,7 +1588,10 @@ mod tests {
         },
     };
 
+    use crate::services::storage_drivers::local::local_only_storages;
     use crate::state::integration::{IntegrationController, IntegrationState};
+    use music_storage_local::LocalMusicStorage;
+    use rec_core::{MusicAssetStore, MusicStorageKind};
     use ui::{MusicManagementEvent, ProviderChoice};
 
     struct NeverSelect {
@@ -2606,23 +1626,13 @@ mod tests {
         }
     }
 
-    struct TestAssetResolver;
-
-    impl AssetResolver for TestAssetResolver {
-        fn resolve<'a>(&'a self, _asset: &'a AssetReference) -> AssetFuture<'a> {
-            Box::pin(async { Err(startup_error("not used by lifecycle tests")) })
-        }
-    }
-
     async fn lifecycle_runtime(label: &str) -> (Arc<DesktopIntegration>, TestDirectory) {
         let root = TestDirectory::new(label);
         let catalog = Arc::new(TursoCatalog::in_memory().await.unwrap());
-        let local = Arc::new(LocalLibraryService::new(
-            catalog.clone(),
-            Arc::new(NeverSelect {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-        ));
+        let selection: Arc<dyn LocalSelectionProvider> = Arc::new(NeverSelect {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let storages = local_only_storages(&catalog, selection);
         let credentials =
             Arc::new(super::super::soundcloud_catalog::MemoryCredentialStore::default());
         let soundcloud = Arc::new(
@@ -2630,10 +1640,9 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let backup_providers = Arc::new(BackupProviderRegistry::default());
         let backup = Arc::new(BackupService::new(
             catalog.clone(),
-            backup_providers.clone(),
+            storages.live_stores().clone(),
             root.path().join("staging"),
         ));
         let manager = ProfileManager::new(
@@ -2643,40 +1652,18 @@ mod tests {
         )
         .unwrap();
         let lease = manager.acquire(Utc::now()).unwrap();
-        let drive_registry = Arc::new(DriveRuntimeRegistry::new(Arc::new(NeverDriveFactory)));
         let runtime = Arc::new(DesktopIntegration::from_parts(
             catalog,
             Arc::new(ProviderRegistry::default()),
-            local,
             soundcloud,
             backup,
             manager,
             lease,
             None,
-            drive_registry,
-            backup_providers,
-            Arc::new(TestAssetResolver),
+            storages,
             Vec::new(),
         ));
         (runtime, root)
-    }
-
-    #[test]
-    fn production_drive_selection_never_claims_picker_provenance_for_pasted_ids() {
-        let configuration = ui::PrimaryConfigurationView {
-            provider: ProviderChoice::GoogleDrive,
-            name: "Portable rec_bag".into(),
-            location: "pasted-folder-id-without-picker-provenance".into(),
-            organize_by_artist: false,
-            verify_after_copy: true,
-        };
-
-        assert_eq!(
-            production_drive_folder_selection(&configuration),
-            DriveFolderSelection::CreateDedicated {
-                name: "Portable rec_bag".into(),
-            }
-        );
     }
 
     #[tokio::test]
@@ -2725,6 +1712,7 @@ mod tests {
     ) -> (
         Arc<TursoCatalog>,
         Arc<LocalLibraryService>,
+        Arc<MusicStorageService>,
         Uuid,
         Arc<AtomicUsize>,
     ) {
@@ -2802,13 +1790,17 @@ mod tests {
         .await
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
+        let selection: Arc<dyn LocalSelectionProvider> = Arc::new(NeverSelect {
+            calls: calls.clone(),
+        });
+        let storages = local_only_storages(&catalog, selection.clone());
         let local = Arc::new(LocalLibraryService::new(
             catalog.clone(),
-            Arc::new(NeverSelect {
-                calls: calls.clone(),
-            }),
+            selection,
+            storages.clone(),
         ));
-        (catalog, local, storage_id, calls)
+        let storage = Arc::new(MusicStorageService::new(catalog.clone(), storages));
+        (catalog, local, storage, storage_id, calls)
     }
 
     struct RecordingHandler {
@@ -2849,7 +1841,7 @@ mod tests {
             MusicManagementEvent::AddSource(ProviderChoice::SoundCloud),
             MusicManagementEvent::AddSource(ProviderChoice::GoogleDrive),
             MusicManagementEvent::StartCleanupReview,
-            MusicManagementEvent::CopyToPrimary(Uuid::new_v4().to_string()),
+            MusicManagementEvent::ReviewMatch(Uuid::new_v4().to_string()),
         ];
         let mut state = IntegrationState::default();
         state.events.extend([
@@ -2894,31 +1886,6 @@ mod tests {
                 .count(),
             IntegrationSlice::ALL.len()
         );
-    }
-
-    struct NeverDriveFactory;
-
-    impl DriveRuntimeFactory for NeverDriveFactory {
-        fn open<'a>(
-            &'a self,
-            _storage: &'a rec_core::MusicStorage,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            Arc<dyn super::super::google_drive::DriveRuntime>,
-                            GoogleDriveServiceError,
-                        >,
-                    > + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async {
-                Err(GoogleDriveServiceError::Runtime(
-                    "Drive should not be opened in this test".into(),
-                ))
-            })
-        }
     }
 
     async fn verified_primary_with_backup(
@@ -3010,21 +1977,29 @@ mod tests {
         fs::write(primary_root.path().join("track.flac"), b"data").unwrap();
         let (catalog, track_id, primary_id, backup_id) =
             verified_primary_with_backup(primary_root.path(), backup_root.path()).await;
-        let providers = Arc::new(BackupProviderRegistry::default());
+        let providers = Arc::new(LiveStores::default());
         providers.register(
             primary_id,
             Arc::new(LocalMusicStorage::new(primary_id, primary_root.path()).unwrap()),
         );
         let backup = BackupService::new(catalog.clone(), providers, backup_root.path());
 
-        let status = plan_catalog_verified_writes(catalog.as_ref(), &backup, Some(track_id)).await;
+        let asset_ids: Vec<Uuid> =
+            AssetRepository::list_originals_for_track(catalog.as_ref(), track_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|asset| asset.id())
+                .collect();
 
-        assert_eq!(status.planned_assets, 1);
-        assert_eq!(status.queued_jobs, 1);
-        assert_eq!(status.deferred_targets, 1);
-        assert!(status.warnings.is_empty());
-        assert!(status.message().contains("queued"));
-        assert!(status.message().contains("deferred"));
+        let report = backup.verified_primary_write(&asset_ids).await;
+
+        assert_eq!(report.planned_assets, 1);
+        assert_eq!(report.queued_jobs, 1);
+        assert_eq!(report.deferred_targets, 1);
+        assert!(report.warnings.is_empty());
+        assert!(report.message().contains("queued"));
+        assert!(report.message().contains("deferred"));
         assert!(MusicStorageRepository::get(catalog.as_ref(), backup_id)
             .await
             .unwrap()
@@ -3037,16 +2012,24 @@ mod tests {
         let backup_root = TestDirectory::new("refresh-backup");
         let (catalog, _, primary_id, backup_id) =
             verified_primary_with_backup(primary_root.path(), backup_root.path()).await;
-        let drive = Arc::new(DriveRuntimeRegistry::new(Arc::new(NeverDriveFactory)));
-        let providers = Arc::new(BackupProviderRegistry::default());
+        let storages = local_only_storages(
+            &catalog,
+            Arc::new(NeverSelect {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
         let mut errors = Vec::new();
 
-        initialize_storage_registries(catalog.as_ref(), drive, providers.clone(), &mut errors)
-            .await;
+        open_storages(&storages, &mut errors).await;
 
-        assert!(errors.is_empty());
-        assert!(providers.get(primary_id).is_ok());
-        assert!(providers.get(backup_id).is_ok());
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(storages.live_stores().contains(primary_id));
+        assert!(storages.live_stores().contains(backup_id));
+        let primary = MusicStorageRepository::get(catalog.as_ref(), primary_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(primary.capabilities.can_store_and_verify());
     }
 
     #[test]
@@ -3072,10 +2055,10 @@ mod tests {
         let root = TestDirectory::new("adopt");
         let path = root.path().join("track.mp3");
         fs::write(&path, b"original audio").unwrap();
-        let (catalog, local, migrated_storage_id, picker_calls) =
+        let (catalog, local, storage, migrated_storage_id, picker_calls) =
             migrated_catalog(root.path(), Some(root.path())).await;
 
-        let outcome = adopt_migrated_local_library(catalog.as_ref(), local.as_ref())
+        let outcome = adopt_migrated_local_library(catalog.as_ref(), local.as_ref(), &storage)
             .await
             .unwrap();
 
@@ -3104,10 +2087,10 @@ mod tests {
         let root = TestDirectory::new("notice");
         fs::write(root.path().join("track.mp3"), b"audio").unwrap();
         let unrelated = TestDirectory::new("unrelated");
-        let (catalog, local, migrated_storage_id, picker_calls) =
+        let (catalog, local, storage, migrated_storage_id, picker_calls) =
             migrated_catalog(root.path(), Some(unrelated.path())).await;
 
-        let outcome = adopt_migrated_local_library(catalog.as_ref(), local.as_ref())
+        let outcome = adopt_migrated_local_library(catalog.as_ref(), local.as_ref(), &storage)
             .await
             .unwrap();
 
@@ -3133,259 +2116,6 @@ mod tests {
     fn secret_debug_never_exposes_bytes() {
         let secret = Secret::new(b"refresh-token".to_vec());
         assert_eq!(format!("{secret:?}"), "Secret([REDACTED])");
-    }
-
-    #[test]
-    fn google_callback_rejects_mismatched_state() {
-        let states = CallbackStates::default();
-        states.register("expected".into()).unwrap();
-        let error = states.consume("expected", "attacker").unwrap_err();
-        assert!(error.to_string().contains("state did not match"));
-    }
-
-    #[test]
-    fn google_callback_state_is_single_use() {
-        let states = CallbackStates::default();
-        states.register("one-time".into()).unwrap();
-        states.consume("one-time", "one-time").unwrap();
-        let error = states.consume("one-time", "one-time").unwrap_err();
-        assert!(error.to_string().contains("expired or replayed"));
-    }
-
-    #[test]
-    fn google_callback_reports_user_cancellation() {
-        let states = CallbackStates::default();
-        states.register("pending".into()).unwrap();
-        let callback = url::Url::parse(
-            "http://127.0.0.1:17842/oauth/google?error=access_denied&state=pending",
-        )
-        .unwrap();
-        let error = parse_google_callback(&callback).unwrap_err();
-        states.cancel("pending");
-
-        assert!(error.to_string().contains("cancelled or denied"));
-        assert!(states
-            .consume("pending", "pending")
-            .unwrap_err()
-            .to_string()
-            .contains("expired or replayed"));
-    }
-
-    struct TestDriveIdentityProvider {
-        selected: Option<String>,
-    }
-
-    impl DriveFolderIdentityProvider for TestDriveIdentityProvider {
-        fn request<'a>(
-            &'a self,
-            configured: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<String, GoogleDriveServiceError>> + Send + 'a>>
-        {
-            Box::pin(async move {
-                if !configured.trim().is_empty() {
-                    return Ok(configured.to_owned());
-                }
-                self.selected.clone().ok_or_else(|| {
-                    GoogleDriveServiceError::FolderSelection(
-                        "Google Drive folder selection was cancelled; retry Add backup and choose a folder".into(),
-                    )
-                })
-            })
-        }
-    }
-
-    struct TestGoogleOAuth;
-
-    impl GoogleOAuth for TestGoogleOAuth {
-        fn begin(
-            &self,
-            redirect_uri: url::Url,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<GoogleOAuthRequest, GoogleDriveServiceError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            Box::pin(async move {
-                Ok(GoogleOAuthRequest {
-                    authorization_url: url::Url::parse("https://accounts.example/authorize")
-                        .unwrap(),
-                    state: "state".into(),
-                    verifier: "verifier".into(),
-                    redirect_uri,
-                })
-            })
-        }
-
-        fn exchange<'a>(
-            &'a self,
-            _request: &'a GoogleOAuthRequest,
-            _callback: GoogleOAuthCallback,
-        ) -> Pin<
-            Box<dyn Future<Output = Result<GoogleCredential, GoogleDriveServiceError>> + Send + 'a>,
-        > {
-            Box::pin(async {
-                Ok(GoogleCredential {
-                    access_token: "access-token".into(),
-                    refresh_token: Some("refresh-token".into()),
-                    expires_at: None,
-                    account_id: Some("account".into()),
-                })
-            })
-        }
-
-        fn refresh<'a>(
-            &'a self,
-            _refresh_token: &'a str,
-        ) -> Pin<
-            Box<dyn Future<Output = Result<GoogleCredential, GoogleDriveServiceError>> + Send + 'a>,
-        > {
-            Box::pin(async { unreachable!("refresh is not used while provisioning") })
-        }
-    }
-
-    struct TestCallbackSession;
-
-    impl GoogleCallbackSession for TestCallbackSession {
-        fn redirect_uri(&self) -> url::Url {
-            url::Url::parse("http://127.0.0.1:17842/oauth/google").unwrap()
-        }
-
-        fn receive<'a>(
-            &'a self,
-            request: &'a GoogleOAuthRequest,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<GoogleOAuthCallback, GoogleDriveServiceError>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async move {
-                Ok(GoogleOAuthCallback {
-                    code: "code".into(),
-                    state: request.state.clone(),
-                })
-            })
-        }
-    }
-
-    struct TestCallbackSessionFactory;
-
-    impl GoogleCallbackSessionFactory for TestCallbackSessionFactory {
-        fn prepare(
-            &self,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<Box<dyn GoogleCallbackSession>, GoogleDriveServiceError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            Box::pin(async { Ok(Box::new(TestCallbackSession) as Box<dyn GoogleCallbackSession>) })
-        }
-    }
-
-    struct RecordingFolderSelector {
-        selected_id: String,
-        call: Arc<StdMutex<Option<(String, String)>>>,
-    }
-
-    impl GoogleDriveFolderSelector for RecordingFolderSelector {
-        fn select_folder<'a>(
-            &'a self,
-            access_token: &'a str,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<SelectedDriveFolder, GoogleDriveServiceError>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async move {
-                *self.call.lock().unwrap() =
-                    Some((self.selected_id.clone(), access_token.to_owned()));
-                Ok(SelectedDriveFolder {
-                    id: self.selected_id.clone(),
-                    display_name: "Validated Music".into(),
-                })
-            })
-        }
-    }
-
-    struct RecordingFolderSelectorFactory {
-        call: Arc<StdMutex<Option<(String, String)>>>,
-    }
-
-    impl DriveFolderSelectorFactory for RecordingFolderSelectorFactory {
-        fn selector(
-            &self,
-            identity: &str,
-        ) -> Result<Arc<dyn GoogleDriveFolderSelector>, GoogleDriveServiceError> {
-            Ok(Arc::new(RecordingFolderSelector {
-                selected_id: identity.to_owned(),
-                call: self.call.clone(),
-            }))
-        }
-    }
-
-    #[tokio::test]
-    async fn selected_drive_folder_is_normalized_and_validated_with_access_token() {
-        let call = Arc::new(StdMutex::new(None));
-        let provisioner = InteractiveGoogleProvisioner {
-            oauth: Arc::new(TestGoogleOAuth),
-            sessions: Arc::new(TestCallbackSessionFactory),
-            folders: Arc::new(RecordingFolderSelectorFactory { call: call.clone() }),
-            identities: Arc::new(TestDriveIdentityProvider {
-                selected: Some(
-                    "https://drive.google.com/drive/u/0/folders/folder-123?usp=sharing".into(),
-                ),
-            }),
-            states: CallbackStates::default(),
-        };
-        let configuration = ui::PrimaryConfigurationView {
-            provider: ProviderChoice::GoogleDrive,
-            name: "Primary".into(),
-            location: String::new(),
-            organize_by_artist: true,
-            verify_after_copy: true,
-        };
-
-        let provisioned = provisioner.provision(&configuration).await.unwrap();
-
-        assert_eq!(
-            *call.lock().unwrap(),
-            Some(("folder-123".into(), "access-token".into()))
-        );
-        assert_eq!(provisioned.folder.id, "folder-123");
-        assert_eq!(provisioned.folder.display_name, "Validated Music");
-        assert_eq!(provisioned.credential_account, "account");
-    }
-
-    #[tokio::test]
-    async fn empty_drive_backup_location_reports_prompt_cancellation_actionably() {
-        let provisioner = InteractiveGoogleProvisioner {
-            oauth: Arc::new(TestGoogleOAuth),
-            sessions: Arc::new(TestCallbackSessionFactory),
-            folders: Arc::new(RecordingFolderSelectorFactory {
-                call: Arc::new(StdMutex::new(None)),
-            }),
-            identities: Arc::new(TestDriveIdentityProvider { selected: None }),
-            states: CallbackStates::default(),
-        };
-        let configuration = ui::PrimaryConfigurationView {
-            provider: ProviderChoice::GoogleDrive,
-            name: "Google Drive backup".into(),
-            location: String::new(),
-            organize_by_artist: false,
-            verify_after_copy: true,
-        };
-
-        let error = provisioner.provision(&configuration).await.unwrap_err();
-
-        assert!(error.to_string().contains("selection was cancelled"));
-        assert!(error.to_string().contains("retry Add backup"));
     }
 
     #[test]

@@ -453,20 +453,37 @@ async fn storage_provider_deletion_preserves_owned_assets_and_canonical_tracks()
     SyncRunRepository::upsert(&catalog, run.clone())
         .await
         .unwrap();
-    SettingsRepository::set(
-        &catalog,
-        Setting {
-            key: format!("google_drive.upload.{}.checkpoint", storage.id),
-            value: Value::Bool(true),
-            updated_at: Utc::now(),
-        },
-    )
-    .await
-    .unwrap();
+    let forgotten_keys = [
+        format!("storage.{}.transfer.checkpoint", storage.id),
+        format!("google_drive.upload.{}.checkpoint", storage.id),
+    ];
+    let retained_key = format!("storage.{}.transfer.checkpoint", retained_storage.id);
+    for key in forgotten_keys.iter().chain([&retained_key]) {
+        SettingsRepository::set(
+            &catalog,
+            Setting {
+                key: key.clone(),
+                value: Value::Bool(true),
+                updated_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    }
     catalog
         .delete_storage_provider_data(storage.id)
         .await
         .unwrap();
+    for key in forgotten_keys {
+        assert!(SettingsRepository::get(&catalog, key)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert!(SettingsRepository::get(&catalog, retained_key)
+        .await
+        .unwrap()
+        .is_some());
     assert!(MusicStorageRepository::get(&catalog, storage.id)
         .await
         .unwrap()

@@ -6,11 +6,14 @@ pub mod integration;
 pub mod backup;
 pub mod catalog;
 pub mod catalog_projection;
-pub mod google_drive;
+#[cfg(feature = "desktop")]
+pub mod credentials;
 pub mod local_library;
+pub mod music_storage_slice;
 pub mod playback_bridge;
 pub mod profile_manager;
 pub mod reconciliation_actions;
 pub mod scheduler;
 pub mod soundcloud_catalog;
+pub mod storage_drivers;
 pub mod stream_cache;

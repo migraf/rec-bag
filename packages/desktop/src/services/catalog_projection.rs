@@ -1,23 +1,22 @@
 //! Provider-neutral projection of catalog state into the Music Management view.
 //!
-//! Gathering catalog records and probing provider health belong to the caller.
-//! This module turns what the caller gathered into a [`MusicManagementView`] and
+//! Reconciliation and storage health probing belong to `music_storage`. This
+//! module turns the catalog and that projection into a [`MusicManagementView`] and
 //! knows nothing about any individual provider, so a Catalog Source or Music
 //! Storage cannot be dropped or mislabelled because of which slice built the view.
 
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
-    sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
+use music_storage::{catalog_io, MusicStorages, StorageError};
 use rec_core::{
-    AssetRepository, CanonicalPlaylist, CanonicalTrack, CatalogSource, CatalogSourceKind,
-    HealthStatus, MatchCandidate, MetadataField, MetadataValue, MusicAssetStore, MusicStorage,
-    MusicStorageKind, MusicStorageRepository, PlaylistRepository, ReconciliationOutcome,
-    RepositoryError, RepositoryPageRequest, SourceRepository, StorageObject, StorageRole,
-    TrackRepository, TrackStorageStatus,
+    CanonicalPlaylist, CanonicalTrack, CatalogSource, CatalogSourceKind, HealthStatus,
+    MatchCandidate, MetadataField, MetadataValue, MusicStorage, MusicStorageKind,
+    MusicStorageRepository, ReconciliationOutcome, RepositoryError, StorageObject, StorageRole,
+    TrackStorageStatus,
 };
 use rec_persistence::TursoCatalog;
 use rec_sync::ReconciliationReport;
@@ -32,8 +31,6 @@ use uuid::Uuid;
 const CONFIG_FOLDER_DISPLAY_NAME: &str = "folder_display_name";
 /// Local source configuration key holding the scanned path.
 const CONFIG_PATH: &str = "path";
-/// Repository page size used while gathering catalog state.
-const PAGE_SIZE: u32 = 500;
 
 /// Everything the Music Management view is projected from.
 ///
@@ -441,39 +438,59 @@ fn candidate_view(
     }
 }
 
-/// Lookup of the store backing a configured Music Storage.
+/// Projects the whole catalog into the dashboard view.
 ///
-/// Health is probed through [`MusicAssetStore`], so the dashboard learns whether a
-/// storage is reachable without knowing which provider backs it.
-pub trait StorageProviders: Send + Sync {
-    /// Store registered for this storage, when one is available.
-    fn store(&self, storage: &MusicStorage) -> Option<Arc<dyn MusicAssetStore>>;
+/// `music_storage` reconciles against the active primary and probes every open
+/// store; this turns that projection into the provider-neutral view, so every
+/// Catalog Source and Music Storage is included whichever slice asked.
+pub async fn project_dashboard(
+    catalog: &TursoCatalog,
+    storages: &MusicStorages,
+) -> Result<MusicManagementView, StorageError> {
+    let projection = storages.project().await?;
+    let storage_health = projection
+        .storages
+        .iter()
+        .filter_map(|view| {
+            view.health
+                .as_ref()
+                .map(|health| (view.storage.id, health.status))
+        })
+        .collect();
+    Ok(CatalogViewBuilder {
+        catalog,
+        report: &projection.report,
+        storage_health: &storage_health,
+    }
+    .build()
+    .await?)
 }
 
 /// Gathers catalog state and projects it into the Music Management view.
 ///
-/// The Reconciliation report is supplied by the caller because different slices
-/// reconcile different storages; everything else is read here so that one view is
-/// built the same way regardless of which slice handled the request.
+/// The Reconciliation report and storage health are supplied by the caller;
+/// everything else is read here so that one view is built the same way
+/// regardless of which slice handled the request.
 pub struct CatalogViewBuilder<'a> {
     /// Catalog the view is read from.
     pub catalog: &'a TursoCatalog,
     /// Report the completeness and match sections are derived from.
     pub report: &'a ReconciliationReport,
-    /// Registered stores used to probe storage health, when available.
-    pub providers: Option<&'a dyn StorageProviders>,
+    /// Probed health per Music Storage id; storages without an entry fall
+    /// back to whether they are enabled.
+    pub storage_health: &'a BTreeMap<Uuid, HealthStatus>,
 }
 
 impl CatalogViewBuilder<'_> {
-    /// Read the catalog, probe provider health, and project the view.
+    /// Read the catalog and project the view.
     pub async fn build(&self) -> Result<MusicManagementView, RepositoryError> {
-        let sources = self.list_sources().await?;
+        let sources = catalog_io::sources(self.catalog).await?;
         let storages = MusicStorageRepository::list(self.catalog).await?;
-        let tracks = self.list_tracks().await?;
-        let playlists = self.list_playlists().await?;
+        let tracks = catalog_io::tracks(self.catalog).await?;
+        let playlists = catalog_io::playlists(self.catalog).await?;
         let mut objects = Vec::new();
         for storage in &storages {
-            objects.extend(self.list_storage_objects(storage.id).await?);
+            objects.extend(catalog_io::storage_objects(self.catalog, storage.id).await?);
         }
         let active_primary_id = MusicStorageRepository::get_active_primary(self.catalog)
             .await?
@@ -485,17 +502,11 @@ impl CatalogViewBuilder<'_> {
                 source_health.insert(source.id, tone);
             }
         }
-        let mut storage_health = BTreeMap::new();
-        if let Some(providers) = self.providers {
-            for storage in &storages {
-                let Some(store) = providers.store(storage) else {
-                    continue;
-                };
-                if let Ok(health) = store.health().await {
-                    storage_health.insert(storage.id, health_tone(health.status));
-                }
-            }
-        }
+        let storage_health = self
+            .storage_health
+            .iter()
+            .map(|(id, status)| (*id, health_tone(*status)))
+            .collect();
 
         Ok(CatalogProjection {
             report: self.report,
@@ -509,87 +520,6 @@ impl CatalogViewBuilder<'_> {
             storage_health: &storage_health,
         }
         .project())
-    }
-
-    async fn list_sources(&self) -> Result<Vec<CatalogSource>, RepositoryError> {
-        let mut values = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = SourceRepository::list(
-                self.catalog,
-                RepositoryPageRequest {
-                    cursor,
-                    limit: Some(PAGE_SIZE),
-                },
-            )
-            .await?;
-            values.extend(page.items);
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                return Ok(values);
-            }
-        }
-    }
-
-    async fn list_tracks(&self) -> Result<Vec<CanonicalTrack>, RepositoryError> {
-        let mut values = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = TrackRepository::list(
-                self.catalog,
-                RepositoryPageRequest {
-                    cursor,
-                    limit: Some(PAGE_SIZE),
-                },
-            )
-            .await?;
-            values.extend(page.items);
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                return Ok(values);
-            }
-        }
-    }
-
-    async fn list_playlists(&self) -> Result<Vec<CanonicalPlaylist>, RepositoryError> {
-        let mut values = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = PlaylistRepository::list(
-                self.catalog,
-                RepositoryPageRequest {
-                    cursor,
-                    limit: Some(PAGE_SIZE),
-                },
-            )
-            .await?;
-            values.extend(page.items);
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                return Ok(values);
-            }
-        }
-    }
-
-    async fn list_storage_objects(&self, id: Uuid) -> Result<Vec<StorageObject>, RepositoryError> {
-        let mut values = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = AssetRepository::list_storage_objects(
-                self.catalog,
-                id,
-                RepositoryPageRequest {
-                    cursor,
-                    limit: Some(PAGE_SIZE),
-                },
-            )
-            .await?;
-            values.extend(page.items);
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                return Ok(values);
-            }
-        }
     }
 }
 

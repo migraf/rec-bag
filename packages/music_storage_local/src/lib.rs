@@ -66,11 +66,6 @@ pub enum LocalStorageError {
     EmptyRoot,
     #[error("storage root is a file, not a directory: {root}", root = .root.display())]
     RootIsFile { root: PathBuf },
-    #[error("source and storage roots must be distinct and non-nested: {source_path} and {storage_path}", source_path = .source_path.display(), storage_path = .storage_path.display())]
-    OverlappingRoots {
-        source_path: PathBuf,
-        storage_path: PathBuf,
-    },
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 }
@@ -232,84 +227,6 @@ impl LocalMusicStorage {
         Ok(path)
     }
 
-    /// Produces the managed destination convention described in the storage plan.
-    ///
-    /// `artist` and `title` are sanitized as individual path components. Missing
-    /// artist uses `Unknown Artist`; missing title falls back to the source filename.
-    pub fn managed_object_path(
-        &self,
-        artist: Option<&str>,
-        title: Option<&str>,
-        track_id: Uuid,
-        source_file_name: &Path,
-    ) -> Result<String, MusicStorageError> {
-        let fallback_title = source_file_name
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("Untitled");
-        let artist = artist
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("Unknown Artist");
-        let title = title
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(fallback_title);
-        let extension = source_file_name
-            .extension()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .map(|value| format!(".{}", value.to_ascii_lowercase()))
-            .unwrap_or_default();
-        let short_id = &track_id.to_string()[..8];
-        Ok(format!(
-            "{}/{} [{}]{}",
-            sanitize_component(artist),
-            sanitize_component(title),
-            short_id,
-            extension
-        ))
-    }
-
-    /// Builds a collision-safe managed path. Existing paths receive a numeric suffix
-    /// rather than silently replacing a different local file.
-    pub fn available_managed_object_path(
-        &self,
-        artist: Option<&str>,
-        title: Option<&str>,
-        track_id: Uuid,
-        source_file_name: &Path,
-    ) -> Result<String, MusicStorageError> {
-        let candidate = self.managed_object_path(artist, title, track_id, source_file_name)?;
-        let candidate_path = self.object_path(&candidate)?;
-        if !candidate_path.exists() {
-            return Ok(candidate);
-        }
-
-        let path = Path::new(&candidate);
-        let parent = path.parent().unwrap_or(Path::new(""));
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| {
-                storage_error(
-                    MusicStorageErrorKind::InvalidData,
-                    "managed filename is not UTF-8",
-                )
-            })?;
-        let extension = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| format!(".{value}"))
-            .unwrap_or_default();
-        for suffix in 2.. {
-            let name = format!("{stem} ({suffix}){extension}");
-            let object_id = path_to_object_id(&parent.join(name))?;
-            if !self.object_path(&object_id)?.exists() {
-                return Ok(object_id);
-            }
-        }
-        unreachable!("unbounded suffix iterator exhausted")
-    }
-
     /// Lists history versions which are older than the policy window after retaining
     /// the configured number of most-recent versions per object. It does not delete.
     pub fn retention_candidates(
@@ -366,22 +283,6 @@ impl LocalMusicStorage {
             }
         }
         Ok(candidates)
-    }
-
-    /// Rejects same-folder and nested source/primary configurations before copying.
-    pub fn ensure_separate_roots(
-        source_root: impl AsRef<Path>,
-        storage_root: impl AsRef<Path>,
-    ) -> Result<(), LocalStorageError> {
-        let source = normalized_path(source_root.as_ref())?;
-        let storage = normalized_path(storage_root.as_ref())?;
-        if source.starts_with(&storage) || storage.starts_with(&source) {
-            return Err(LocalStorageError::OverlappingRoots {
-                source_path: source,
-                storage_path: storage,
-            });
-        }
-        Ok(())
     }
 
     fn history_root(&self) -> PathBuf {
@@ -1265,24 +1166,6 @@ fn media_type(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn sanitize_component(value: &str) -> String {
-    let sanitized: String = value
-        .trim()
-        .chars()
-        .map(|character| match character {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
-            character if character.is_control() => '_',
-            character => character,
-        })
-        .collect();
-    let sanitized = sanitized.trim_matches('.').trim();
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
-        "Untitled".to_owned()
-    } else {
-        sanitized.to_owned()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum LocalCursorMode {
@@ -1609,22 +1492,6 @@ mod tests {
             .unwrap();
         assert_eq!(result.bytes_written, 3);
         assert_eq!(fs::read(result.destination_path).unwrap(), b"bcd");
-    }
-
-    #[test]
-    fn rejects_same_and_nested_source_storage_roots() {
-        let directory = TempDir::new().unwrap();
-        assert!(matches!(
-            LocalMusicStorage::ensure_separate_roots(directory.path(), directory.path()),
-            Err(LocalStorageError::OverlappingRoots { .. })
-        ));
-        assert!(matches!(
-            LocalMusicStorage::ensure_separate_roots(
-                directory.path(),
-                directory.path().join("nested")
-            ),
-            Err(LocalStorageError::OverlappingRoots { .. })
-        ));
     }
 
     #[test]

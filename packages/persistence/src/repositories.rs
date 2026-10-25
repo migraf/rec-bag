@@ -927,8 +927,11 @@ impl TursoCatalog {
             transaction.db().execute("DELETE FROM storage_objects WHERE storage_id=?1", [storage_id.to_string()]).await.map_err(database_error)?;
             transaction.db().execute("DELETE FROM inventory_generations WHERE storage_id=?1", [storage_id.to_string()]).await.map_err(database_error)?;
             delete_sync_runs_matching(transaction.as_ref(), |run| run.storage_id == Some(storage_id)).await?;
-            let checkpoint_prefix = format!("google_drive.upload.{storage_id}.%");
-            transaction.db().execute("DELETE FROM settings WHERE key LIKE ?1", [checkpoint_prefix]).await.map_err(database_error)?;
+            // Module-owned settings (`storage.{id}.…`) and the legacy Drive upload
+            // breadcrumbs (`google_drive.upload.{id}.…`).
+            for settings_prefix in [format!("storage.{storage_id}.%"), format!("google_drive.upload.{storage_id}.%")] {
+                transaction.db().execute("DELETE FROM settings WHERE key LIKE ?1", [settings_prefix]).await.map_err(database_error)?;
+            }
             transaction.db().execute("DELETE FROM music_storages WHERE id=?1", [storage_id.to_string()]).await.map_err(database_error)?;
             Ok(())
         }.await;

@@ -88,11 +88,11 @@ What a storage adapter can actually do for the selected root, account, and permi
 The responsibility assigned to a music storage: Primary, Backup, or Unassigned.
 
 **Primary**:
-The single storage that holds the authoritative copy of every owned file. Exactly one storage is primary at a time.
+The single storage that holds the authoritative copy of every owned file. At most one storage is primary; there is none only before the first is set up, and from then on a primary can be replaced but never removed.
 _Avoid_: Main, master, source of truth
 
 **Backup**:
-A storage holding replicated copies of primary content, subject to a retention policy. A backup never satisfies a request the primary should serve.
+A storage holding replicated copies of primary content, subject to a retention policy. A backup never satisfies a request the primary should serve: when the primary lacks a file that a backup holds, the file is restored to the primary rather than read from the backup.
 
 **Asset**:
 A file belonging to a canonical track. Every asset is either an original or a derived asset; the distinction determines whether losing it loses anything.

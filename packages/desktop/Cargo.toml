@@ -30,10 +30,12 @@ url = "2.5"
 keyring = { version = "3", optional = true, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"], optional = true }
 webbrowser = { version = "1", optional = true }
+dotenvy = { version = "0.15", optional = true }
+music_storage = { version = "0.1.0", path = "../music_storage" }
 
 [features]
 default = []
-desktop = ["dioxus/desktop", "dep:keyring", "dep:reqwest", "dep:webbrowser"]
+desktop = ["dioxus/desktop", "dep:dotenvy", "dep:keyring", "dep:reqwest", "dep:webbrowser"]
 server = ["dioxus/server", "ui/server"]
 
 [dev-dependencies]

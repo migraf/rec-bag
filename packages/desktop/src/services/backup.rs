@@ -3,10 +3,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
 use chrono::{DateTime, Duration, Utc};
+use music_storage::{HandoffReport, LiveStores, ReplicationHandoff};
 use rec_core::{
     AssetLocation, AssetRepository, AssetType, BoxFuture, ContentHash, DownloadRequest,
     HealthStatus, InventoryMode, InventoryRequest, MusicAssetStore, MusicStorage,
@@ -44,46 +45,14 @@ const DEFAULT_DEFER: Duration = Duration::minutes(15);
 const DATABASE_BACKUP_DIRECTORY: &str = ".rec_bag/database-backups/v1";
 const CLEANUP_KEY_SEPARATOR: char = '|';
 
-/// Runtime registry for configured local and Google Drive stores. Both adapters are
-/// represented by `MusicAssetStore`, so every transfer follows the same staged path.
-#[derive(Default)]
-pub struct BackupProviderRegistry {
-    stores: RwLock<BTreeMap<Uuid, Arc<dyn MusicAssetStore>>>,
-}
-
-impl crate::services::catalog_projection::StorageProviders for BackupProviderRegistry {
-    fn store(&self, storage: &MusicStorage) -> Option<Arc<dyn MusicAssetStore>> {
-        self.get(storage.id).ok()
-    }
-}
-
-impl BackupProviderRegistry {
-    pub fn register(
-        &self,
-        storage_id: Uuid,
-        store: Arc<dyn MusicAssetStore>,
-    ) -> Option<Arc<dyn MusicAssetStore>> {
-        self.stores
-            .write()
-            .expect("backup provider registry lock poisoned")
-            .insert(storage_id, store)
-    }
-
-    pub fn remove(&self, storage_id: Uuid) -> Option<Arc<dyn MusicAssetStore>> {
-        self.stores
-            .write()
-            .expect("backup provider registry lock poisoned")
-            .remove(&storage_id)
-    }
-
-    pub fn get(&self, storage_id: Uuid) -> Result<Arc<dyn MusicAssetStore>, BackupError> {
-        self.stores
-            .read()
-            .expect("backup provider registry lock poisoned")
-            .get(&storage_id)
-            .cloned()
-            .ok_or(BackupError::ProviderNotRegistered(storage_id))
-    }
+/// The open store for `storage_id`, or why replication cannot use it yet.
+fn registered_store(
+    stores: &LiveStores,
+    storage_id: Uuid,
+) -> Result<Arc<dyn MusicAssetStore>, BackupError> {
+    stores
+        .get(storage_id)
+        .ok_or(BackupError::ProviderNotRegistered(storage_id))
 }
 
 /// Cloneable adapter allowing the job engine and service repositories to share one catalog.
@@ -303,7 +272,7 @@ pub enum BackupSchedulerOutcome {
 /// Desktop Slice 4 composition service.
 pub struct BackupService {
     catalog: Arc<TursoCatalog>,
-    providers: Arc<BackupProviderRegistry>,
+    providers: Arc<LiveStores>,
     engine: JobEngine<CatalogJobStore>,
     staging_root: PathBuf,
 }
@@ -311,7 +280,7 @@ pub struct BackupService {
 impl BackupService {
     pub fn new(
         catalog: Arc<TursoCatalog>,
-        providers: Arc<BackupProviderRegistry>,
+        providers: Arc<LiveStores>,
         staging_root: impl Into<PathBuf>,
     ) -> Self {
         let store = CatalogJobStore(catalog.clone());
@@ -323,7 +292,7 @@ impl BackupService {
         }
     }
 
-    pub fn providers(&self) -> &Arc<BackupProviderRegistry> {
+    pub fn providers(&self) -> &Arc<LiveStores> {
         &self.providers
     }
 
@@ -404,7 +373,7 @@ impl BackupService {
             if storage.role != StorageRole::Backup || !storage.enabled {
                 continue;
             }
-            let availability = match self.providers.get(storage.id) {
+            let availability = match registered_store(&self.providers, storage.id) {
                 Ok(store) => match store.health().await {
                     Ok(health) if health.status == HealthStatus::Healthy => {
                         BackupAvailability::Available
@@ -455,7 +424,7 @@ impl BackupService {
             .await?
             .filter(|storage| storage.enabled && storage.role == StorageRole::Primary)
             .ok_or(BackupError::ActivePrimaryMissing)?;
-        let source_provider = self.providers.get(primary.id)?;
+        let source_provider = registered_store(&self.providers, primary.id)?;
         let originals = match asset_id {
             Some(id) => vec![AssetRepository::get_original(self.catalog.as_ref(), id)
                 .await?
@@ -639,7 +608,7 @@ impl BackupService {
             if storage.role != StorageRole::Backup || !storage.enabled {
                 continue;
             }
-            let Ok(provider) = self.providers.get(storage.id) else {
+            let Ok(provider) = registered_store(&self.providers, storage.id) else {
                 continue;
             };
             let mut cursor = None;
@@ -686,7 +655,7 @@ impl BackupService {
         backup: &DatabaseBackup,
         catalog_path: &Path,
     ) -> Result<PathBuf, BackupError> {
-        let provider = self.providers.get(backup.storage_id)?;
+        let provider = registered_store(&self.providers, backup.storage_id)?;
         let staged = staged_restore_path(catalog_path);
         ensure_staging_parent(&staged)
             .await
@@ -723,7 +692,7 @@ impl BackupService {
             {
                 continue;
             }
-            let provider = self.providers.get(storage.id)?;
+            let provider = registered_store(&self.providers, storage.id)?;
             let health = provider.health().await?;
             let objects = list_catalog_objects(self.catalog.as_ref(), storage.id).await?;
             for object in objects {
@@ -991,7 +960,7 @@ impl BackupService {
 
 struct BackupExecutor {
     catalog: Arc<TursoCatalog>,
-    providers: Arc<BackupProviderRegistry>,
+    providers: Arc<LiveStores>,
     staging_root: PathBuf,
 }
 
@@ -1090,14 +1059,10 @@ impl BackupExecutor {
         destination_storage_id: Uuid,
         destination_object_key: String,
     ) -> Result<JobStep, SyncError> {
-        let source = self
-            .providers
-            .get(source_storage_id)
-            .map_err(backup_sync_error)?;
-        let destination = self
-            .providers
-            .get(destination_storage_id)
-            .map_err(backup_sync_error)?;
+        let source =
+            registered_store(&self.providers, source_storage_id).map_err(backup_sync_error)?;
+        let destination =
+            registered_store(&self.providers, destination_storage_id).map_err(backup_sync_error)?;
         let source_object = source
             .stat(&source_object_id)
             .await
@@ -1176,7 +1141,7 @@ impl BackupExecutor {
         object_id: String,
         expected_checksum: Option<String>,
     ) -> Result<JobStep, SyncError> {
-        let provider = self.providers.get(storage_id).map_err(backup_sync_error)?;
+        let provider = registered_store(&self.providers, storage_id).map_err(backup_sync_error)?;
         let object = provider
             .stat(&object_id)
             .await
@@ -1222,7 +1187,7 @@ impl BackupExecutor {
         inventory_root: Option<String>,
         payload_cursor: Option<rec_core::SyncCursor>,
     ) -> Result<JobStep, SyncError> {
-        let provider = self.providers.get(storage_id).map_err(backup_sync_error)?;
+        let provider = registered_store(&self.providers, storage_id).map_err(backup_sync_error)?;
         let page_cursor = job
             .checkpoint
             .as_ref()
@@ -1273,10 +1238,8 @@ impl BackupExecutor {
         destination_storage_id: Uuid,
         destination_object_key: String,
     ) -> Result<JobStep, SyncError> {
-        let destination = self
-            .providers
-            .get(destination_storage_id)
-            .map_err(backup_sync_error)?;
+        let destination =
+            registered_store(&self.providers, destination_storage_id).map_err(backup_sync_error)?;
         let path = staging_path(&self.staging_root, job.id, "library.db");
         ensure_staging_parent(&path).await.map_err(io_sync_error)?;
 
@@ -1377,6 +1340,39 @@ impl BackupExecutor {
                 }
             }
         }
+    }
+}
+
+/// Verified primary writes reach replication here: each asset (or, for an
+/// empty slice, every verified primary asset) is planned for every backup.
+/// Planning problems are reported, never raised, so they cannot undo the
+/// primary write.
+impl ReplicationHandoff for BackupService {
+    fn verified_primary_write<'a>(&'a self, asset_ids: &'a [Uuid]) -> BoxFuture<'a, HandoffReport> {
+        Box::pin(async move {
+            let mut report = HandoffReport::default();
+            let targets: Vec<Option<Uuid>> = if asset_ids.is_empty() {
+                vec![None]
+            } else {
+                asset_ids.iter().copied().map(Some).collect()
+            };
+            for asset_id in targets {
+                match self
+                    .handoff_verified_primary_assets(asset_id, Utc::now())
+                    .await
+                {
+                    Ok(handoff) => {
+                        report.planned_assets += handoff.considered_assets;
+                        report.queued_jobs += handoff.queued_jobs;
+                        report.deferred_targets += handoff.deferred_targets;
+                    }
+                    Err(error) => report
+                        .warnings
+                        .push(format!("backup planning remains deferred: {error}")),
+                }
+            }
+            report
+        })
     }
 }
 
@@ -2344,7 +2340,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_handoff_plans_one_specified_verified_asset() {
         let catalog = Arc::new(TursoCatalog::in_memory().await.unwrap());
-        let providers = Arc::new(BackupProviderRegistry::default());
+        let providers = Arc::new(LiveStores::default());
         let primary_id = Uuid::new_v4();
         let backup_id = Uuid::new_v4();
         let source = Arc::new(
@@ -2410,7 +2406,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_handoff_plans_all_verified_primary_assets() {
         let catalog = Arc::new(TursoCatalog::in_memory().await.unwrap());
-        let providers = Arc::new(BackupProviderRegistry::default());
+        let providers = Arc::new(LiveStores::default());
         let primary_id = Uuid::new_v4();
         let backup_id = Uuid::new_v4();
         let source = Arc::new(
@@ -2470,7 +2466,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_handoff_with_no_backups_is_a_successful_noop() {
         let catalog = Arc::new(TursoCatalog::in_memory().await.unwrap());
-        let providers = Arc::new(BackupProviderRegistry::default());
+        let providers = Arc::new(LiveStores::default());
         let primary_id = Uuid::new_v4();
         let source = Arc::new(FakeStore::new(primary_id).with_object("one.flac", b"one"));
         providers.register(primary_id, source.clone());
@@ -2508,7 +2504,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_catalog_handoff_deduplicates_active_replication() {
         let catalog = Arc::new(TursoCatalog::in_memory().await.unwrap());
-        let providers = Arc::new(BackupProviderRegistry::default());
+        let providers = Arc::new(LiveStores::default());
         let primary_id = Uuid::new_v4();
         let backup_id = Uuid::new_v4();
         let source = Arc::new(FakeStore::new(primary_id).with_object("one.flac", b"one"));
@@ -2559,7 +2555,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_handoff_queues_unavailable_backup_as_deferred() {
         let catalog = Arc::new(TursoCatalog::in_memory().await.unwrap());
-        let providers = Arc::new(BackupProviderRegistry::default());
+        let providers = Arc::new(LiveStores::default());
         let primary_id = Uuid::new_v4();
         let backup_id = Uuid::new_v4();
         let source = Arc::new(FakeStore::new(primary_id).with_object("one.flac", b"one"));
@@ -2611,7 +2607,7 @@ mod tests {
     #[tokio::test]
     async fn durable_worker_restarts_after_upload_failure_without_repeating_download() {
         let catalog = Arc::new(TursoCatalog::in_memory().await.unwrap());
-        let providers = Arc::new(BackupProviderRegistry::default());
+        let providers = Arc::new(LiveStores::default());
         let source_id = Uuid::new_v4();
         let destination_id = Uuid::new_v4();
         let bytes = b"restartable";

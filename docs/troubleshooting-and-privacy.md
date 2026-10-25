@@ -67,11 +67,15 @@ SoundCloud refresh tokens are single-use. The desktop serializes refresh under a
 
 ### OAuth configuration missing
 
-Set `REC_BAG_GOOGLE_CLIENT_ID` to an installed-app client ID. Register the exact loopback redirect (default `http://127.0.0.1:17842/oauth/google`) and restart.
+Set `REC_BAG_GOOGLE_CLIENT_ID` and `REC_BAG_GOOGLE_CLIENT_SECRET` from a **Desktop app** OAuth client and restart. Desktop-type clients need no redirect URI registration; loopback IP redirects on any port are permitted. Debug builds read these from `.env`; release builds need them in the process environment unless `REC_BAG_LOAD_DOTENV=true`.
+
+### Token endpoint returned 400
+
+The error message includes Google's `error` and `error_description`. `invalid_request (client_secret is missing.)` or `invalid_client` means `REC_BAG_GOOGLE_CLIENT_SECRET` is unset or does not belong to the configured client ID.
 
 ### Callback port or state failure
 
-The loopback URL must be plain HTTP on localhost/loopback with an explicit port. The listener binds `127.0.0.1`, times out after 180 seconds, validates the callback path, and consumes state once. Restart the authorization flow; never reuse a callback URL.
+The loopback URL must be plain HTTP on localhost/loopback with an explicit port. The listener binds `127.0.0.1`, times out after 180 seconds, answers stray requests on other paths (such as `/favicon.ico`) with 404 while it keeps waiting, and consumes state once. Restart the authorization flow; never reuse a callback URL.
 
 ### Dedicated folder creation returns 403/404
 
@@ -83,9 +87,17 @@ This is expected. Shared Drives are disabled, and inventory is constrained to th
 
 ### Playback cache is corrupt/full
 
-Cache entries are disposable and checksum verified. Stop playback, remove only the affected storage cache under `cache/google-drive/<storage-id>/`, then allow a fresh download. Never delete primary/backup Drive files to fix cache pressure.
+Cache entries are disposable and checksum verified. Stop playback, remove only the affected storage cache under `cache/offline/<storage-id>/`, then allow a fresh download. Never delete primary/backup Drive files to fix cache pressure.
 
 ## Local/backup behavior
+
+### Playback says to restore a track from backup
+
+Expected when the primary has lost a file that a backup still holds. rec_bag never plays a backup copy; use **Copy to primary**, which restores the file from the backup, verifies it, and then plays it from the primary.
+
+### Disconnect, revoke, or forget is refused for the primary
+
+Expected. The active primary can be replaced but not removed. Migrate to another primary first, then disconnect, revoke, or forget the old storage.
 
 ### Storage appears empty while disconnected
 
@@ -113,7 +125,7 @@ Retention keeps 30 days and at least three versions and requires exact approval.
 
 - `library.db`: track/playlist metadata, source relationships, paths/app-created Drive folder IDs, checksums, provider object IDs, jobs, errors, settings, and non-secret credential references.
 - catalog and recovery snapshots: most of the same metadata and operational history, with secret-field rejection and without token values.
-- Drive cache/staging: temporary full audio content.
+- Offline cache/staging: temporary full audio content.
 - local primary/backups: normal unencrypted audio files.
 - OS keyring: SoundCloud and Google user token material.
 
@@ -133,7 +145,7 @@ Audio bytes leave the device when Google Drive is primary/backup. SoundCloud cat
 
 ### Retention and deletion
 
-SoundCloud disconnect revokes access at SoundCloud when reachable, removes its local credential, and deletes SoundCloud-derived catalog rows (SoundCloud API Terms), preserving canonical owned assets. Google storage disconnect is non-destructive and retains the account credential for other/reconnected Drive storage. Revocation removes the relevant local credential and disables affected connections but does not delete remote content. Confirmed provider forget deletes current provider-derived catalog/storage rows and current catalog snapshot rows while preserving canonical owned assets and remote files. Independently exported/off-device snapshots and backups require separate deletion. Primary deletion does not cascade to backups. Define operator retention for profile backups, logs, and support artifacts, and honor user deletion/export requests across each location.
+SoundCloud disconnect revokes access at SoundCloud when reachable, removes its local credential, and deletes SoundCloud-derived catalog rows (SoundCloud API Terms), preserving canonical owned assets. Google storage disconnect is non-destructive and retains the account credential for other/reconnected Drive storage. Revocation removes the relevant local credential and disables affected connections but does not delete remote content. Disconnect, revocation, and forget are refused for the active primary (and revocation for any grant the primary uses) until another primary has been migrated to. Confirmed provider forget deletes current provider-derived catalog/storage rows and current catalog snapshot rows while preserving canonical owned assets and remote files. Independently exported/off-device snapshots and backups require separate deletion. Primary deletion does not cascade to backups. Define operator retention for profile backups, logs, and support artifacts, and honor user deletion/export requests across each location.
 
 ### Logs and support
 

@@ -58,11 +58,33 @@ fn initialize_logging() {
         .try_init();
 }
 
+/// Loads `.env` (searched upward from the working directory) so local `REC_BAG_GOOGLE_*` settings
+/// reach the desktop process.
+///
+/// Defaults to on for debug builds and off for release builds; `REC_BAG_LOAD_DOTENV` overrides
+/// either default. Process environment always takes precedence over `.env` values.
+#[cfg(feature = "desktop")]
+fn load_dotenv() {
+    let enabled = match std::env::var("REC_BAG_LOAD_DOTENV")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Ok("true" | "1" | "yes") => true,
+        Ok("false" | "0" | "no") => false,
+        _ => cfg!(debug_assertions),
+    };
+    if enabled {
+        let _ = dotenvy::dotenv();
+    }
+}
+
 /// The desktop process is the only runtime permitted to acquire and mutate the local profile.
 /// `dx serve --platform desktop` also starts a fullstack server sidecar for server functions;
 /// letting that sidecar acquire the lease first would make the native UI block itself.
 #[cfg(feature = "desktop")]
 fn main() {
+    // Before logging and any threads exist, so `.env` can also supply `RUST_LOG`.
+    load_dotenv();
     initialize_logging();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

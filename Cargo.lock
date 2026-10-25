@@ -1587,7 +1587,9 @@ dependencies = [
  "chrono",
  "dioxus",
  "dioxus-ssr",
+ "dotenvy",
  "keyring",
+ "music_storage",
  "music_storage_google_drive",
  "music_storage_local",
  "rand 0.9.2",
@@ -4529,6 +4531,23 @@ dependencies = [
  "mime",
  "spin",
  "version_check",
+]
+
+[[package]]
+name = "music_storage"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rec_core",
+ "rec_persistence",
+ "rec_sync",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

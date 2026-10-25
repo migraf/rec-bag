@@ -39,8 +39,8 @@ The directory contains:
 
 ```text
 library.db
-cache/google-drive/<storage-id>/
-staging/drive/
+cache/offline/<storage-id>/
+staging/storage/
 staging/backup/
 ```
 
@@ -128,11 +128,20 @@ Never use `$http_x_real_ip`. Test spoofed, missing, malformed, and comma-separat
 
 ## 4. Google OAuth and app-created storage folder
 
-Create a Google Cloud project, enable Google Drive API, configure the OAuth consent screen, and create an **installed/desktop application** OAuth client. Register the exact loopback redirect used by rec_bag; default:
+Create a Google Cloud project, enable Google Drive API, configure the OAuth consent screen, and create an OAuth client of type **Desktop app**. Desktop-type clients have no redirect URI registration: Google permits loopback IP redirects on any port. rec_bag listens on this default, overridable with `REC_BAG_GOOGLE_REDIRECT_URI`:
 
 ```text
 http://127.0.0.1:17842/oauth/google
 ```
+
+Configure the desktop with both values from the client:
+
+```dotenv
+REC_BAG_GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+REC_BAG_GOOGLE_CLIENT_SECRET=your-desktop-client-secret
+```
+
+Google issues a client secret for Desktop-type clients. It is not confidential in an installed app (it ships with every copy), but Google's token endpoint still requires it for code exchange and refresh, even with PKCE. Debug builds load these from `.env` (searched upward from the working directory); set `REC_BAG_LOAD_DOTENV=true` or `false` to override. Process environment variables take precedence over `.env`.
 
 The desktop requests only:
 
@@ -140,7 +149,7 @@ The desktop requests only:
 https://www.googleapis.com/auth/drive.file
 ```
 
-It also requests offline access and consent so a refresh token can be issued. The flow uses PKCE S256 and a one-time state value. No Google client secret is used by the production desktop wiring.
+It also requests offline access and consent so a refresh token can be issued. The flow uses PKCE S256 and a one-time state value, and sends the Desktop client secret to the token endpoint.
 
 After authorization, rec_bag creates a dedicated My Drive folder named `rec_bag Music` with Drive `files.create`. This app-created folder is directly accessible under `drive.file`. rec_bag validates the returned object as a non-trashed My Drive folder and persists its stable ID and display name.
 

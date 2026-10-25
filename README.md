@@ -38,9 +38,12 @@ Desktop:
 
 ```dotenv
 REC_BAG_DATA_DIR=/absolute/writable/profile-directory
-REC_BAG_GOOGLE_CLIENT_ID=installed-app-client-id
+REC_BAG_GOOGLE_CLIENT_ID=desktop-app-client-id
+REC_BAG_GOOGLE_CLIENT_SECRET=desktop-app-client-secret
 REC_BAG_GOOGLE_REDIRECT_URI=http://127.0.0.1:17842/oauth/google
 ```
+
+Create the Google OAuth client as type **Desktop app**; no redirect URI registration is needed. Its client secret is not confidential in an installed app, but Google's token endpoint requires it. Debug desktop builds load `.env` automatically (`REC_BAG_LOAD_DOTENV` overrides); process environment wins.
 
 The desktop app gets the public SoundCloud client ID and loopback redirect from the broker (`/api/soundcloud/oauth/config`), so connecting needs no manual setup. **Music Management → Configure SoundCloud** optionally overrides them in the local profile; the broker client secret is never entered in the desktop app.
 
@@ -65,7 +68,8 @@ Use a secret manager for server credentials. Provider user tokens belong in the 
 ## Safety invariants
 
 - SoundCloud is a catalog source; rec_bag does not archive SoundCloud playback transcodes.
-- Exactly zero or one storage is active primary. Backups never become authoritative automatically.
+- Exactly zero or one storage is active primary. Backups never become authoritative automatically, and playback never reads a backup: a file only a backup holds is restored to the primary.
+- The active primary cannot be disconnected or forgotten; migrate to another primary first.
 - A primary change must inventory, copy, verify, snapshot, confirm, and atomically switch roles. The old primary remains a backup by default.
 - External primary changes wait for review before replication. Primary deletion does not delete backup copies.
 - Google Drive access uses `drive.file`, My Drive only, and a dedicated app-created `rec_bag Music` folder subtree.

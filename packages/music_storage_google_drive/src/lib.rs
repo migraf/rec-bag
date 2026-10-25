@@ -5,11 +5,9 @@
 //! only: every listing uses `corpora=user`, `spaces=drive`, and never enables
 //! shared-drive support.
 
-mod cache;
 mod checkpoint;
 mod http;
 
-pub use cache::CacheConfig;
 pub use checkpoint::{
     DriveUploadCheckpoint, DriveUploadCheckpointStore, FileDriveUploadCheckpointStore,
 };
@@ -18,7 +16,6 @@ pub use http::{
     GoogleAccessToken, GoogleTokenError, GoogleTokenProvider,
 };
 
-use cache::PlaybackCache;
 use chrono::{DateTime, Utc};
 use md5::Md5;
 use rec_core::{
@@ -96,7 +93,6 @@ impl Default for RetryPolicy {
 pub struct GoogleDriveStoreConfig {
     pub storage_id: Uuid,
     pub folder: GoogleDriveFolder,
-    pub cache: Option<CacheConfig>,
     pub retry: RetryPolicy,
     pub api_base_url: String,
     pub upload_base_url: String,
@@ -108,7 +104,6 @@ impl GoogleDriveStoreConfig {
         Self {
             storage_id,
             folder,
-            cache: None,
             retry: RetryPolicy::default(),
             api_base_url: DRIVE_V3.to_owned(),
             upload_base_url: UPLOAD_V3.to_owned(),
@@ -122,22 +117,6 @@ pub struct GoogleDriveMusicStore<T, P> {
     config: GoogleDriveStoreConfig,
     transport: T,
     tokens: P,
-    cache: Option<PlaybackCache>,
-}
-
-/// Runtime cache operations exposed for provider registries without requiring a
-/// concrete Google Drive store type.
-pub trait PlaybackCacheRuntime: Send + Sync {
-    fn cached_playback_path(
-        &self,
-        object_id: &str,
-    ) -> Result<Option<std::path::PathBuf>, MusicStorageError>;
-    fn cache_for_playback<'a>(
-        &'a self,
-        object_id: &'a str,
-    ) -> BoxFuture<'a, Result<std::path::PathBuf, MusicStorageError>>;
-    fn set_offline_pinned(&self, object_id: &str, pinned: bool) -> Result<(), MusicStorageError>;
-    fn evict_playback_cache(&self) -> Result<(), MusicStorageError>;
 }
 
 impl<T, P> GoogleDriveMusicStore<T, P> {
@@ -158,52 +137,15 @@ impl<T, P> GoogleDriveMusicStore<T, P> {
                 format!("upload chunk size must be between 1 and {MAX_UPLOAD_CHUNK_SIZE} bytes"),
             ));
         }
-        let cache = config.cache.clone().map(PlaybackCache::new).transpose()?;
         Ok(Self {
             config,
             transport,
             tokens,
-            cache,
         })
     }
 
     pub fn folder(&self) -> &GoogleDriveFolder {
         &self.config.folder
-    }
-
-    /// Returns an existing verified playback-cache entry, updating its LRU time.
-    pub fn cached_playback_path(
-        &self,
-        object_id: &str,
-    ) -> Result<Option<std::path::PathBuf>, MusicStorageError> {
-        self.cache
-            .as_ref()
-            .map_or(Ok(None), |cache| cache.cached_path(object_id))
-    }
-
-    /// Pins an already cached object so LRU eviction will not remove it.
-    pub fn set_offline_pinned(
-        &self,
-        object_id: &str,
-        pinned: bool,
-    ) -> Result<(), MusicStorageError> {
-        self.cache
-            .as_ref()
-            .ok_or_else(|| {
-                MusicStorageError::new(
-                    MusicStorageErrorKind::NotFound,
-                    "playback cache is disabled",
-                )
-            })?
-            .set_pinned(object_id, pinned)
-    }
-
-    /// Applies the configured LRU size limit immediately.
-    pub fn evict_playback_cache(&self) -> Result<(), MusicStorageError> {
-        if let Some(cache) = &self.cache {
-            cache.evict()?;
-        }
-        Ok(())
     }
 }
 
@@ -286,6 +228,19 @@ impl<T: DriveHttpTransport, P: GoogleTokenProvider> GoogleDriveMusicStore<T, P> 
             self.config.api_base_url,
             url_encode(object_id),
             url_encode(FILE_FIELDS)
+        );
+        parse_json(self.execute(DriveHttpRequest::new("GET", url)).await?)
+    }
+
+    /// Reads the configured folder's own Drive capabilities. Storage
+    /// capabilities are established from this probe, never assumed from the
+    /// storage kind.
+    async fn probe_folder(&self) -> Result<DriveFolderProbe, MusicStorageError> {
+        let url = format!(
+            "{}/files/{}?fields={}&supportsAllDrives=false",
+            self.config.api_base_url,
+            url_encode(&self.config.folder.id),
+            url_encode(FOLDER_PROBE_FIELDS)
         );
         parse_json(self.execute(DriveHttpRequest::new("GET", url)).await?)
     }
@@ -904,66 +859,6 @@ impl<T: DriveHttpTransport, P: GoogleTokenProvider> GoogleDriveMusicStore<T, P> 
             checksum_verified: expected.is_some(),
         })
     }
-
-    /// Downloads an object to the verified local playback cache, returning its path.
-    pub async fn cache_for_playback(
-        &self,
-        object_id: &str,
-    ) -> Result<std::path::PathBuf, MusicStorageError> {
-        let cache = self.cache.as_ref().ok_or_else(|| {
-            MusicStorageError::new(
-                MusicStorageErrorKind::NotFound,
-                "playback cache is disabled",
-            )
-        })?;
-        if let Some(path) = cache.cached_path(object_id)? {
-            return Ok(path);
-        }
-        let path = cache.path_for(object_id);
-        let result = self
-            .download_inner(DownloadRequest {
-                object_id: object_id.to_owned(),
-                destination_path: path.clone(),
-                range: None,
-                expected_checksum: None,
-                overwrite: true,
-            })
-            .await?;
-        let checksum = result.checksum.ok_or_else(|| {
-            MusicStorageError::new(
-                MusicStorageErrorKind::ChecksumMismatch,
-                "playback cache download did not produce a checksum",
-            )
-        })?;
-        cache.record(object_id, &path, result.bytes_written, checksum)?;
-        Ok(path)
-    }
-}
-
-impl<T: DriveHttpTransport + Send + Sync, P: GoogleTokenProvider + Send + Sync> PlaybackCacheRuntime
-    for GoogleDriveMusicStore<T, P>
-{
-    fn cached_playback_path(
-        &self,
-        object_id: &str,
-    ) -> Result<Option<std::path::PathBuf>, MusicStorageError> {
-        GoogleDriveMusicStore::cached_playback_path(self, object_id)
-    }
-
-    fn cache_for_playback<'a>(
-        &'a self,
-        object_id: &'a str,
-    ) -> BoxFuture<'a, Result<std::path::PathBuf, MusicStorageError>> {
-        Box::pin(async move { GoogleDriveMusicStore::cache_for_playback(self, object_id).await })
-    }
-
-    fn set_offline_pinned(&self, object_id: &str, pinned: bool) -> Result<(), MusicStorageError> {
-        GoogleDriveMusicStore::set_offline_pinned(self, object_id, pinned)
-    }
-
-    fn evict_playback_cache(&self) -> Result<(), MusicStorageError> {
-        GoogleDriveMusicStore::evict_playback_cache(self)
-    }
 }
 
 impl<T: DriveHttpTransport + Send + Sync, P: GoogleTokenProvider + Send + Sync> MusicAssetStore
@@ -971,19 +866,31 @@ impl<T: DriveHttpTransport + Send + Sync, P: GoogleTokenProvider + Send + Sync> 
 {
     fn health(&self) -> BoxFuture<'_, Result<StorageHealth, MusicStorageError>> {
         Box::pin(async move {
-            let url = format!(
-                "{}/about?fields=user(permissionId)&supportsAllDrives=false",
-                self.config.api_base_url
-            );
-            match self.execute(DriveHttpRequest::new("GET", url)).await {
-                Ok(_) => Ok(StorageHealth {
-                    status: HealthStatus::Healthy,
-                    checked_at: Utc::now(),
-                    message: None,
-                    capabilities: drive_capabilities(),
-                }),
-                Err(error) => Ok(StorageHealth {
-                    status: match error.kind {
+            let (status, message, capabilities) = match self.probe_folder().await {
+                Ok(folder) if folder.trashed => (
+                    HealthStatus::Unavailable,
+                    Some("Drive folder is in the trash".to_owned()),
+                    StorageCapabilities::default(),
+                ),
+                Ok(folder) if folder.mime_type.as_deref() != Some(FOLDER_MIME_TYPE) => (
+                    HealthStatus::Unavailable,
+                    Some("Drive storage root is not a folder".to_owned()),
+                    StorageCapabilities::default(),
+                ),
+                Ok(folder) => {
+                    let capabilities = folder.capabilities.storage_capabilities();
+                    if capabilities.can_upload {
+                        (HealthStatus::Healthy, None, capabilities)
+                    } else {
+                        (
+                            HealthStatus::Degraded,
+                            Some("Drive folder is read-only".to_owned()),
+                            capabilities,
+                        )
+                    }
+                }
+                Err(error) => (
+                    match error.kind {
                         MusicStorageErrorKind::AuthenticationRequired => {
                             HealthStatus::AuthenticationRequired
                         }
@@ -991,11 +898,16 @@ impl<T: DriveHttpTransport + Send + Sync, P: GoogleTokenProvider + Send + Sync> 
                         | MusicStorageErrorKind::RateLimited => HealthStatus::Degraded,
                         _ => HealthStatus::Unavailable,
                     },
-                    checked_at: Utc::now(),
-                    message: Some(error.message),
-                    capabilities: drive_capabilities(),
-                }),
-            }
+                    Some(error.message),
+                    StorageCapabilities::default(),
+                ),
+            };
+            Ok(StorageHealth {
+                status,
+                checked_at: Utc::now(),
+                message,
+                capabilities,
+            })
         })
     }
 
@@ -1071,24 +983,8 @@ impl<T: DriveHttpTransport + Send + Sync, P: GoogleTokenProvider + Send + Sync> 
     }
 }
 
-fn drive_capabilities() -> StorageCapabilities {
-    StorageCapabilities {
-        can_inventory: true,
-        can_stat: true,
-        can_upload: true,
-        can_download: true,
-        can_create_containers: false,
-        supports_atomic_replace: false,
-        supports_change_tracking: true,
-        supports_version_history: true,
-        provider_hash_algorithms: vec![
-            HashAlgorithm::Md5,
-            HashAlgorithm::Sha1,
-            HashAlgorithm::Sha256,
-        ],
-    }
-}
-
+const FOLDER_PROBE_FIELDS: &str =
+    "id,mimeType,trashed,capabilities(canAddChildren,canListChildren,canEdit,canDownload)";
 const FILE_FIELDS: &str = "id,name,mimeType,size,modifiedTime,version,headRevisionId,etag,md5Checksum,sha1Checksum,sha256Checksum,trashed,appProperties,capabilities(canDownload),parents";
 
 #[derive(Debug, Deserialize)]
@@ -1145,6 +1041,49 @@ struct DriveFile {
 struct DriveCapabilities {
     #[serde(default)]
     can_download: bool,
+}
+/// The configured folder as reported by the capability probe.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriveFolderProbe {
+    mime_type: Option<String>,
+    #[serde(default)]
+    trashed: bool,
+    #[serde(default)]
+    capabilities: DriveFolderCapabilities,
+}
+/// Capabilities the signed-in user has on the configured folder. Missing
+/// fields fail closed. The folder's `canDownload` is not mapped: downloads are
+/// authorized per file by [`DriveCapabilities`] before any content request.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriveFolderCapabilities {
+    #[serde(default)]
+    can_add_children: bool,
+    #[serde(default)]
+    can_list_children: bool,
+    #[serde(default)]
+    can_edit: bool,
+}
+impl DriveFolderCapabilities {
+    fn storage_capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities {
+            can_inventory: self.can_list_children,
+            can_stat: true,
+            can_upload: self.can_add_children && self.can_edit,
+            can_download: true,
+            can_create_containers: false,
+            supports_atomic_replace: false,
+            // Incremental inventory only refines a full listing of the folder.
+            supports_change_tracking: self.can_list_children,
+            supports_version_history: true,
+            provider_hash_algorithms: vec![
+                HashAlgorithm::Md5,
+                HashAlgorithm::Sha1,
+                HashAlgorithm::Sha256,
+            ],
+        }
+    }
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

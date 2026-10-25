@@ -1,0 +1,24 @@
+[package]
+name = "music_storage"
+version = "0.1.0"
+edition = "2021"
+description = "Provider-neutral music storage workflows for rec_bag"
+
+[dependencies]
+chrono.workspace = true
+rec_core = { version = "0.1.0", path = "../core", default-features = false }
+rec_persistence = { version = "0.1.0", path = "../persistence" }
+rec_sync = { version = "0.1.0", path = "../sync" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+# Exposes `testing` (in-memory store, fake driver, temporary catalog) to other crates' tests.
+test-support = []

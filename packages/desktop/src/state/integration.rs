@@ -26,7 +26,8 @@ use ui::{
 pub enum IntegrationSlice {
     LocalLibrary,
     SoundcloudCatalog,
-    GoogleDrive,
+    /// Every music storage, whatever its provider.
+    MusicStorage,
     Backup,
     ReconciliationActions,
 }
@@ -35,7 +36,7 @@ impl IntegrationSlice {
     pub const ALL: [Self; 5] = [
         Self::LocalLibrary,
         Self::SoundcloudCatalog,
-        Self::GoogleDrive,
+        Self::MusicStorage,
         Self::Backup,
         Self::ReconciliationActions,
     ];
@@ -564,7 +565,7 @@ pub fn use_integration_state_provider(startup: Option<Result<DesktopStartup, Int
                     state,
                     app_state,
                     runtime.clone(),
-                    IntegrationSlice::GoogleDrive
+                    IntegrationSlice::MusicStorage
                 ),
                 run_slice(state, app_state, runtime.clone(), IntegrationSlice::Backup),
                 run_slice(
@@ -659,60 +660,34 @@ fn slice_for_event(
     event: &MusicManagementEvent,
     view: &MusicManagementView,
 ) -> Result<IntegrationSlice, &'static str> {
-    let source_slice = |source_id: &str| {
-        let source = view
-            .sources
-            .iter()
-            .find(|source| source.id == source_id)
-            .ok_or("The selected music source no longer exists")?;
-        match source.provider {
-            ProviderChoice::LocalFolder => Ok(IntegrationSlice::LocalLibrary),
-            ProviderChoice::SoundCloud => Ok(IntegrationSlice::SoundcloudCatalog),
-            ProviderChoice::GoogleDrive => Ok(IntegrationSlice::GoogleDrive),
-        }
-    };
-    let storage_slice = |storage_id: &str| {
-        let storage = view
-            .primary_storage
+    let source = |source_id: &str| view.sources.iter().find(|source| source.id == source_id);
+    let storage = |storage_id: &str| {
+        view.primary_storage
             .iter()
             .chain(view.backup_storages.iter())
             .chain(view.unassigned_storages.iter())
             .find(|storage| storage.id == storage_id)
-            .ok_or("The selected music storage no longer exists")?;
-        match storage.provider {
+    };
+    let source_slice = |source_id: &str| {
+        let source = source(source_id).ok_or("The selected music source no longer exists")?;
+        match source.provider {
             ProviderChoice::LocalFolder => Ok(IntegrationSlice::LocalLibrary),
-            ProviderChoice::GoogleDrive => Ok(IntegrationSlice::GoogleDrive),
-            ProviderChoice::SoundCloud => Err("SoundCloud cannot be used as music storage"),
+            ProviderChoice::SoundCloud => Ok(IntegrationSlice::SoundcloudCatalog),
+            ProviderChoice::GoogleDrive => Ok(IntegrationSlice::MusicStorage),
         }
     };
-    let persisted_data_slice = |record_id: &str| {
-        let source_provider = view
-            .sources
-            .iter()
-            .find(|source| source.id == record_id)
-            .map(|source| source.provider);
-        let storage_provider = view
-            .primary_storage
-            .iter()
-            .chain(view.backup_storages.iter())
-            .chain(view.unassigned_storages.iter())
-            .find(|storage| storage.id == record_id)
-            .map(|storage| storage.provider);
-        let provider = match (source_provider, storage_provider) {
-            (Some(source), Some(storage)) if source != storage => {
-                return Err("The selected provider record is ambiguous")
-            }
-            (Some(provider), _) | (_, Some(provider)) => provider,
-            (None, None) => return Err("The selected provider record no longer exists"),
-        };
-        match provider {
-            ProviderChoice::LocalFolder => Ok(IntegrationSlice::LocalLibrary),
-            ProviderChoice::SoundCloud if source_provider.is_some() => {
-                Ok(IntegrationSlice::SoundcloudCatalog)
-            }
-            ProviderChoice::GoogleDrive => Ok(IntegrationSlice::GoogleDrive),
-            ProviderChoice::SoundCloud => Err("SoundCloud cannot be used as music storage"),
-        }
+    let existing_storage = |storage_id: &str| {
+        storage(storage_id)
+            .map(|_| IntegrationSlice::MusicStorage)
+            .ok_or("The selected music storage no longer exists")
+    };
+    // Local data held for a record: a storage's belongs to the storage slice,
+    // a source's to the slice owning that source.
+    let persisted_data_slice = |record_id: &str| match (source(record_id), storage(record_id)) {
+        (Some(_), Some(_)) => Err("The selected provider record is ambiguous"),
+        (_, Some(_)) => Ok(IntegrationSlice::MusicStorage),
+        (Some(_), None) => source_slice(record_id),
+        (None, None) => Err("The selected provider record no longer exists"),
     };
 
     match event {
@@ -720,12 +695,13 @@ fn slice_for_event(
         | MusicManagementEvent::AddLocalFolderSource { .. } => Ok(IntegrationSlice::LocalLibrary),
         MusicManagementEvent::AddSource(ProviderChoice::SoundCloud)
         | MusicManagementEvent::ConfigureSoundCloud(_) => Ok(IntegrationSlice::SoundcloudCatalog),
+        // Refused by the storage slice, which explains why.
         MusicManagementEvent::AddSource(ProviderChoice::GoogleDrive) => {
-            Ok(IntegrationSlice::GoogleDrive)
+            Ok(IntegrationSlice::MusicStorage)
         }
         MusicManagementEvent::SyncSource(source_id) => source_slice(source_id),
         MusicManagementEvent::DisconnectSource { source_id } => match source_slice(source_id)? {
-            IntegrationSlice::GoogleDrive => {
+            IntegrationSlice::MusicStorage => {
                 Err("Google Drive must be disconnected as music storage")
             }
             slice => Ok(slice),
@@ -734,12 +710,7 @@ fn slice_for_event(
         | MusicManagementEvent::ForgetProviderCatalogData { source_id } => {
             persisted_data_slice(source_id)
         }
-        MusicManagementEvent::DisconnectStorage { storage_id } => {
-            match storage_slice(storage_id)? {
-                IntegrationSlice::GoogleDrive => Ok(IntegrationSlice::GoogleDrive),
-                _ => Err("Only Google Drive uses the storage disconnect lifecycle"),
-            }
-        }
+        MusicManagementEvent::DisconnectStorage { storage_id } => existing_storage(storage_id),
         MusicManagementEvent::RevokeProviderGrant {
             provider,
             connection_id,
@@ -748,60 +719,30 @@ fn slice_for_event(
                 IntegrationSlice::SoundcloudCatalog => Ok(IntegrationSlice::SoundcloudCatalog),
                 _ => Err("The provider grant does not match the selected music source"),
             },
-            ProviderChoice::GoogleDrive => match storage_slice(connection_id)? {
-                IntegrationSlice::GoogleDrive => Ok(IntegrationSlice::GoogleDrive),
-                _ => Err("The provider grant does not match the selected music storage"),
-            },
+            ProviderChoice::GoogleDrive => {
+                match storage(connection_id).map(|storage| storage.provider) {
+                    Some(ProviderChoice::GoogleDrive) => Ok(IntegrationSlice::MusicStorage),
+                    Some(_) => Err("The provider grant does not match the selected music storage"),
+                    None => Err("The selected music storage no longer exists"),
+                }
+            }
             ProviderChoice::LocalFolder => {
                 Err("Local folders do not have provider authorization grants")
             }
         },
-        MusicManagementEvent::CreatePrimary(ui::PrimaryConfigurationView {
-            provider: ProviderChoice::GoogleDrive,
-            ..
-        })
-        | MusicManagementEvent::PreparePrimaryMigration(ui::PrimaryMigrationPlanView {
-            destination:
-                ui::PrimaryConfigurationView {
-                    provider: ProviderChoice::GoogleDrive,
-                    ..
-                },
-            ..
-        }) => Ok(IntegrationSlice::GoogleDrive),
         MusicManagementEvent::CreatePrimary(_)
         | MusicManagementEvent::UpdatePrimaryMetadata(_)
-        | MusicManagementEvent::PreparePrimaryMigration(_) => Ok(IntegrationSlice::LocalLibrary),
-        MusicManagementEvent::AddBackup(ProviderChoice::LocalFolder) => {
-            Ok(IntegrationSlice::LocalLibrary)
-        }
-        MusicManagementEvent::AddBackup(ProviderChoice::GoogleDrive) => {
-            Ok(IntegrationSlice::GoogleDrive)
-        }
+        | MusicManagementEvent::PreparePrimaryMigration(_)
+        | MusicManagementEvent::AddBackup(ProviderChoice::LocalFolder)
+        | MusicManagementEvent::AddBackup(ProviderChoice::GoogleDrive)
+        | MusicManagementEvent::ToggleOfflinePin(_, _)
+        | MusicManagementEvent::CopyToPrimary(_) => Ok(IntegrationSlice::MusicStorage),
         MusicManagementEvent::AddBackup(ProviderChoice::SoundCloud)
         | MusicManagementEvent::SaveBackupPolicy(_)
         | MusicManagementEvent::StartCleanupReview
         | MusicManagementEvent::ConfirmCleanup(_) => Ok(IntegrationSlice::Backup),
-        MusicManagementEvent::RetryStorage(storage_id) => Ok(view
-            .primary_storage
-            .iter()
-            .chain(view.backup_storages.iter())
-            .chain(view.unassigned_storages.iter())
-            .find(|storage| storage.id == *storage_id)
-            .map(|storage| match storage.provider {
-                ProviderChoice::LocalFolder => IntegrationSlice::LocalLibrary,
-                ProviderChoice::GoogleDrive => IntegrationSlice::GoogleDrive,
-                ProviderChoice::SoundCloud => IntegrationSlice::Backup,
-            })
-            .unwrap_or(IntegrationSlice::ReconciliationActions)),
-        MusicManagementEvent::ToggleOfflinePin(_, _) => Ok(IntegrationSlice::GoogleDrive),
-        MusicManagementEvent::CopyToPrimary(_) => Ok(view
-            .primary_storage
-            .as_ref()
-            .map(|storage| match storage.provider {
-                ProviderChoice::LocalFolder => IntegrationSlice::LocalLibrary,
-                ProviderChoice::GoogleDrive => IntegrationSlice::GoogleDrive,
-                ProviderChoice::SoundCloud => IntegrationSlice::ReconciliationActions,
-            })
+        MusicManagementEvent::RetryStorage(storage_id) => Ok(storage(storage_id)
+            .map(|_| IntegrationSlice::MusicStorage)
             .unwrap_or(IntegrationSlice::ReconciliationActions)),
         MusicManagementEvent::RetrySyncRun { .. }
         | MusicManagementEvent::ReviewMatch(_)
@@ -880,7 +821,7 @@ mod tests {
             vec![
                 IntegrationSlice::LocalLibrary,
                 IntegrationSlice::SoundcloudCatalog,
-                IntegrationSlice::GoogleDrive,
+                IntegrationSlice::MusicStorage,
             ]
         );
     }
@@ -918,6 +859,14 @@ mod tests {
                 provider: ProviderChoice::SoundCloud,
                 connection_id: "soundcloud-main".to_owned(),
             },
+            // Local storages share the one storage lifecycle.
+            MusicManagementEvent::DisconnectStorage {
+                storage_id: "primary-local".to_owned(),
+            },
+            MusicManagementEvent::ForgetProviderCatalogData {
+                source_id: "primary-candidate".to_owned(),
+            },
+            MusicManagementEvent::RetryStorage("primary-local".to_owned()),
         ];
 
         for event in events {
@@ -933,11 +882,14 @@ mod tests {
                 IntegrationSlice::SoundcloudCatalog,
                 IntegrationSlice::LocalLibrary,
                 IntegrationSlice::SoundcloudCatalog,
-                IntegrationSlice::GoogleDrive,
-                IntegrationSlice::GoogleDrive,
-                IntegrationSlice::GoogleDrive,
-                IntegrationSlice::GoogleDrive,
+                IntegrationSlice::MusicStorage,
+                IntegrationSlice::MusicStorage,
+                IntegrationSlice::MusicStorage,
+                IntegrationSlice::MusicStorage,
                 IntegrationSlice::SoundcloudCatalog,
+                IntegrationSlice::MusicStorage,
+                IntegrationSlice::MusicStorage,
+                IntegrationSlice::MusicStorage,
             ]
         );
     }
@@ -952,12 +904,17 @@ mod tests {
             MusicManagementEvent::DisconnectStorage {
                 storage_id: "missing-storage".to_owned(),
             },
+            // A source is not a storage.
             MusicManagementEvent::DisconnectStorage {
-                storage_id: "primary-local".to_owned(),
+                storage_id: "local-crate".to_owned(),
             },
             MusicManagementEvent::RevokeProviderGrant {
                 provider: ProviderChoice::SoundCloud,
                 connection_id: "backup-drive".to_owned(),
+            },
+            MusicManagementEvent::RevokeProviderGrant {
+                provider: ProviderChoice::GoogleDrive,
+                connection_id: "primary-local".to_owned(),
             },
             MusicManagementEvent::RevokeProviderGrant {
                 provider: ProviderChoice::LocalFolder,
@@ -970,7 +927,7 @@ mod tests {
         }
 
         assert_eq!(state.pending_requests().count(), 0);
-        assert_eq!(state.errors.len(), 4);
+        assert_eq!(state.errors.len(), 5);
         assert!(state.errors.iter().all(|error| !error.retryable));
         assert!(state
             .events
@@ -1077,7 +1034,7 @@ mod tests {
         .unwrap();
 
         let request =
-            IntegrationController::begin_next(&mut state, IntegrationSlice::LocalLibrary).unwrap();
+            IntegrationController::begin_next(&mut state, IntegrationSlice::MusicStorage).unwrap();
         assert_eq!(request.id, request_id);
         assert_eq!(state.pending_requests().count(), 0);
         assert_eq!(state.in_flight_requests().count(), 1);

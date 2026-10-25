@@ -1,7 +1,9 @@
 //! Desktop adapter for the provider-independent music-management dashboard.
 
 use dioxus::prelude::*;
-use ui::{MusicManagementDashboard, MusicManagementEvent, MusicManagementView, ProviderChoice};
+use ui::{
+    HealthTone, MusicManagementDashboard, MusicManagementEvent, MusicManagementView, ProviderChoice,
+};
 
 use crate::state::integration::{
     use_integration_state, IntegrationError, IntegrationEvent, IntegrationSlice,
@@ -117,9 +119,19 @@ fn contains_any(value: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| value.contains(marker))
 }
 
+/// Whether the error comes from a slice that works with local folders (local
+/// sources, or local storages through the music storage slice), so local
+/// folder wording in it is meaningful.
+fn touches_local_folders(error: &IntegrationError) -> bool {
+    matches!(
+        error.slice,
+        Some(IntegrationSlice::LocalLibrary | IntegrationSlice::MusicStorage)
+    )
+}
+
 fn classify_error(error: &IntegrationError) -> SafeErrorKind {
     let message = error.message.to_ascii_lowercase();
-    if error.slice == Some(IntegrationSlice::LocalLibrary) {
+    if touches_local_folders(error) {
         if contains_any(&message, &["permission", "access denied", "read-only"]) {
             return SafeErrorKind::Permission;
         }
@@ -510,7 +522,7 @@ fn provider_label(slice: Option<IntegrationSlice>) -> &'static str {
     match slice {
         Some(IntegrationSlice::LocalLibrary) => "Local library",
         Some(IntegrationSlice::SoundcloudCatalog) => "SoundCloud",
-        Some(IntegrationSlice::GoogleDrive) => "Google Drive",
+        Some(IntegrationSlice::MusicStorage) => "Music storage",
         Some(IntegrationSlice::Backup) => "Backup storage",
         Some(IntegrationSlice::ReconciliationActions) => "Reconciliation",
         None => "Desktop integration",
@@ -529,7 +541,9 @@ fn settings_href(slice: Option<IntegrationSlice>) -> &'static str {
         Some(IntegrationSlice::LocalLibrary | IntegrationSlice::SoundcloudCatalog) => {
             "#music-sources"
         }
-        Some(IntegrationSlice::GoogleDrive | IntegrationSlice::Backup) => "#music-storage-settings",
+        Some(IntegrationSlice::MusicStorage | IntegrationSlice::Backup) => {
+            "#music-storage-settings"
+        }
         _ => "#music-management-settings",
     }
 }
@@ -564,13 +578,19 @@ fn retry_event(
                 _ => Some(MusicManagementEvent::SyncSource(source.id.clone())),
             }
         }
-        IntegrationSlice::GoogleDrive => view
-            .primary_storage
-            .iter()
-            .chain(view.backup_storages.iter())
-            .chain(view.unassigned_storages.iter())
-            .find(|storage| storage.provider == ProviderChoice::GoogleDrive)
-            .map(|storage| MusicManagementEvent::RetryStorage(storage.id.clone())),
+        // Without the failed event, retry the storage that looks unwell.
+        IntegrationSlice::MusicStorage => {
+            let mut storages = view
+                .primary_storage
+                .iter()
+                .chain(view.backup_storages.iter())
+                .chain(view.unassigned_storages.iter());
+            let first = storages.clone().next();
+            storages
+                .find(|storage| storage.health != HealthTone::Healthy)
+                .or(first)
+                .map(|storage| MusicManagementEvent::RetryStorage(storage.id.clone()))
+        }
         IntegrationSlice::Backup => view
             .backup_storages
             .first()
@@ -645,21 +665,15 @@ fn safe_failure_reason(error: &IntegrationError) -> &'static str {
         "The SoundCloud redirect URI is invalid. In Music Management → Configure SoundCloud, use the exact loopback redirect registered with SoundCloud and allowed by the broker."
     } else if message.contains("authorization broker could not be reached") {
         "The SoundCloud broker is unavailable. Start or deploy the rec_bag fullstack web service and verify it is reachable before retrying."
-    } else if error.slice == Some(IntegrationSlice::LocalLibrary)
-        && message.contains("local storage is read-only")
-    {
+    } else if touches_local_folders(error) && message.contains("local storage is read-only") {
         "The selected local primary folder is read-only. Choose a folder rec_bag can write to, or update that folder's permissions, then create the primary again."
-    } else if error.slice == Some(IntegrationSlice::LocalLibrary)
+    } else if touches_local_folders(error)
         && contains_any(&message, &["folder chooser", "folder picker"])
     {
         "rec_bag cannot open a local-folder chooser in this session. Run the native desktop app and install zenity or kdialog on Linux, or set REC_BAG_LOCAL_SOURCE to an absolute writable folder before starting rec_bag."
-    } else if error.slice == Some(IntegrationSlice::LocalLibrary)
-        && message.contains("local root is unavailable")
-    {
+    } else if touches_local_folders(error) && message.contains("local root is unavailable") {
         "rec_bag could not open the selected local folder. Confirm the folder exists, its drive is mounted, and your account can access every parent directory, then try again."
-    } else if error.slice == Some(IntegrationSlice::LocalLibrary)
-        && classify_error(error) == SafeErrorKind::Permission
-    {
+    } else if touches_local_folders(error) && classify_error(error) == SafeErrorKind::Permission {
         "rec_bag could not access the selected local folder. Choose a folder your account can read and write, ensure its drive is mounted read-write, then create the primary again."
     } else if error.slice.is_none()
         && error.request_id.is_none()
@@ -793,6 +807,68 @@ mod tests {
         assert_eq!(classify_error(&error), SafeErrorKind::Configuration);
         assert!(diagnostics.contains("install zenity or kdialog"));
         assert!(diagnostics.contains("category: configuration"));
+    }
+
+    /// Local storages are connected through the music storage slice, which
+    /// reports the local driver's own wording.
+    #[test]
+    fn music_storage_local_folder_failures_get_the_local_summaries() {
+        let read_only = error(
+            IntegrationSlice::MusicStorage,
+            "local storage is read-only",
+            false,
+        );
+        assert_eq!(classify_error(&read_only), SafeErrorKind::Permission);
+        assert!(
+            safe_failure_reason(&read_only).contains("selected local primary folder is read-only")
+        );
+
+        let chooser = error(
+            IntegrationSlice::MusicStorage,
+            "local root is unavailable: No native folder chooser is installed",
+            false,
+        );
+        assert_eq!(classify_error(&chooser), SafeErrorKind::Configuration);
+        assert!(safe_failure_reason(&chooser).contains("install zenity or kdialog"));
+        assert_eq!(
+            settings_href(Some(IntegrationSlice::MusicStorage)),
+            "#music-storage-settings"
+        );
+        assert_eq!(
+            provider_label(Some(IntegrationSlice::MusicStorage)),
+            "Music storage"
+        );
+    }
+
+    #[test]
+    fn music_storage_retry_targets_an_unwell_storage_of_any_provider() {
+        let mut view = mock_music_management_view();
+        let retry = |view: &MusicManagementView| {
+            retry_event(
+                &error(IntegrationSlice::MusicStorage, "offline", true),
+                view,
+                None,
+            )
+        };
+        for storage in view
+            .primary_storage
+            .iter_mut()
+            .chain(view.backup_storages.iter_mut())
+            .chain(view.unassigned_storages.iter_mut())
+        {
+            storage.health = HealthTone::Healthy;
+        }
+        assert_eq!(
+            retry(&view),
+            Some(MusicManagementEvent::RetryStorage("primary-local".into()))
+        );
+        view.unassigned_storages[0].health = HealthTone::Offline;
+        assert_eq!(
+            retry(&view),
+            Some(MusicManagementEvent::RetryStorage(
+                "primary-candidate".into()
+            ))
+        );
     }
 
     #[test]
